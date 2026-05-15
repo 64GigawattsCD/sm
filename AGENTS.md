@@ -19,5 +19,7 @@ This file is for future coding agents working in this repository.
 ## Update Guidance
 
 - Keep this file high level.
-- Add or revise goals when the user changes direction.
+- Update this file whenever the user sets a new goal, completes a goal, pauses work, or meaningfully changes direction.
+- Add or revise goals when the user changes direction, and remove or reword stale goals so the active intent stays accurate.
+- When work is completed, record the outcome briefly or move the goal out of the active list instead of leaving future agents to rediscover its status.
 - Avoid turning this into a changelog; focus on active intent and collaborator preferences.
