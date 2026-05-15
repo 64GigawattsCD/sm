@@ -14,6 +14,12 @@ This file is for future coding agents working in this repository.
 - The physical d-pad should remain available for menus, but not drive Samus movement during active gameplay.
 - Analog stick values are being exposed through an on-screen debug overlay (`LX`, `LY`) plus an aim-direction arrow for tuning.
 - Right-stick aiming and left-stick movement are intended to be decoupled; left stick only supplies fallback aim when the right stick is idle.
+- `Samus_IsAiming()` should represent active right-stick aiming; left stick fallback aim should not block grounded walking transitions.
+- Landing into a run and mid-run direction flips should stay responsive even while right-stick aim is active.
+- Right-stick aiming must not synthesize left/right/up/down input for movement or pose-transition lookup; aim poses should be applied through the analog pose override path.
+- Near-vertical right-stick aim should preserve current facing until horizontal aim crosses the flip threshold, to avoid rapid left/right pose flicker.
+- When left-stick movement and right-stick aim are horizontally opposed beyond the flip threshold, analog pose override should force moonwalk instead of allowing vanilla ground turn-around transitions to flicker.
+- Projectile heading/inherited-velocity physics looked good in the latest user test; keep tuning focused on movement and pose interaction unless new projectile issues appear.
 - Reference-behavior mismatch checking has been intentionally disabled while analog movement work is underway.
 
 ## Update Guidance

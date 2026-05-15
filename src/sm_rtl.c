@@ -46,12 +46,13 @@ float Samus_GetShapedHorizontalInputMagnitude(void) {
   return magnitude * magnitude;
 }
 
+static float Samus_GetRightStickMagnitude(void) {
+  float magnitude = sqrtf(g_right_stick_x * g_right_stick_x + g_right_stick_y * g_right_stick_y);
+  return magnitude > 1.0f ? 1.0f : magnitude;
+}
+
 float Samus_GetAimInputMagnitude(void) {
-  float right_magnitude = sqrtf(g_right_stick_x * g_right_stick_x + g_right_stick_y * g_right_stick_y);
-  if (right_magnitude > 0.25f)
-    return right_magnitude > 1.0f ? 1.0f : right_magnitude;
-  float left_magnitude = Samus_GetLeftStickMagnitude();
-  return left_magnitude > 1.0f ? 1.0f : left_magnitude;
+  return Samus_GetRightStickMagnitude();
 }
 
 bool Samus_IsAiming(void) {
@@ -71,7 +72,7 @@ int Samus_GetMovementDirectionSign(void) {
 }
 
 void Samus_GetNormalizedAimDirection(float *out_x, float *out_y) {
-  float magnitude = sqrtf(g_right_stick_x * g_right_stick_x + g_right_stick_y * g_right_stick_y);
+  float magnitude = Samus_GetRightStickMagnitude();
   if (magnitude > 0.25f) {
     *out_x = g_right_stick_x / magnitude;
     *out_y = g_right_stick_y / magnitude;

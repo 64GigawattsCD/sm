@@ -278,7 +278,11 @@ static uint16 Samus_SelectBestAnalogAimPose(const AnalogAimPoseCandidate *candid
   return best_pose;
 }
 
-static uint16 Samus_GetAnalogAimPoseForState(float aim_x, float aim_y) {
+static bool Samus_ShouldAnalogMoonwalk(int move_sign, float aim_x) {
+  return move_sign != 0 && fabsf(aim_x) >= 0.2f && ((move_sign > 0) != (aim_x > 0.0f));
+}
+
+static uint16 Samus_GetAnalogAimPoseForState(uint8 movement_type, float aim_x, float aim_y) {
   static const AnalogAimPoseCandidate kStandingPoses[] = {
     { kPose_01_FaceR_Normal, 1.0f, 0.0f },
     { kPose_02_FaceL_Normal, -1.0f, 0.0f },
@@ -290,8 +294,8 @@ static uint16 Samus_GetAnalogAimPoseForState(float aim_x, float aim_y) {
     { kPose_08_FaceL_AimDL, -0.70710677f, 0.70710677f },
   };
   static const AnalogAimPoseCandidate kRunningPoses[] = {
-    { kPose_09_MoveR_NoAim, 1.0f, 0.0f },
-    { kPose_0A_MoveL_NoAim, -1.0f, 0.0f },
+    { kPose_0B_MoveR_Gun, 1.0f, 0.0f },
+    { kPose_0C_MoveL_Gun, -1.0f, 0.0f },
     { kPose_0F_MoveR_AimUR, 0.70710677f, -0.70710677f },
     { kPose_10_MoveL_AimUL, -0.70710677f, -0.70710677f },
     { kPose_11_MoveR_AimDR, 0.70710677f, 0.70710677f },
@@ -336,14 +340,13 @@ static uint16 Samus_GetAnalogAimPoseForState(float aim_x, float aim_y) {
     { kPose_74_FaceL_Crouch_AimDL, -0.70710677f, 0.70710677f },
   };
 
-  switch (samus_movement_type) {
+  switch (movement_type) {
   case kMovementType_00_Standing:
-  case kMovementType_0E_TurningAroundOnGround:
     return Samus_SelectBestAnalogAimPose(kStandingPoses, sizeof(kStandingPoses) / sizeof(kStandingPoses[0]), aim_x, aim_y);
   case kMovementType_01_Running:
   case kMovementType_10_Moonwalking: {
     int move_sign = Samus_GetMovementDirectionSign();
-    bool moonwalk = move_sign != 0 && ((move_sign > 0) != (aim_x >= 0.0f));
+    bool moonwalk = Samus_ShouldAnalogMoonwalk(move_sign, aim_x);
     const AnalogAimPoseCandidate *cands = moonwalk ? kMoonwalkPoses : kRunningPoses;
     int count = moonwalk ? (int)(sizeof(kMoonwalkPoses) / sizeof(kMoonwalkPoses[0])) : (int)(sizeof(kRunningPoses) / sizeof(kRunningPoses[0]));
     return Samus_SelectBestAnalogAimPose(cands, count, aim_x, aim_y);
@@ -369,12 +372,21 @@ static void Samus_ApplyAnalogAimPose(void) {
     return;
   float aim_x, aim_y;
   Samus_GetNormalizedAimDirection(&aim_x, &aim_y);
-  bool facing_right = (aim_x > 0.0f) ? true : (aim_x < 0.0f ? false : samus_pose_x_dir != 4);
-  uint16 new_pose = Samus_GetAnalogAimPoseForState(aim_x, aim_y);
-  if (new_pose) {
-    samus_pose_x_dir = facing_right ? 8 : 4;
-    samus_new_pose = new_pose;
+  if (fabsf(aim_x) < 0.2f)
+    aim_x = samus_pose_x_dir == 4 ? -0.001f : 0.001f;
+  uint8 movement_type = samus_movement_type;
+  if (samus_new_pose != 0 && samus_new_pose != 0xFFFF)
+    movement_type = kPoseParams[samus_new_pose].movement_type;
+  int move_sign = Samus_GetMovementDirectionSign();
+  if (Samus_ShouldAnalogMoonwalk(move_sign, aim_x)) {
+    movement_type = kMovementType_10_Moonwalking;
+    moonwalk_flag = 1;
+  } else if (movement_type == kMovementType_0E_TurningAroundOnGround) {
+    return;
   }
+  uint16 new_pose = Samus_GetAnalogAimPoseForState(movement_type, aim_x, aim_y);
+  if (new_pose)
+    samus_new_pose = new_pose;
 }
 
 void Samus_Pose_CancelGrapple(void) {  // 0x9182D9
