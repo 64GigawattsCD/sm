@@ -4,6 +4,7 @@
 #include "variables.h"
 #include "sm_rtl.h"
 #include "funcs.h"
+#include <math.h>
 
 #define kSamusFramesForUnderwaterSfx ((uint8*)RomFixedPtr(0x90a514))
 #define kPauseMenuMapData ((uint16*)RomFixedPtr(0x829717))
@@ -15,6 +16,95 @@
 #define kFlareAnimDelays ((uint16*)RomFixedPtr(0x90c481))
 
 static Pair_Bool_Amt Samus_CalcBaseSpeed_NoDecel_X(uint16 k);
+
+static int32 ScaleSpeedForAnalogInput(int32 amount) {
+  float magnitude = Samus_GetShapedHorizontalInputMagnitude();
+  if (magnitude <= 0.0f || magnitude >= 0.999f)
+    return amount;
+  return (int32)lroundf((double)amount * magnitude);
+}
+
+typedef enum AnalogProjectileCollision {
+  kAnalogProjectileCollision_NoWave,
+  kAnalogProjectileCollision_Wave,
+  kAnalogProjectileCollision_Missile,
+  kAnalogProjectileCollision_SuperMissile,
+} AnalogProjectileCollision;
+
+static bool g_projectile_has_heading[10];
+static bool g_projectile_inherited_launcher_velocity[10];
+static float g_projectile_heading_x[10];
+static float g_projectile_heading_y[10];
+
+static int16 RoundProjectileSpeed(float value) {
+  if (value > 32767.0f)
+    return 32767;
+  if (value < -32768.0f)
+    return -32768;
+  return (int16)lroundf(value);
+}
+
+static void ClearProjectileHeading(int slot) {
+  if (slot < 0 || slot >= 10)
+    return;
+  g_projectile_has_heading[slot] = false;
+  g_projectile_inherited_launcher_velocity[slot] = false;
+  g_projectile_heading_x[slot] = 0.0f;
+  g_projectile_heading_y[slot] = 0.0f;
+}
+
+static void SetProjectileHeadingFromAim(int slot) {
+  float aim_x = 0.0f, aim_y = 0.0f;
+  Samus_GetNormalizedAimDirection(&aim_x, &aim_y);
+  g_projectile_has_heading[slot] = true;
+  g_projectile_inherited_launcher_velocity[slot] = false;
+  g_projectile_heading_x[slot] = aim_x;
+  g_projectile_heading_y[slot] = aim_y;
+}
+
+static void AddProjectileHeadingAcceleration(int slot, float amount) {
+  if (!g_projectile_has_heading[slot])
+    return;
+  projectile_bomb_x_speed[slot] += RoundProjectileSpeed(g_projectile_heading_x[slot] * amount);
+  projectile_bomb_y_speed[slot] += RoundProjectileSpeed(g_projectile_heading_y[slot] * amount);
+}
+
+static uint8 MoveProjectileWithAnalogHeading(uint16 k, AnalogProjectileCollision collision) {
+  int slot = k >> 1;
+  uint8 collided = 0;
+  bool horizontal_first = fabsf(g_projectile_heading_x[slot]) >= fabsf(g_projectile_heading_y[slot]);
+  for (int pass = 0; pass < 2; pass++) {
+    bool do_horizontal = (pass == 0) ? horizontal_first : !horizontal_first;
+    if (do_horizontal) {
+      if (projectile_bomb_x_speed[slot] == 0)
+        continue;
+      if (collision == kAnalogProjectileCollision_Wave) {
+        collided |= BlockCollWaveBeamHoriz(k);
+      } else if (collision == kAnalogProjectileCollision_Missile || collision == kAnalogProjectileCollision_SuperMissile) {
+        collided |= BlockCollMissileHoriz(k);
+        if (collision == kAnalogProjectileCollision_SuperMissile)
+          SuperMissileBlockCollDetect_X();
+      } else {
+        collided |= BlockCollNoWaveBeamHoriz(k);
+      }
+    } else {
+      if (projectile_bomb_y_speed[slot] == 0)
+        continue;
+      if (collision == kAnalogProjectileCollision_Wave) {
+        collided |= BlockCollWaveBeamVert(k);
+      } else if (collision == kAnalogProjectileCollision_Missile || collision == kAnalogProjectileCollision_SuperMissile) {
+        collided |= BlockCollMissileVert(k);
+        if (collision == kAnalogProjectileCollision_SuperMissile)
+          SuperMissileBlockCollDetect_Y();
+      } else {
+        collided |= BlockCollNoWaveBeamVert(k);
+      }
+    }
+    if (collided && collision != kAnalogProjectileCollision_Wave)
+      break;
+  }
+  return collided;
+}
 
 static const uint16 kUnchargedProjectile_Sfx[12] = { 0xb, 0xd, 0xc, 0xe, 0xf, 0x12, 0x10, 0x11, 0x13, 0x16, 0x14, 0x15 };
 static const uint16 kChargedProjectile_Sfx[12] = { 0x17, 0x19, 0x18, 0x1a, 0x1b, 0x1e, 0x1c, 0x1d, 0x1f, 0x22, 0x20, 0x21 };
@@ -334,7 +424,7 @@ static Func_AnimDelay *const kAnimDelayFuncs[16] = {  // 0x9082DC
 #define kDefaultAnimFramePtr ((uint16 *)RomFixedPtr(0x91B5D1))
 
 static uint8 Samus_HandleSpeedBoosterAnimDelay(const uint8 *jp) {  // 0x90852C
-  if (!samus_has_momentum_flag || (button_config_run_b & joypad1_lastkeys) == 0 || samus_movement_type != 1)
+  if (!samus_has_momentum_flag || !Samus_ShouldTreatRunButtonAsHeld() || samus_movement_type != 1)
     return jp[0];
   if ((equipped_items & 0x2000) == 0) {
     samus_anim_frame = 0;
@@ -902,6 +992,14 @@ void Samus_HandleMovement_X(void) {  // 0x908E64
 }
 
 void Samus_MoveX(int32 amt) {  // 0x908EA9
+  int move_sign = Samus_GetMovementDirectionSign();
+  if (move_sign > 0) {
+    amt = Samus_CalcDisplacementMoveRight(amt);
+    goto LABEL_8;
+  } else if (move_sign < 0) {
+    amt = Samus_CalcDisplacementMoveLeft(amt);
+    goto LABEL_8;
+  }
   if (!samus_x_accel_mode || samus_x_accel_mode == 2) {
     if (samus_pose_x_dir != 4) {
 LABEL_6:
@@ -1404,7 +1502,7 @@ LABEL_24:
       goto LABEL_24;
     }
   }
-  if (samus_movement_type != 1 || (button_config_run_b & joypad1_lastkeys) == 0)
+  if (samus_movement_type != 1 || !Samus_ShouldTreatRunButtonAsHeld())
     goto LABEL_24;
   if ((equipped_items & 0x2000) != 0) {
     if (!samus_has_momentum_flag) {
@@ -1604,6 +1702,9 @@ static bool IsGreaterThanQuirked(uint16 vhi, uint16 vlo, uint16 cmphi, uint16 cm
 
 int32 Samus_CalcBaseSpeed_X(uint16 k) {  // 0x909A7E
   SamusSpeedTableEntry *sste = get_SamusSpeedTableEntry(k);
+  int32 max_speed = __PAIR32__(sste->max_speed, sste->max_speed_sub);
+  if (Samus_HasHorizontalMovementInput())
+    max_speed = ScaleSpeedForAnalogInput(max_speed);
   if (samus_x_accel_mode) {
     int32 delta = samus_x_decel_mult ?
         __PAIR32__(Mult8x8(samus_x_decel_mult, sste->decel) >> 8, Mult8x8(samus_x_decel_mult, HIBYTE(sste->decel_sub))) :
@@ -1616,9 +1717,9 @@ int32 Samus_CalcBaseSpeed_X(uint16 k) {  // 0x909A7E
     }
   } else {
     AddToHiLo(&samus_x_base_speed, &samus_x_base_subspeed, __PAIR32__(sste->accel, sste->accel_sub));
-    if (IsGreaterThanQuirked(samus_x_base_speed, samus_x_base_subspeed, sste->max_speed, sste->max_speed_sub)) {
-      samus_x_base_speed = sste->max_speed;
-      samus_x_base_subspeed = sste->max_speed_sub;
+    if (IsGreaterThanQuirked(samus_x_base_speed, samus_x_base_subspeed, (uint16)(max_speed >> 16), (uint16)max_speed)) {
+      samus_x_base_speed = (uint16)(max_speed >> 16);
+      samus_x_base_subspeed = (uint16)max_speed;
     }
   }
   return __PAIR32__(samus_x_base_speed, samus_x_base_subspeed);
@@ -1626,6 +1727,9 @@ int32 Samus_CalcBaseSpeed_X(uint16 k) {  // 0x909A7E
 
 static Pair_Bool_Amt Samus_CalcBaseSpeed_NoDecel_X(uint16 k) {  // 0x909B1F
   SamusSpeedTableEntry *sste = get_SamusSpeedTableEntry(k);
+  int32 max_speed = __PAIR32__(sste->max_speed, sste->max_speed_sub);
+  if (Samus_HasHorizontalMovementInput())
+    max_speed = ScaleSpeedForAnalogInput(max_speed);
   bool rv = false;
   if ((samus_x_accel_mode & 1) != 0) {
     int32 delta = samus_x_decel_mult ?
@@ -1639,9 +1743,9 @@ static Pair_Bool_Amt Samus_CalcBaseSpeed_NoDecel_X(uint16 k) {  // 0x909B1F
     }
   } else {
     AddToHiLo(&samus_x_base_speed, &samus_x_base_subspeed, __PAIR32__(sste->accel, sste->accel_sub));
-    if (IsGreaterThanQuirked(samus_x_base_speed, samus_x_base_subspeed, sste->max_speed, sste->max_speed_sub)) {
-      samus_x_base_speed = sste->max_speed;
-      samus_x_base_subspeed = sste->max_speed_sub;
+    if (IsGreaterThanQuirked(samus_x_base_speed, samus_x_base_subspeed, (uint16)(max_speed >> 16), (uint16)max_speed)) {
+      samus_x_base_speed = (uint16)(max_speed >> 16);
+      samus_x_base_subspeed = (uint16)max_speed;
       rv = true;
     }
   }
@@ -1991,7 +2095,7 @@ void Samus_Movement_06_Falling(void) {  // 0x90A58D
 }
 
 void Samus_Movement_08_MorphBallFalling(void) {  // 0x90A5CA
-  if ((joypad1_lastkeys & (kButton_Left | kButton_Right)) == 0 && !samus_x_accel_mode) {
+  if (!Samus_HasHorizontalMovementInput() && !samus_x_accel_mode) {
     Samus_CancelSpeedBoost();
     samus_x_extra_run_speed = 0;
     samus_x_extra_run_subspeed = 0;
@@ -2114,7 +2218,7 @@ void Samus_Movement_12_SpringBallInAir(void) {  // 0x90A6F1
 }
 
 void Samus_Movement_13_SpringBallFalling(void) {  // 0x90A703
-  if ((joypad1_lastkeys & (kButton_Left | kButton_Right)) == 0 && !samus_x_accel_mode) {
+  if (!Samus_HasHorizontalMovementInput() && !samus_x_accel_mode) {
     Samus_CancelSpeedBoost();
     samus_x_extra_run_speed = 0;
     samus_x_extra_run_subspeed = 0;
@@ -2480,6 +2584,7 @@ void ResetProjectileData(void) {  // 0x90AD22
     projectile_variables[v1] = 0;
     projectile_spritemap_pointers[v1] = 0;
     projectile_bomb_pre_instructions[v1] = FUNC16(ProjPreInstr_Empty);
+    ClearProjectileHeading(v1);
     v0 += 2;
   } while ((int16)(v0 - 20) < 0);
   bomb_counter = 0;
@@ -2529,6 +2634,7 @@ void ClearProjectile(uint16 k) {  // 0x90ADB7
   projectile_variables[v1] = 0;
   projectile_spritemap_pointers[v1] = 0;
   projectile_bomb_pre_instructions[v1] = FUNC16(ProjPreInstr_Empty);
+  ClearProjectileHeading(v1);
   if ((int16)(k - 10) >= 0) {
     if ((--bomb_counter & 0x8000) != 0)
       bomb_counter = 0;
@@ -2687,6 +2793,12 @@ void ProjPreInstr_Beam_NoWaveBeam(uint16 k) {
       k = projectile_index;
     }
     int v3 = k >> 1;
+    if (g_projectile_has_heading[v3]) {
+      AddProjectileHeadingAcceleration(v3, 16.0f);
+      MoveProjectileWithAnalogHeading(k, kAnalogProjectileCollision_NoWave);
+      DeleteProjectileIfFarOffScreen();
+      return;
+    }
     uint16 v4 = 2 * (projectile_dir[v3] & 0xF);
     int v5 = v4 >> 1;
     projectile_bomb_x_speed[v3] += kDirToVelMult16_X[v5];
@@ -2735,6 +2847,13 @@ void ProjPreInstr_Missile(uint16 k) {
       k = projectile_index;
     }
     int v3 = k >> 1;
+    if (g_projectile_has_heading[v3]) {
+      AddProjectileHeadingAcceleration(v3, 16.0f);
+      Missile_Func1(k);
+      MoveProjectileWithAnalogHeading(k, kAnalogProjectileCollision_Missile);
+      DeleteProjectileIfFarOffScreen();
+      return;
+    }
     uint16 v4 = 2 * (projectile_dir[v3] & 0xF);
     int v5 = v4 >> 1;
     projectile_bomb_x_speed[v3] += kDirToVelMult16_X[v5];
@@ -2789,6 +2908,13 @@ LABEL_7:
     projectile_timers[v1] = 2;
     SpawnProjectileTrail(k);
     k = projectile_index;
+  }
+  if (g_projectile_has_heading[k >> 1]) {
+    Missile_Func1(k);
+    MoveProjectileWithAnalogHeading(k, kAnalogProjectileCollision_SuperMissile);
+    if (DeleteProjectileIfFarOffScreen() & 1)
+      goto LABEL_7;
+    return;
   }
   v3 = projectile_dir[k >> 1] & 0xF;
   Missile_Func1(k);
@@ -2888,6 +3014,11 @@ static Func_Y_V *const kProjPreInstr_WavePlasmaEtcFuncs[10] = {  // 0x90B103
 void ProjPreInstr_Wave_Shared(uint16 k) {
 
   int v1 = k >> 1;
+  if (g_projectile_has_heading[v1]) {
+    AddProjectileHeadingAcceleration(v1, 16.0f);
+    MoveProjectileWithAnalogHeading(k, kAnalogProjectileCollision_Wave);
+    return;
+  }
   uint16 v2 = 2 * (projectile_dir[v1] & 0xF);
   int v3 = v2 >> 1;
   projectile_bomb_x_speed[v1] += kDirToVelMult16_X[v3];
@@ -2955,6 +3086,10 @@ void SetInitialProjectileSpeed(uint16 r20) {
   uint16 v1 = 4 * (projectile_type[v0] & 0xF);
   uint16 v2 = 2 * (projectile_dir[v0] & 0xF);
   uint16 r22;
+  if (g_projectile_has_heading[v0]) {
+    InitializeProjectileSpeed(r20, kInitializeProjectileSpeed_XY_Diag[v1 >> 1]);
+    return;
+  }
   if (!v2 || v2 == 4 || v2 == 8 || v2 == 10 || v2 == 14 || v2 == 18) {
     r22 = kInitializeProjectileSpeed_XY_Diag[v1 >> 1];
   } else {
@@ -2970,69 +3105,70 @@ void InitializeProjectileSpeedOfType(uint16 r20) {  // 0x90B1DD
 }
 
 void InitializeProjectileSpeed(uint16 k, uint16 r22) {  // 0x90B1F3
-  uint16 r18;
-
   int kh = k >> 1;
+  int16 inherit_x = Samus_GetProjectileInheritanceX();
+  int16 inherit_y = Samus_GetProjectileInheritanceY();
   projectile_bomb_x_subpos[kh] = 0;
   projectile_bomb_y_subpos[kh] = 0;
+  if (g_projectile_has_heading[kh]) {
+    if (g_projectile_inherited_launcher_velocity[kh]) {
+      inherit_x = 0;
+      inherit_y = 0;
+    } else {
+      g_projectile_inherited_launcher_velocity[kh] = true;
+    }
+    projectile_bomb_x_speed[kh] = RoundProjectileSpeed(g_projectile_heading_x[kh] * r22) + inherit_x;
+    projectile_bomb_y_speed[kh] = RoundProjectileSpeed(g_projectile_heading_y[kh] * r22) + inherit_y;
+    return;
+  }
   switch (2 * (projectile_dir[kh] & 0xF)) {
   case 0:
   case 18: {
-    if ((uint8)projectile_init_speed_samus_moved_up)
-      r18 = (*(uint16 *)((uint8 *)&projectile_init_speed_samus_moved_right_fract + 1) >> 2) | 0xC000;
-    else
-      r18 = 0;
-    projectile_bomb_y_speed[kh] = r18 - r22;
+    projectile_bomb_y_speed[kh] = -r22;
     projectile_bomb_x_speed[kh] = 0;
     break;
   }
   case 2: {
-    if ((uint8)projectile_init_speed_samus_moved_up)
-      r18 = (*(uint16 *)((uint8 *)&projectile_init_speed_samus_moved_right_fract + 1) >> 2) | 0xC000;
-    else
-      r18 = 0;
-    projectile_bomb_y_speed[kh] = r18 - r22;
-    projectile_bomb_x_speed[kh] = *(uint16 *)((uint8 *)&projectile_init_speed_samus_moved_left_fract + 1) + r22;
+    projectile_bomb_y_speed[kh] = -r22;
+    projectile_bomb_x_speed[kh] = r22;
     break;
   }
   case 4: {
     projectile_bomb_y_speed[kh] = 0;
-    projectile_bomb_x_speed[kh] = *(uint16 *)((uint8 *)&projectile_init_speed_samus_moved_left_fract + 1) + r22;
+    projectile_bomb_x_speed[kh] = r22;
     break;
   }
   case 6: {
-    projectile_bomb_y_speed[kh] = *(uint16 *)((uint8 *)&projectile_init_speed_samus_moved_up_fract + 1) + r22;
-    projectile_bomb_x_speed[kh] = *(uint16 *)((uint8 *)&projectile_init_speed_samus_moved_left_fract + 1) + r22;
+    projectile_bomb_y_speed[kh] = r22;
+    projectile_bomb_x_speed[kh] = r22;
     break;
   }
   case 8:
   case 10: {
-    projectile_bomb_y_speed[kh] = *(uint16 *)((uint8 *)&projectile_init_speed_samus_moved_up_fract + 1) + r22;
+    projectile_bomb_y_speed[kh] = r22;
     projectile_bomb_x_speed[kh] = 0;
     break;
   }
   case 12: {
-    projectile_bomb_y_speed[kh] = *(uint16 *)((uint8 *)&projectile_init_speed_samus_moved_up_fract + 1) + r22;
-    projectile_bomb_x_speed[kh] = *(uint16 *)((uint8 *)&absolute_moved_last_frame_y_fract + 1) - r22;
+    projectile_bomb_y_speed[kh] = r22;
+    projectile_bomb_x_speed[kh] = -r22;
     break;
   }
   case 14: {
     projectile_bomb_y_speed[kh] = 0;
-    projectile_bomb_x_speed[kh] = *(uint16 *)((uint8 *)&absolute_moved_last_frame_y_fract + 1) - r22;
+    projectile_bomb_x_speed[kh] = -r22;
     break;
   }
   case 16: {
-    if ((uint8)projectile_init_speed_samus_moved_up)
-      r18 = (*(uint16 *)((uint8 *)&projectile_init_speed_samus_moved_right_fract + 1) >> 2) | 0xC000;
-    else
-      r18 = 0;
-    projectile_bomb_y_speed[kh] = r18 - r22;
-    projectile_bomb_x_speed[kh] = *(uint16 *)((uint8 *)&absolute_moved_last_frame_y_fract + 1) - r22;
+    projectile_bomb_y_speed[kh] = -r22;
+    projectile_bomb_x_speed[kh] = -r22;
     break;
   }
   default:
     Unreachable();
   }
+  projectile_bomb_x_speed[kh] += inherit_x;
+  projectile_bomb_y_speed[kh] += inherit_y;
 }
 
 void Missile_Func1(uint16 k) {  // 0x90B2F6
@@ -3046,6 +3182,13 @@ void Missile_Func1(uint16 k) {  // 0x90B2F6
     else
       v3 = addr_kSuperMissileAccelerations;
     const uint8 *v4 = RomPtr_90(v3 + 4 * (projectile_dir[v1] & 0xF));
+    if (g_projectile_has_heading[v1]) {
+      int16 accel_x = GET_WORD(v4);
+      int16 accel_y = GET_WORD(v4 + 2);
+      float accel = sqrtf((float)accel_x * (float)accel_x + (float)accel_y * (float)accel_y);
+      AddProjectileHeadingAcceleration(v1, accel);
+      return;
+    }
     projectile_bomb_x_speed[v1] += GET_WORD(v4);
     projectile_bomb_y_speed[v1] += GET_WORD(v4 + 2);
   } else {
@@ -3529,6 +3672,28 @@ static const int16 kProjectileOriginOffsets3_Y[10] = { -8, -13, 1, 4, 13, 13, 4,
 static const int16 kProjectileOriginOffsets4_X[10] = { 2, 15, 15, 13, 2, -5, -13, -13, -15, -2 };
 static const int16 kProjectileOriginOffsets4_Y[10] = { -8, -16, -2, 1, 13, 13, 1, -2, -16, -8 };
 
+static uint8 AimSegmentToProjectileDir(float aim_x, float aim_y) {
+  static const uint8 kSegmentToProjectileDir[8] = { 0, 1, 2, 3, 4, 6, 7, 8 };
+  uint8 angle = (uint8)(int)(((atan2f(aim_y, aim_x) / (2.0f * (float)M_PI)) * 256.0f) + 0.5f);
+  return kSegmentToProjectileDir[(uint8)(angle + 16 + 64) >> 5];
+}
+
+static void GetInterpolatedProjectileOffset(const int16 *table_x, const int16 *table_y,
+                                            float aim_x, float aim_y, int16 *out_x, int16 *out_y) {
+  static const uint8 kAnchorIndices[8] = { 0, 1, 2, 3, 4, 6, 7, 8 };
+  float angle = atan2f(aim_x, -aim_y);
+  if (angle < 0.0f)
+    angle += 2.0f * (float)M_PI;
+  float sector = angle * (4.0f / (float)M_PI);
+  int idx0 = (int)floorf(sector) & 7;
+  int idx1 = (idx0 + 1) & 7;
+  float t = sector - floorf(sector);
+  int anchor0 = kAnchorIndices[idx0];
+  int anchor1 = kAnchorIndices[idx1];
+  *out_x = (int16)lroundf(table_x[anchor0] + (table_x[anchor1] - table_x[anchor0]) * t);
+  *out_y = (int16)lroundf(table_y[anchor0] + (table_y[anchor1] - table_y[anchor0]) * t);
+}
+
 uint8 InitProjectilePositionDirection(uint16 r20) {  // 0x90BA56
   uint16 v0 = samus_pose;
   uint16 direction_shots_fired;
@@ -3549,21 +3714,33 @@ uint8 InitProjectilePositionDirection(uint16 r20) {  // 0x90BA56
       v0 = samus_pose;
     }
   }
+  {
+    float aim_x = 0.0f, aim_y = 0.0f;
+    Samus_GetNormalizedAimDirection(&aim_x, &aim_y);
+    direction_shots_fired = AimSegmentToProjectileDir(aim_x, aim_y);
+  }
   int v2 = r20 >> 1;
   projectile_dir[v2] = direction_shots_fired;
+  SetProjectileHeadingFromAim(v2);
   uint16 r22 = kPoseParams[v0].y_offset_to_gfx;
-  uint16 v3 = 2 * (projectile_dir[v2] & 0xF);
+  int16 offset_x, offset_y;
   if (samus_pose == kPose_75_FaceL_Moonwalk_AimUL
       || samus_pose == kPose_76_FaceR_Moonwalk_AimUR
       || samus_movement_type == 1) {
-    int v6 = v3 >> 1;
-    projectile_x_pos[v2] = samus_x_pos + kProjectileOriginOffsets4_X[v6];
-    projectile_y_pos[v2] = samus_y_pos + kProjectileOriginOffsets4_Y[v6] - r22;
+    float aim_x = 0.0f, aim_y = 0.0f;
+    Samus_GetNormalizedAimDirection(&aim_x, &aim_y);
+    GetInterpolatedProjectileOffset(kProjectileOriginOffsets4_X, kProjectileOriginOffsets4_Y,
+                                    aim_x, aim_y, &offset_x, &offset_y);
+    projectile_x_pos[v2] = samus_x_pos + offset_x;
+    projectile_y_pos[v2] = samus_y_pos + offset_y - r22;
     return 0;
   } else {
-    int v4 = v3 >> 1;
-    projectile_x_pos[v2] = samus_x_pos + kProjectileOriginOffsets3_X[v4];
-    projectile_y_pos[v2] = samus_y_pos + kProjectileOriginOffsets3_Y[v4] - r22;
+    float aim_x = 0.0f, aim_y = 0.0f;
+    Samus_GetNormalizedAimDirection(&aim_x, &aim_y);
+    GetInterpolatedProjectileOffset(kProjectileOriginOffsets3_X, kProjectileOriginOffsets3_Y,
+                                    aim_x, aim_y, &offset_x, &offset_y);
+    projectile_x_pos[v2] = samus_x_pos + offset_x;
+    projectile_y_pos[v2] = samus_y_pos + offset_y - r22;
     return 0;
   }
 }
@@ -5333,7 +5510,7 @@ void HudSelectionHandler_JumpEtc(void) {  // 0x90DDB6
 }
 
 void HudSelectionHandler_Xray(void) {  // 0x90DDC8
-  if ((button_config_run_b & joypad1_lastkeys) != 0)
+  if (Samus_ShouldTreatRunButtonAsHeld())
     XrayRunHandler();
   else
     HudSelectionHandler_NothingOrPowerBombs();

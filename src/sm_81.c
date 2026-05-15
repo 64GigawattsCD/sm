@@ -33,6 +33,28 @@
 
 static const uint16 kFileSelectMap_AreaIndexes[6] = { 0, 3, 5, 1, 4, 2 };
 
+static void TrySkipFileSelectMenu(void) {
+  if (!g_skip_menu)
+    return;
+  g_skip_menu = false;
+  selected_save_slot = 0;
+  *(uint16 *)&g_sram[0x1FEC] = selected_save_slot;
+  *(uint16 *)&g_sram[0x1FEE] = ~selected_save_slot;
+  RtlWriteSram();
+  if (LoadFromSram(selected_save_slot)) {
+    NewSaveFile();
+    has_area_map = 0;
+    loading_game_state = kGameState_31_SetUpNewGame;
+    game_state = kGameState_31_SetUpNewGame;
+    area_index = 6;
+    load_station_index = 0;
+    SaveToSram(selected_save_slot);
+  } else {
+    LoadMirrorOfExploredMapTiles();
+    game_state = kGameState_6_LoadingGameData;
+  }
+}
+
 void SoftReset(void) {
   game_state = 0xffff;
 }
@@ -1404,6 +1426,9 @@ void FileSelectMenu_2_InitMain(void) {  // 0x819ED6
     v0 = 0;
   }
   selected_save_slot = v0;
+  TrySkipFileSelectMenu();
+  if (game_state != kGameState_4_FileSelectMenus)
+    return;
   FileSelectMenu_16();
 }
 
@@ -2466,7 +2491,7 @@ void NewSaveFile(void) {  // 0x81B2CB
   game_time_minutes = 0;
   game_time_hours = 0;
   japanese_text_flag = 0;
-  moonwalk_flag = 0;
+  moonwalk_flag = 1;
   hud_auto_cancel_flag = 0;
   debug_flag = 1;
   UNUSED_word_7E09E8 = 1;

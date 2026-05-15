@@ -1,11 +1,12 @@
 #include "sm_rtl.h"
 #include "sm_cpu_infra.h"
 #include "types.h"
-//#include "ida_types.h"
+#include "ida_types.h"
 #include "variables.h"
 #include "funcs.h"
 #include "spc_player.h"
 #include "util.h"
+#include <math.h>
 
 struct StateRecorder;
 
@@ -15,10 +16,165 @@ static void RtlRestoreMusicAfterLoad_Locked(bool is_reset);
 uint8 g_ram[0x20000];
 uint8 *g_sram;
 const uint8 *g_rom;
+bool g_skip_menu = true;
+float g_left_stick_x;
+float g_left_stick_y;
+float g_right_stick_x;
+float g_right_stick_y;
 
 static uint8 *g_rtl_memory_ptr;
 static RunFrameFunc *g_rtl_runframe;
 static SyncAllFunc *g_rtl_syncall;
+static int g_aim_buttons_frame = -1;
+static uint16 g_aim_buttons_held;
+static uint16 g_aim_buttons_prev;
+
+float Samus_GetLeftStickMagnitude(void) {
+  float magnitude = sqrtf(g_left_stick_x * g_left_stick_x + g_left_stick_y * g_left_stick_y);
+  return magnitude > 1.0f ? 1.0f : magnitude;
+}
+
+float Samus_GetHorizontalInputMagnitude(void) {
+  float magnitude = fabsf(g_left_stick_x);
+  if (magnitude > 0.0001f)
+    return magnitude > 1.0f ? 1.0f : magnitude;
+  return (joypad1_lastkeys & (kButton_Left | kButton_Right)) != 0 ? 1.0f : 0.0f;
+}
+
+float Samus_GetShapedHorizontalInputMagnitude(void) {
+  float magnitude = Samus_GetHorizontalInputMagnitude();
+  return magnitude * magnitude;
+}
+
+float Samus_GetAimInputMagnitude(void) {
+  float right_magnitude = sqrtf(g_right_stick_x * g_right_stick_x + g_right_stick_y * g_right_stick_y);
+  if (right_magnitude > 0.25f)
+    return right_magnitude > 1.0f ? 1.0f : right_magnitude;
+  float left_magnitude = Samus_GetLeftStickMagnitude();
+  return left_magnitude > 1.0f ? 1.0f : left_magnitude;
+}
+
+bool Samus_IsAiming(void) {
+  return Samus_GetAimInputMagnitude() > 0.25f;
+}
+
+int Samus_GetMovementDirectionSign(void) {
+  if (g_left_stick_x >= 0.1f)
+    return 1;
+  if (g_left_stick_x <= -0.1f)
+    return -1;
+  if (joypad1_lastkeys & kButton_Right)
+    return 1;
+  if (joypad1_lastkeys & kButton_Left)
+    return -1;
+  return 0;
+}
+
+void Samus_GetNormalizedAimDirection(float *out_x, float *out_y) {
+  float magnitude = sqrtf(g_right_stick_x * g_right_stick_x + g_right_stick_y * g_right_stick_y);
+  if (magnitude > 0.25f) {
+    *out_x = g_right_stick_x / magnitude;
+    *out_y = g_right_stick_y / magnitude;
+    return;
+  }
+  magnitude = Samus_GetLeftStickMagnitude();
+  if (magnitude > 0.0f) {
+    *out_x = g_left_stick_x / magnitude;
+    *out_y = g_left_stick_y / magnitude;
+    return;
+  }
+  *out_x = (samus_pose_x_dir == 4) ? -1.0f : 1.0f;
+  *out_y = 0.0f;
+}
+
+uint8 Samus_GetDiscreteAimDirection(void) {
+  static const uint8 kSegmentToProjectileDir[8] = {
+    0, 1, 2, 3, 4, 6, 7, 8,
+  };
+  float aim_x = 0.0f, aim_y = 0.0f;
+  Samus_GetNormalizedAimDirection(&aim_x, &aim_y);
+  uint8 angle = (uint8)(int)(((atan2f(aim_y, aim_x) / (2.0f * (float)M_PI)) * 256.0f) + 0.5f);
+  return kSegmentToProjectileDir[(uint8)(angle + 16 + 64) >> 5];
+}
+
+static int32 Samus_GetProjectileInheritanceComponent(uint16 positive_hi, uint16 positive_lo,
+                                                     uint16 negative_hi, uint16 negative_lo) {
+  if (positive_hi || positive_lo)
+    return IPAIR32(positive_hi, positive_lo);
+  if (negative_hi || negative_lo)
+    return IPAIR32(negative_hi, negative_lo);
+  return 0;
+}
+
+int16 Samus_GetProjectileInheritanceX(void) {
+  return (int16)(Samus_GetProjectileInheritanceComponent(
+      projectile_init_speed_samus_moved_right, projectile_init_speed_samus_moved_right_fract,
+      projectile_init_speed_samus_moved_left, projectile_init_speed_samus_moved_left_fract) >> 8);
+}
+
+int16 Samus_GetProjectileInheritanceY(void) {
+  return (int16)(Samus_GetProjectileInheritanceComponent(
+      projectile_init_speed_samus_moved_down, projectile_init_speed_samus_moved_down_fract,
+      projectile_init_speed_samus_moved_up, projectile_init_speed_samus_moved_up_fract) >> 8);
+}
+
+static uint16 ComputeAimButtons(void) {
+  static const uint16 kSegmentToButtons[8] = {
+    kButton_Up,
+    kButton_Up | kButton_Right,
+    kButton_Right,
+    kButton_Down | kButton_Right,
+    kButton_Down,
+    kButton_Down | kButton_Left,
+    kButton_Left,
+    kButton_Up | kButton_Left,
+  };
+  float aim_x = 0.0f, aim_y = 0.0f;
+  if (Samus_IsAiming()) {
+    float magnitude = Samus_GetAimInputMagnitude();
+    aim_x = g_right_stick_x / magnitude;
+    aim_y = g_right_stick_y / magnitude;
+  } else {
+    float magnitude = Samus_GetLeftStickMagnitude();
+    if (magnitude > 0.0f) {
+      aim_x = g_left_stick_x / magnitude;
+      aim_y = g_left_stick_y / magnitude;
+    }
+  }
+  if (aim_x == 0.0f && aim_y == 0.0f)
+    return 0;
+  uint8 angle = (uint8)(int)(((atan2f(aim_y, aim_x) / (2.0f * (float)M_PI)) * 256.0f) + 0.5f);
+  return kSegmentToButtons[(uint8)(angle + 16 + 64) >> 5];
+}
+
+static void UpdateAimButtonsCache(void) {
+  if (g_aim_buttons_frame == snes_frame_counter)
+    return;
+  g_aim_buttons_frame = snes_frame_counter;
+  g_aim_buttons_prev = g_aim_buttons_held;
+  g_aim_buttons_held = ComputeAimButtons();
+}
+
+uint16 Samus_GetAimButtonsHeld(void) {
+  UpdateAimButtonsCache();
+  return g_aim_buttons_held;
+}
+
+uint16 Samus_GetAimButtonsPressed(void) {
+  UpdateAimButtonsCache();
+  return g_aim_buttons_held & ~g_aim_buttons_prev;
+}
+
+bool Samus_HasHorizontalMovementInput(void) {
+  return Samus_GetHorizontalInputMagnitude() >= 0.1f;
+}
+
+bool Samus_ShouldTreatRunButtonAsHeld(void) {
+  if (Samus_GetHorizontalInputMagnitude() >= 0.1f)
+    return true;
+  return samus_x_extra_run_speed != 0 || samus_x_extra_run_subspeed != 0 ||
+         samus_x_base_speed >= 1 || samus_total_x_speed >= 1;
+}
 
 void RtlSetupEmuCallbacks(uint8 *emu_ram, RunFrameFunc *func, SyncAllFunc *sync_all) {
   g_rtl_memory_ptr = emu_ram;

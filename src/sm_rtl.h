@@ -2,6 +2,7 @@
 #include "types.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdbool.h>
 
 extern uint8 g_ram[0x20000];
 extern void RtlApuWrite(uint32 adr, uint8 val);
@@ -12,6 +13,10 @@ extern const uint8 *g_rom;
 extern bool g_use_my_apu_code;
 #define LONGPTR(t) {(t) & 0xffff, (t) >> 16}
 extern bool g_debug_flag;
+extern float g_left_stick_x;
+extern float g_left_stick_y;
+extern float g_right_stick_x;
+extern float g_right_stick_y;
 
 typedef void HandlerFunc(void);
 typedef uint8 Func_V_A(void);
@@ -120,6 +125,22 @@ void RtlWriteSram();
 void RtlSaveSnapshot(const char *filename, bool saving_with_bug);
 void RtlUpdateSnesPatchForBugfix();
 extern uint16 currently_installed_bug_fix_counter;
+extern bool g_skip_menu;
+
+float Samus_GetLeftStickMagnitude(void);
+float Samus_GetHorizontalInputMagnitude(void);
+float Samus_GetShapedHorizontalInputMagnitude(void);
+float Samus_GetAimInputMagnitude(void);
+bool Samus_IsAiming(void);
+void Samus_GetNormalizedAimDirection(float *out_x, float *out_y);
+int Samus_GetMovementDirectionSign(void);
+uint8 Samus_GetDiscreteAimDirection(void);
+int16 Samus_GetProjectileInheritanceX(void);
+int16 Samus_GetProjectileInheritanceY(void);
+uint16 Samus_GetAimButtonsHeld(void);
+uint16 Samus_GetAimButtonsPressed(void);
+bool Samus_HasHorizontalMovementInput(void);
+bool Samus_ShouldTreatRunButtonAsHeld(void);
 
 uint16 Mult8x8(uint8 a, uint8 b);
 uint16 SnesDivide(uint16 a, uint8 b);

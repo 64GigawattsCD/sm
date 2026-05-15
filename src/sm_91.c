@@ -3,6 +3,7 @@
 #include "variables.h"
 #include "funcs.h"
 #include "sm_rtl.h"
+#include <math.h>
 
 
 #define unk_91CAF2 (*(SpawnHdmaObject_Args*)RomFixedPtr(0x91caf2))
@@ -40,7 +41,14 @@ typedef struct Pair_R18_R20 {
   uint16 r18, r20;
 } Pair_R18_R20;
 
+typedef struct AnalogAimPoseCandidate {
+  uint16 pose;
+  float heading_x;
+  float heading_y;
+} AnalogAimPoseCandidate;
+
 Pair_R18_R20 TranslateCustomControllerBindingsToDefault(void);
+static void Samus_ApplyAnalogAimPose(void);
 
 
 static Func_V *const kSamusInputHandlers[28] = {
@@ -206,22 +214,28 @@ void Samus_Input_1B_ShinesparkEtc(void) {  // 0x9181A1
 }
 
 void Samus_LookupTransitionTable(void) {  // 0x9181A9
-  if (joypad1_lastkeys) {
-    Pair_R18_R20 pair = TranslateCustomControllerBindingsToDefault();
+  Pair_R18_R20 pair = TranslateCustomControllerBindingsToDefault();
+  if (joypad1_lastkeys || joypad1_newkeys || Samus_IsAiming()) {
     PoseEntry *pe = get_PoseEntry(kPoseTransitionTable[samus_pose]);
-    if (pe->new_input == 0xFFFF)
+    if (pe->new_input == 0xFFFF) {
+      Samus_ApplyAnalogAimPose();
       return;
+    }
     do {
       if ((pair.r18 & pe->new_input) == 0 && (pair.r20 & pe->cur_input) == 0) {
         if (pe->new_pose != samus_pose) {
           samus_new_pose = pe->new_pose;
           bomb_jump_dir = 0;
         }
+        Samus_ApplyAnalogAimPose();
         return;
       }
       pe++;
     } while (pe->new_input != 0xFFFF);
   }
+  Samus_ApplyAnalogAimPose();
+  if (Samus_IsAiming() && samus_new_pose != 0)
+    return;
   UNUSED_word_7E0A18 = 0;
   Samus_Pose_CancelGrapple();
 }
@@ -234,32 +248,133 @@ Pair_R18_R20 TranslateCustomControllerBindingsToDefault(void) {  // 0x9181F4
     r18 |= kButton_X;
   if ((button_config_jump_a & v0) != 0)
     r18 |= kButton_A;
-  if ((button_config_run_b & v0) != 0)
+  if (Samus_ShouldTreatRunButtonAsHeld())
     r18 |= kButton_B;
   if ((button_config_itemcancel_y & v0) != 0)
     r18 |= kButton_Y;
-  if ((button_config_aim_up_R & v0) != 0) {
-    if ((button_config_aim_up_R & (kButton_L | kButton_R)) != 0)
-      r18 |= kButton_R;
-  }
-  if ((button_config_aim_down_L & v0) != 0 && (button_config_aim_down_L & (kButton_L | kButton_R)) != 0)
-    r18 |= kButton_L;
   uint16 v1 = joypad1_lastkeys;
   if ((button_config_shoot_x & joypad1_lastkeys) != 0)
     r20 |= kButton_X;
   if ((button_config_jump_a & v1) != 0)
     r20 |= kButton_A;
-  if ((button_config_run_b & v1) != 0)
+  if (Samus_ShouldTreatRunButtonAsHeld())
     r20 |= kButton_B;
   if ((button_config_itemcancel_y & v1) != 0)
     r20 |= kButton_Y;
-  if ((button_config_aim_up_R & v1) != 0) {
-    if ((button_config_aim_up_R & (kButton_L | kButton_R)) != 0)
-      r20 |= kButton_R;
-  }
-  if ((button_config_aim_down_L & v1) != 0 && (button_config_aim_down_L & (kButton_L | kButton_R)) != 0)
-    r20 |= kButton_L;
   return (Pair_R18_R20) { ~r18, ~r20 };
+}
+
+static uint16 Samus_SelectBestAnalogAimPose(const AnalogAimPoseCandidate *candidates, int count,
+                                            float aim_x, float aim_y) {
+  float best_dot = -9999.0f;
+  uint16 best_pose = 0;
+  for (int i = 0; i < count; i++) {
+    float dot = aim_x * candidates[i].heading_x + aim_y * candidates[i].heading_y;
+    if (dot > best_dot) {
+      best_dot = dot;
+      best_pose = candidates[i].pose;
+    }
+  }
+  return best_pose;
+}
+
+static uint16 Samus_GetAnalogAimPoseForState(float aim_x, float aim_y) {
+  static const AnalogAimPoseCandidate kStandingPoses[] = {
+    { kPose_01_FaceR_Normal, 1.0f, 0.0f },
+    { kPose_02_FaceL_Normal, -1.0f, 0.0f },
+    { kPose_03_FaceR_AimU, 0.0f, -1.0f },
+    { kPose_04_FaceL_AimU, 0.0f, -1.0f },
+    { kPose_05_FaceR_AimUR, 0.70710677f, -0.70710677f },
+    { kPose_06_FaceL_AimUL, -0.70710677f, -0.70710677f },
+    { kPose_07_FaceR_AimDR, 0.70710677f, 0.70710677f },
+    { kPose_08_FaceL_AimDL, -0.70710677f, 0.70710677f },
+  };
+  static const AnalogAimPoseCandidate kRunningPoses[] = {
+    { kPose_09_MoveR_NoAim, 1.0f, 0.0f },
+    { kPose_0A_MoveL_NoAim, -1.0f, 0.0f },
+    { kPose_0F_MoveR_AimUR, 0.70710677f, -0.70710677f },
+    { kPose_10_MoveL_AimUL, -0.70710677f, -0.70710677f },
+    { kPose_11_MoveR_AimDR, 0.70710677f, 0.70710677f },
+    { kPose_12_MoveL_AimDL, -0.70710677f, 0.70710677f },
+  };
+  static const AnalogAimPoseCandidate kMoonwalkPoses[] = {
+    { kPose_4A_FaceR_Moonwalk, 1.0f, 0.0f },
+    { kPose_49_FaceL_Moonwalk, -1.0f, 0.0f },
+    { kPose_76_FaceR_Moonwalk_AimUR, 0.70710677f, -0.70710677f },
+    { kPose_75_FaceL_Moonwalk_AimUL, -0.70710677f, -0.70710677f },
+    { kPose_78_FaceR_Moonwalk_AimDR, 0.70710677f, 0.70710677f },
+    { kPose_77_FaceL_Moonwalk_AimDL, -0.70710677f, 0.70710677f },
+  };
+  static const AnalogAimPoseCandidate kJumpingPoses[] = {
+    { kPose_13_FaceR_Jump_NoAim_NoMove_Gun, 1.0f, 0.0f },
+    { kPose_14_FaceL_Jump_NoAim_NoMove_Gun, -1.0f, 0.0f },
+    { kPose_15_FaceR_Jump_AimU, 0.0f, -1.0f },
+    { kPose_16_FaceL_Jump_AimU, 0.0f, -1.0f },
+    { kPose_69_FaceR_Jump_AimUR, 0.70710677f, -0.70710677f },
+    { kPose_6A_FaceL_Jump_AimUL, -0.70710677f, -0.70710677f },
+    { kPose_6B_FaceR_Jump_AimDR, 0.70710677f, 0.70710677f },
+    { kPose_6C_FaceL_Jump_AimDL, -0.70710677f, 0.70710677f },
+  };
+  static const AnalogAimPoseCandidate kFallingPoses[] = {
+    { kPose_67_FaceR_Fall_Gun, 1.0f, 0.0f },
+    { kPose_68_FaceL_Fall_Gun, -1.0f, 0.0f },
+    { kPose_2B_FaceR_Fall_AimU, 0.0f, -1.0f },
+    { kPose_2C_FaceL_Fall_AimU, 0.0f, -1.0f },
+    { kPose_6D_FaceR_Fall_AimUR, 0.70710677f, -0.70710677f },
+    { kPose_6E_FaceL_Fall_AimUL, -0.70710677f, -0.70710677f },
+    { kPose_6F_FaceR_Fall_AimDR, 0.70710677f, 0.70710677f },
+    { kPose_70_FaceL_Fall_AimDL, -0.70710677f, 0.70710677f },
+  };
+  static const AnalogAimPoseCandidate kCrouchingPoses[] = {
+    { kPose_27_FaceR_Crouch, 1.0f, 0.0f },
+    { kPose_28_FaceL_Crouch, -1.0f, 0.0f },
+    { kPose_85_FaceR_Crouch_AimU, 0.0f, -1.0f },
+    { kPose_86_FaceL_Crouch_AimU, 0.0f, -1.0f },
+    { kPose_71_FaceR_Crouch_AimUR, 0.70710677f, -0.70710677f },
+    { kPose_72_FaceL_Crouch_AimUL, -0.70710677f, -0.70710677f },
+    { kPose_73_FaceR_Crouch_AimDR, 0.70710677f, 0.70710677f },
+    { kPose_74_FaceL_Crouch_AimDL, -0.70710677f, 0.70710677f },
+  };
+
+  switch (samus_movement_type) {
+  case kMovementType_00_Standing:
+  case kMovementType_0E_TurningAroundOnGround:
+    return Samus_SelectBestAnalogAimPose(kStandingPoses, sizeof(kStandingPoses) / sizeof(kStandingPoses[0]), aim_x, aim_y);
+  case kMovementType_01_Running:
+  case kMovementType_10_Moonwalking: {
+    int move_sign = Samus_GetMovementDirectionSign();
+    bool moonwalk = move_sign != 0 && ((move_sign > 0) != (aim_x >= 0.0f));
+    const AnalogAimPoseCandidate *cands = moonwalk ? kMoonwalkPoses : kRunningPoses;
+    int count = moonwalk ? (int)(sizeof(kMoonwalkPoses) / sizeof(kMoonwalkPoses[0])) : (int)(sizeof(kRunningPoses) / sizeof(kRunningPoses[0]));
+    return Samus_SelectBestAnalogAimPose(cands, count, aim_x, aim_y);
+  }
+  case kMovementType_02_NormalJumping:
+  case kMovementType_17_TurningAroundJumping:
+    return Samus_SelectBestAnalogAimPose(kJumpingPoses, sizeof(kJumpingPoses) / sizeof(kJumpingPoses[0]), aim_x, aim_y);
+  case kMovementType_06_Falling:
+  case kMovementType_18_TurningAroundFalling:
+    return Samus_SelectBestAnalogAimPose(kFallingPoses, sizeof(kFallingPoses) / sizeof(kFallingPoses[0]), aim_x, aim_y);
+  case kMovementType_05_Crouching:
+  case kMovementType_0F_CrouchingEtcTransition:
+    return Samus_SelectBestAnalogAimPose(kCrouchingPoses, sizeof(kCrouchingPoses) / sizeof(kCrouchingPoses[0]), aim_x, aim_y);
+  default:
+    return 0;
+  }
+}
+
+static void Samus_ApplyAnalogAimPose(void) {
+  if (!Samus_IsAiming())
+    return;
+  if ((button_config_jump_a & joypad1_newkeys) != 0)
+    return;
+  float aim_x, aim_y;
+  Samus_GetNormalizedAimDirection(&aim_x, &aim_y);
+  bool facing_right = (aim_x > 0.0f) ? true : (aim_x < 0.0f ? false : samus_pose_x_dir != 4);
+  uint16 new_pose = Samus_GetAnalogAimPoseForState(aim_x, aim_y);
+  if (new_pose) {
+    samus_pose_x_dir = facing_right ? 8 : 4;
+    samus_new_pose = new_pose;
+  }
 }
 
 void Samus_Pose_CancelGrapple(void) {  // 0x9182D9
@@ -557,7 +672,7 @@ void LoadDemoData(void) {
   button_config_aim_down_L = kButton_L;
   UNUSED_word_7E09E8 = 1;
   debug_flag = 1;
-  moonwalk_flag = 0;
+  moonwalk_flag = 1;
   UNUSED_word_7E0DF8 = 0;
   UNUSED_word_7E0DFA = 0;
   UNUSED_word_7E0DFC = 0;
@@ -847,7 +962,7 @@ void CalculateXrayHdmaTableInner(uint16 k, uint16 j, uint16 r18, uint16 r20, boo
 }
 
 void XrayRunHandler(void) {  // 0x91CAD6
-  if (!time_is_frozen_flag && (button_config_run_b & joypad1_lastkeys) != 0) {
+  if (!time_is_frozen_flag && Samus_ShouldTreatRunButtonAsHeld()) {
     if (Xray_Initialize() & 1)
       SpawnHdmaObject(0x91, &unk_91CAF2);
   }
@@ -3531,13 +3646,8 @@ uint8 MaybeUnused_sub_91F840(void) {  // 0x91F840
 }
 
 uint8 SamusFunc_F468_Moonwalking(void) {  // 0x91F88C
-  if (moonwalk_flag)
-    return 0;
-  if (samus_pose_x_dir == 4)
-    samus_pose = kPose_25_FaceR_Turn_Stand;
-  else
-    samus_pose = kPose_26_FaceL_Turn_Stand;
-  return 1;
+  moonwalk_flag = 1;
+  return 0;
 }
 
 uint8 SamusFunc_F468_DamageBoost(void) {  // 0x91F8AE

@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <math.h>
 #include <SDL.h>
 #ifdef _WIN32
 #include "platform/win32/volume_control.h"
@@ -18,6 +19,10 @@
 #include "types.h"
 #include "sm_rtl.h"
 #include "sm_cpu_infra.h"
+#include "ida_types.h"
+#include "variables.h"
+#include "variables_extra.h"
+#include "funcs.h"
 #include "config.h"
 #include "util.h"
 #include "spc_player.h"
@@ -38,6 +43,12 @@ static int RemapSdlButton(int button);
 static void HandleGamepadInput(int button, bool pressed);
 static void HandleInput(int keyCode, int keyMod, bool pressed);
 static void HandleCommand(uint32 j, bool pressed);
+static uint16 GetInputBitForControlCommand(uint32 j);
+static bool IsDirectionalControlCommand(uint16 cmd);
+static bool IsGameplayMovementState(void);
+static void UpdateOpeningIntroSkipState(uint16 inputs);
+static void RenderOpeningIntroSkipPrompt(uint8 *pixel_buffer, size_t pitch, int width, int height);
+static void RenderAnalogDebugOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height);
 void OpenGLRenderer_Create(struct RendererFuncs *funcs);
 
 bool g_debug_flag;
@@ -70,7 +81,8 @@ static SDL_Window *g_window;
 
 static uint8 g_paused, g_turbo, g_replay_turbo = true, g_cursor = true;
 static uint8 g_current_window_scale;
-static uint8 g_gamepad_buttons;
+static uint8 g_gamepad_analog_buttons;
+static uint8 g_gamepad_dpad_buttons;
 static int g_input1_state;
 static bool g_display_perf;
 static int g_curr_fps;
@@ -80,7 +92,16 @@ static int g_sdl_audio_mixer_volume = SDL_MIX_MAXVOLUME;
 static struct RendererFuncs g_renderer_funcs;
 static uint32 g_gamepad_modifiers;
 static uint16 g_gamepad_last_cmd[kGamepadBtn_Count];
+static uint8 g_intro_skip_hold_frames;
 extern Snes *g_snes;
+
+enum {
+  kOpeningIntroSkipHoldFrames = 60,
+  // main.c feeds RtlRunFrame a packed 12-button frontend bitfield.
+  // The SNES Start mask is produced later after SwapInputBits(), so use the
+  // frontend bit here instead of kButton_Start.
+  kInputBit_Start = 1 << 3,
+};
 
 void NORETURN Die(const char *error) {
   SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, kWindowTitle, error, NULL);
@@ -193,8 +214,8 @@ static void DrawPpuFrameWithPerf(void) {
   if (g_display_perf)
     RenderNumber(pixel_buffer + pitch * render_scale, pitch, g_curr_fps, render_scale == 4);
 
-  if (g_got_mismatch_count)
-    RenderNumber(pixel_buffer + pitch * render_scale, pitch, g_got_mismatch_count, render_scale == 4);
+  RenderAnalogDebugOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+  RenderOpeningIntroSkipPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
 
   g_renderer_funcs.EndDraw();
 }
@@ -446,7 +467,6 @@ int main(int argc, char** argv) {
   uint32 curTick = 0;
   uint32 frameCtr = 0;
   uint8 audiopaused = true;
-  bool has_bug_in_title = false;
 
   while (running) {
     SDL_Event event;
@@ -503,9 +523,13 @@ int main(int argc, char** argv) {
 
     // Clear gamepad inputs when joypad directional inputs to avoid wonkiness
     int inputs = g_input1_state;
+    uint8 analog_buttons = g_gamepad_analog_buttons;
     if (g_input1_state & 0xf0)
-      g_gamepad_buttons = 0;
-    inputs |= g_gamepad_buttons;
+      analog_buttons = 0;
+    inputs |= analog_buttons;
+    if (!IsGameplayMovementState())
+      inputs |= g_gamepad_dpad_buttons;
+    UpdateOpeningIntroSkipState(inputs);
 
     uint8 is_replay = RtlRunFrame(inputs);
 
@@ -514,18 +538,6 @@ int main(int argc, char** argv) {
 
     if (!g_snes->disableRender)
       DrawPpuFrameWithPerf();
-
-    bool want_bug_in_title = (g_got_mismatch_count != 0);
-    if (want_bug_in_title != has_bug_in_title) {
-      has_bug_in_title = want_bug_in_title;
-      char title[60];
-      if (want_bug_in_title) {
-        snprintf(title, sizeof(title), "%s | BUG FOUND!", kWindowTitle);
-        SDL_SetWindowTitle(g_window, title);
-      } else {
-        SDL_SetWindowTitle(g_window, kWindowTitle);
-      }
-    }
 
     // if vsync isn't working, delay manually
     curTick = SDL_GetTicks();
@@ -614,13 +626,242 @@ static void RenderNumber(uint8 *dst, size_t pitch, int n, uint8 big) {
     RenderDigit(dst + (i << big), pitch, *s - '0', 0xffffff, big);
 }
 
+static bool IsOpeningIntroSkippable(void) {
+  return game_state == kGameState_30_IntroCinematic &&
+    cinematic_function != FUNC16(CinematicFunction_Intro_Func72) &&
+    cinematic_function != FUNC16(CinematicFunction_Intro_Func73);
+}
+
+static void UpdateOpeningIntroSkipState(uint16 inputs) {
+  if (!IsOpeningIntroSkippable()) {
+    g_intro_skip_hold_frames = 0;
+    return;
+  }
+
+  if ((inputs & kInputBit_Start) == 0) {
+    g_intro_skip_hold_frames = 0;
+    return;
+  }
+
+  if (g_intro_skip_hold_frames < kOpeningIntroSkipHoldFrames)
+    ++g_intro_skip_hold_frames;
+
+  if (g_intro_skip_hold_frames == kOpeningIntroSkipHoldFrames) {
+    NewSaveFile();
+    screen_fade_delay = 0;
+    screen_fade_counter = 0;
+    cinematic_function = FUNC16(CinematicFunction_Intro_Func72);
+    g_intro_skip_hold_frames = 0;
+  }
+}
+
+static void PutPixel(uint8 *pixel_buffer, size_t pitch, int x, int y, uint32 color) {
+  ((uint32 *)(pixel_buffer + y * pitch))[x] = color;
+}
+
+static void FillRect(uint8 *pixel_buffer, size_t pitch, int width, int height, int x, int y, int w, int h, uint32 color) {
+  int x0 = IntMax(x, 0), y0 = IntMax(y, 0);
+  int x1 = IntMin(x + w, width), y1 = IntMin(y + h, height);
+  for (int py = y0; py < y1; py++) {
+    uint32 *dst = (uint32 *)(pixel_buffer + py * pitch);
+    for (int px = x0; px < x1; px++)
+      dst[px] = color;
+  }
+}
+
+static void DrawRectOutline(uint8 *pixel_buffer, size_t pitch, int width, int height, int x, int y, int w, int h, int thickness, uint32 color) {
+  FillRect(pixel_buffer, pitch, width, height, x, y, w, thickness, color);
+  FillRect(pixel_buffer, pitch, width, height, x, y + h - thickness, w, thickness, color);
+  FillRect(pixel_buffer, pitch, width, height, x, y, thickness, h, color);
+  FillRect(pixel_buffer, pitch, width, height, x + w - thickness, y, thickness, h, color);
+}
+
+static void DrawGlyph5x7(uint8 *pixel_buffer, size_t pitch, int width, int height, int x, int y, char ch, int scale, uint32 color) {
+  static const struct {
+    char ch;
+    uint8 rows[7];
+  } kGlyphs[] = {
+    { ' ', { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+    { '+', { 0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00 } },
+    { '-', { 0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00 } },
+    { '.', { 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x06 } },
+    { '0', { 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E } },
+    { '1', { 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E } },
+    { '2', { 0x0E, 0x11, 0x10, 0x08, 0x04, 0x02, 0x1F } },
+    { '3', { 0x1E, 0x10, 0x10, 0x0C, 0x10, 0x10, 0x1E } },
+    { '4', { 0x08, 0x0C, 0x0A, 0x09, 0x1F, 0x08, 0x08 } },
+    { '5', { 0x1F, 0x01, 0x01, 0x0F, 0x10, 0x10, 0x0F } },
+    { '6', { 0x0E, 0x01, 0x01, 0x0F, 0x11, 0x11, 0x0E } },
+    { '7', { 0x1F, 0x10, 0x08, 0x04, 0x02, 0x02, 0x02 } },
+    { '8', { 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E } },
+    { '9', { 0x0E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x0E } },
+    { ':', { 0x00, 0x06, 0x06, 0x00, 0x06, 0x06, 0x00 } },
+    { 'A', { 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 } },
+    { 'D', { 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E } },
+    { 'H', { 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 } },
+    { 'L', { 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x1F } },
+    { 'O', { 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E } },
+    { 'P', { 0x0F, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x01 } },
+    { 'R', { 0x1E, 0x11, 0x11, 0x1E, 0x09, 0x11, 0x11 } },
+    { 'S', { 0x1E, 0x01, 0x01, 0x0E, 0x10, 0x10, 0x0F } },
+    { 'T', { 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 } },
+    { 'X', { 0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11 } },
+    { 'Y', { 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04 } },
+  };
+  const uint8 *rows = NULL;
+  for (size_t i = 0; i < sizeof(kGlyphs) / sizeof(kGlyphs[0]); i++) {
+    if (kGlyphs[i].ch == ch) {
+      rows = kGlyphs[i].rows;
+      break;
+    }
+  }
+  if (!rows)
+    return;
+
+  for (int gy = 0; gy < 7; gy++) {
+    for (int gx = 0; gx < 5; gx++) {
+      if ((rows[gy] & (1 << (4 - gx))) == 0)
+        continue;
+      FillRect(pixel_buffer, pitch, width, height, x + gx * scale, y + gy * scale, scale, scale, color);
+    }
+  }
+}
+
+static void DrawText5x7(uint8 *pixel_buffer, size_t pitch, int width, int height, int x, int y, const char *text, int scale, uint32 color) {
+  for (int i = 0; text[i]; i++)
+    DrawGlyph5x7(pixel_buffer, pitch, width, height, x + i * scale * 6, y, text[i], scale, color);
+}
+
+static void DrawPoint(uint8 *pixel_buffer, size_t pitch, int width, int height, int x, int y, int size, uint32 color) {
+  FillRect(pixel_buffer, pitch, width, height, x - size / 2, y - size / 2, size, size, color);
+}
+
+static void DrawLine(uint8 *pixel_buffer, size_t pitch, int width, int height, int x0, int y0, int x1, int y1, int thickness, uint32 color) {
+  int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+  int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+  int err = dx + dy;
+  while (1) {
+    DrawPoint(pixel_buffer, pitch, width, height, x0, y0, thickness, color);
+    if (x0 == x1 && y0 == y1)
+      break;
+    int e2 = 2 * err;
+    if (e2 >= dy) {
+      err += dy;
+      x0 += sx;
+    }
+    if (e2 <= dx) {
+      err += dx;
+      y0 += sy;
+    }
+  }
+}
+
+static void FormatAnalogValue(char *dst, size_t dst_size, float value) {
+  float clamped = value;
+  if (clamped > 1.0f)
+    clamped = 1.0f;
+  else if (clamped < -1.0f)
+    clamped = -1.0f;
+  snprintf(dst, dst_size, "%+.2f", clamped);
+}
+
+static void DrawCircleProgress(uint8 *pixel_buffer, size_t pitch, int width, int height, int cx, int cy, int radius, int thickness, float progress) {
+  const int segments = 64;
+  const int active_segments = (int)(progress * segments + 0.5f);
+  for (int i = 0; i < segments; i++) {
+    float t = (float)i / segments * 2.0f * (float)M_PI - (float)M_PI * 0.5f;
+    int px = cx + (int)lroundf(cosf(t) * radius);
+    int py = cy + (int)lroundf(sinf(t) * radius);
+    uint32 color = (i < active_segments) ? 0x8FEA7D : 0x3A3A3A;
+    FillRect(pixel_buffer, pitch, width, height, px - thickness / 2, py - thickness / 2, thickness, thickness, color);
+  }
+}
+
+static void RenderOpeningIntroSkipPrompt(uint8 *pixel_buffer, size_t pitch, int width, int height) {
+  if (!IsOpeningIntroSkippable())
+    return;
+
+  const int scale = IntMax(1, height / 240);
+  const int ring_radius = 18 * scale;
+  const int ring_thickness = 3 * scale;
+  const int margin = 12 * scale;
+  const int cx = width - margin - ring_radius;
+  const int cy = height - margin - ring_radius;
+  const int icon_w = 34 * scale;
+  const int icon_h = 12 * scale;
+  const int icon_x = cx - icon_w / 2;
+  const int icon_y = cy - icon_h / 2;
+  const int hold_text_x = cx - 12 * scale;
+  const int hold_text_y = icon_y - 10 * scale;
+  float progress = (float)g_intro_skip_hold_frames / kOpeningIntroSkipHoldFrames;
+
+  FillRect(pixel_buffer, pitch, width, height, icon_x, icon_y, icon_w, icon_h, 0x111111);
+  DrawRectOutline(pixel_buffer, pitch, width, height, icon_x, icon_y, icon_w, icon_h, IntMax(1, scale), 0xFFFFFF);
+  DrawText5x7(pixel_buffer, pitch, width, height, hold_text_x, hold_text_y, "HOLD", scale, 0xFFFFFF);
+  DrawText5x7(pixel_buffer, pitch, width, height, icon_x + 2 * scale, icon_y + 2 * scale, "START", scale, 0xFFFFFF);
+  DrawCircleProgress(pixel_buffer, pitch, width, height, cx, cy, ring_radius, ring_thickness, progress);
+}
+
+static void RenderAnalogDebugOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height) {
+  char line[48], lx[8], ly[8];
+  int scale = IntMax(1, height / 240);
+  int x = 4 * scale;
+  int y = 4 * scale;
+  int arrow_box = 18 * scale;
+  int arrow_cx = width - 18 * scale;
+  int arrow_cy = 14 * scale;
+  float aim_x, aim_y;
+
+  FormatAnalogValue(lx, sizeof(lx), g_left_stick_x);
+  FormatAnalogValue(ly, sizeof(ly), g_left_stick_y);
+  snprintf(line, sizeof(line), "LX:%s LY:%s", lx, ly);
+  DrawText5x7(pixel_buffer, pitch, width, height, x + scale, y + scale, line, scale, 0x000000);
+  DrawText5x7(pixel_buffer, pitch, width, height, x, y, line, scale, 0xFFFFFF);
+
+  Samus_GetNormalizedAimDirection(&aim_x, &aim_y);
+  DrawRectOutline(pixel_buffer, pitch, width, height,
+      arrow_cx - arrow_box / 2, arrow_cy - arrow_box / 2, arrow_box, arrow_box, IntMax(1, scale), 0x7A7A7A);
+  DrawLine(pixel_buffer, pitch, width, height,
+      arrow_cx - 1, arrow_cy - 1, arrow_cx + 1, arrow_cy + 1, IntMax(1, scale), 0x7A7A7A);
+  if (aim_x != 0.0f || aim_y != 0.0f) {
+    int shaft = 7 * scale;
+    int head = 3 * scale;
+    int tip_x = arrow_cx + (int)lroundf(aim_x * shaft);
+    int tip_y = arrow_cy + (int)lroundf(aim_y * shaft);
+    int back_x = arrow_cx - (int)lroundf(aim_x * (2 * scale));
+    int back_y = arrow_cy - (int)lroundf(aim_y * (2 * scale));
+    float perp_x = -aim_y;
+    float perp_y = aim_x;
+    int left_x = tip_x - (int)lroundf(aim_x * head) + (int)lroundf(perp_x * head);
+    int left_y = tip_y - (int)lroundf(aim_y * head) + (int)lroundf(perp_y * head);
+    int right_x = tip_x - (int)lroundf(aim_x * head) - (int)lroundf(perp_x * head);
+    int right_y = tip_y - (int)lroundf(aim_y * head) - (int)lroundf(perp_y * head);
+    DrawLine(pixel_buffer, pitch, width, height, back_x, back_y, tip_x, tip_y, IntMax(1, scale), 0x8FEA7D);
+    DrawLine(pixel_buffer, pitch, width, height, tip_x, tip_y, left_x, left_y, IntMax(1, scale), 0x8FEA7D);
+    DrawLine(pixel_buffer, pitch, width, height, tip_x, tip_y, right_x, right_y, IntMax(1, scale), 0x8FEA7D);
+  }
+}
+
+static uint16 GetInputBitForControlCommand(uint32 j) {
+  static const uint8 kKbdRemap[] = { 0, 4, 5, 6, 7, 2, 3, 8, 0, 9, 1, 10, 11 };
+  return (j >= kKeys_Controls && j <= kKeys_Controls_Last) ? (1 << kKbdRemap[j]) : 0;
+}
+
+static bool IsDirectionalControlCommand(uint16 cmd) {
+  return cmd >= kKeys_Controls && cmd <= kKeys_Controls + 3;
+}
+
+static bool IsGameplayMovementState(void) {
+  return game_state == kGameState_7_MainGameplayFadeIn || game_state == kGameState_8_MainGameplay;
+}
+
 static void HandleCommand(uint32 j, bool pressed) {
   if (j <= kKeys_Controls_Last) {
-    static const uint8 kKbdRemap[] = { 0, 4, 5, 6, 7, 2, 3, 8, 0, 9, 1, 10, 11 };
+    uint16 bit = GetInputBitForControlCommand(j);
     if (pressed)
-      g_input1_state |= 1 << kKbdRemap[j];
+      g_input1_state |= bit;
     else
-      g_input1_state &= ~(1 << kKbdRemap[j]);
+      g_input1_state &= ~bit;
     return;
   }
 
@@ -729,8 +970,17 @@ static void HandleGamepadInput(int button, bool pressed) {
   g_gamepad_modifiers ^= 1 << button;
   if (pressed)
     g_gamepad_last_cmd[button] = FindCmdForGamepadButton(button, g_gamepad_modifiers);
-  if (g_gamepad_last_cmd[button] != 0)
+  if (g_gamepad_last_cmd[button] != 0) {
+    if (button >= kGamepadBtn_DpadUp && button <= kGamepadBtn_DpadRight && IsDirectionalControlCommand(g_gamepad_last_cmd[button])) {
+      uint16 bit = GetInputBitForControlCommand(g_gamepad_last_cmd[button]);
+      if (pressed)
+        g_gamepad_dpad_buttons |= bit;
+      else
+        g_gamepad_dpad_buttons &= ~bit;
+      return;
+    }
     HandleCommand(g_gamepad_last_cmd[button], pressed);
+  }
 }
 
 static void HandleVolumeAdjustment(int volume_adjustment) {
@@ -766,36 +1016,67 @@ static float ApproximateAtan2(float y, float x) {
   return q + *(float *)&uatan_2q;
 }
 
+static float NormalizeGamepadAxis(int value) {
+  const float raw = value >= 0 ? value / 32767.0f : value / 32768.0f;
+  return raw < -1.0f ? -1.0f : (raw > 1.0f ? 1.0f : raw);
+}
+
+static void NormalizeStickPosition(int x, int y, float *out_x, float *out_y) {
+  const float deadzone = 0.025f;
+  const float raw_x = NormalizeGamepadAxis(x);
+  const float raw_y = NormalizeGamepadAxis(y);
+  const float magnitude = sqrtf(raw_x * raw_x + raw_y * raw_y);
+  if (magnitude >= deadzone) {
+    const float scaled = fminf((magnitude - deadzone) / (1.0f - deadzone), 1.0f);
+    const float inv_magnitude = magnitude > 0.0f ? 1.0f / magnitude : 0.0f;
+    *out_x = raw_x * inv_magnitude * scaled;
+    *out_y = raw_y * inv_magnitude * scaled;
+  } else {
+    *out_x = 0.0f;
+    *out_y = 0.0f;
+  }
+}
+
 static void HandleGamepadAxisInput(int gamepad_id, int axis, int value) {
-  static int last_gamepad_id, last_x, last_y;
-  if (axis == SDL_CONTROLLER_AXIS_LEFTX || axis == SDL_CONTROLLER_AXIS_LEFTY) {
+  static int last_gamepad_id, last_left_x, last_left_y, last_right_x, last_right_y;
+  if (axis == SDL_CONTROLLER_AXIS_LEFTX || axis == SDL_CONTROLLER_AXIS_LEFTY ||
+      axis == SDL_CONTROLLER_AXIS_RIGHTX || axis == SDL_CONTROLLER_AXIS_RIGHTY) {
     // ignore other gamepads unless they have a big input
     if (last_gamepad_id != gamepad_id) {
-      if (value > -16000 && value < 16000)
+      if (value > -6000 && value < 6000)
         return;
       last_gamepad_id = gamepad_id;
-      last_x = last_y = 0;
+      last_left_x = last_left_y = 0;
+      last_right_x = last_right_y = 0;
     }
-    *(axis == SDL_CONTROLLER_AXIS_LEFTX ? &last_x : &last_y) = value;
-    int buttons = 0;
-    if (last_x * last_x + last_y * last_y >= 10000 * 10000) {
-      // in the non deadzone part, divide the circle into eight 45 degree
-      // segments rotated by 22.5 degrees that control which direction to move.
-      // todo: do this without floats?
-      static const uint8 kSegmentToButtons[8] = {
-        1 << 4,           // 0 = up
-        1 << 4 | 1 << 7,  // 1 = up, right
-        1 << 7,           // 2 = right
-        1 << 7 | 1 << 5,  // 3 = right, down
-        1 << 5,           // 4 = down
-        1 << 5 | 1 << 6,  // 5 = down, left
-        1 << 6,           // 6 = left
-        1 << 6 | 1 << 4,  // 7 = left, up
-      };
-      uint8 angle = (uint8)(int)(ApproximateAtan2(last_y, last_x) * 64.0f + 0.5f);
-      buttons = kSegmentToButtons[(uint8)(angle + 16 + 64) >> 5];
+    if (axis == SDL_CONTROLLER_AXIS_LEFTX || axis == SDL_CONTROLLER_AXIS_LEFTY) {
+      *(axis == SDL_CONTROLLER_AXIS_LEFTX ? &last_left_x : &last_left_y) = value;
+      NormalizeStickPosition(last_left_x, last_left_y, &g_left_stick_x, &g_left_stick_y);
+    } else {
+      *(axis == SDL_CONTROLLER_AXIS_RIGHTX ? &last_right_x : &last_right_y) = value;
+      NormalizeStickPosition(last_right_x, last_right_y, &g_right_stick_x, &g_right_stick_y);
     }
-    g_gamepad_buttons = buttons;
+    if (axis == SDL_CONTROLLER_AXIS_LEFTX || axis == SDL_CONTROLLER_AXIS_LEFTY) {
+      int buttons = 0;
+      if (g_left_stick_x != 0.0f || g_left_stick_y != 0.0f) {
+        // in the non deadzone part, divide the circle into eight 45 degree
+        // segments rotated by 22.5 degrees that control which direction to move.
+        // todo: do this without floats?
+        static const uint8 kSegmentToButtons[8] = {
+          1 << 4,           // 0 = up
+          1 << 4 | 1 << 7,  // 1 = up, right
+          1 << 7,           // 2 = right
+          1 << 7 | 1 << 5,  // 3 = right, down
+          1 << 5,           // 4 = down
+          1 << 5 | 1 << 6,  // 5 = down, left
+          1 << 6,           // 6 = left
+          1 << 6 | 1 << 4,  // 7 = left, up
+        };
+        uint8 angle = (uint8)(int)(ApproximateAtan2(g_left_stick_y, g_left_stick_x) * 64.0f + 0.5f);
+        buttons = kSegmentToButtons[(uint8)(angle + 16 + 64) >> 5];
+      }
+      g_gamepad_analog_buttons = buttons;
+    }
   } else if ((axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT || axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT)) {
     if (value < 12000 || value >= 16000)  // hysteresis
       HandleGamepadInput(axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT ? kGamepadBtn_L2 : kGamepadBtn_R2, value >= 12000);
