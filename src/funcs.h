@@ -1021,6 +1021,7 @@ PairU16 Samus_CalcSpritemapPos_Standing(uint16 j);
 uint16 CallSomeSamusCode(uint16 a);
 uint16 Samus_DetermineGrappleSwingSpeed_X(void);
 uint16 Samus_DetermineSpeedTableEntryPtr_X(void);
+uint16 Samus_GetScaledRunCycleAnimDelay(uint16 delay);
 uint8 ClearCarry(void);
 uint8 DeleteProjectileIfFarOffScreen(void);
 uint8 FireSba(void);

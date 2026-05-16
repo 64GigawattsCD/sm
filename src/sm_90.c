@@ -17,6 +17,42 @@
 
 static Pair_Bool_Amt Samus_CalcBaseSpeed_NoDecel_X(uint16 k);
 
+static bool Samus_IsRunCycleAnimMovement(void) {
+  return samus_movement_type == kMovementType_01_Running ||
+         samus_movement_type == kMovementType_10_Moonwalking;
+}
+
+static int32 Samus_GetMovementMaxSpeedForAnalogCap(uint16 k) {
+  SamusSpeedTableEntry *sste = get_SamusSpeedTableEntry(k);
+  if (samus_movement_type == kMovementType_10_Moonwalking)
+    return INT16_SHL16(1);
+  return __PAIR32__(sste->max_speed, sste->max_speed_sub);
+}
+
+static int32 Samus_GetRunCycleAnimReferenceSpeed(void) {
+  SamusSpeedTableEntry *sste = get_SamusSpeedTableEntry(Samus_DetermineSpeedTableEntryPtr_X());
+  return __PAIR32__(sste->max_speed, sste->max_speed_sub);
+}
+
+uint16 Samus_GetScaledRunCycleAnimDelay(uint16 delay) {
+  if (!Samus_IsRunCycleAnimMovement())
+    return delay;
+  int32 reference_speed = Samus_GetRunCycleAnimReferenceSpeed();
+  if (reference_speed <= 0)
+    return delay;
+  int32 speed = __PAIR32__(samus_total_x_speed, samus_total_x_subspeed);
+  float rate = (float)(uint32)speed / (float)(uint32)reference_speed;
+  float max_rate = samus_movement_type == kMovementType_10_Moonwalking ? 2.0f : 1.0f;
+  if (rate < 0.125f)
+    rate = 0.125f;
+  if (rate > max_rate)
+    rate = max_rate;
+
+  float duration = delay <= 1 ? 1.0f : (float)delay;
+  uint16 scaled = (uint16)lroundf(duration / rate);
+  return scaled < 1 ? 1 : scaled;
+}
+
 static int32 ScaleSpeedForAnalogInput(int32 amount) {
   float magnitude = Samus_GetShapedHorizontalInputMagnitude();
   if (magnitude <= 0.0f || magnitude >= 0.999f)
@@ -428,7 +464,7 @@ static uint8 Samus_HandleSpeedBoosterAnimDelay(const uint8 *jp) {  // 0x90852C
     return jp[0];
   if ((equipped_items & 0x2000) == 0) {
     samus_anim_frame = 0;
-    samus_anim_frame_timer = samus_anim_frame_buffer + RomPtr_91(*kDefaultAnimFramePtr)[0];
+    samus_anim_frame_timer = Samus_GetScaledRunCycleAnimDelay(samus_anim_frame_buffer + RomPtr_91(*kDefaultAnimFramePtr)[0]);
     return 0;
   }
   if ((uint8)--speed_boost_counter)
@@ -447,7 +483,7 @@ static uint8 Samus_HandleSpeedBoosterAnimDelay(const uint8 *jp) {  // 0x90852C
   int v3 = HIBYTE(v2);
   speed_boost_counter = kSpeedBoostToCtr[v3] | speed_boost_counter & 0xFF00;
   samus_anim_frame = 0;
-  samus_anim_frame_timer = samus_anim_frame_buffer + RomPtr_91(kSpeedBoostToAnimFramePtr[v3])[0];
+  samus_anim_frame_timer = Samus_GetScaledRunCycleAnimDelay(samus_anim_frame_buffer + RomPtr_91(kSpeedBoostToAnimFramePtr[v3])[0]);
   return 0;
 }
 
@@ -457,13 +493,13 @@ static void Samus_HandleAnimDelay(void) {
     uint8 v1 = Samus_HandleSpeedBoosterAnimDelay(p + samus_anim_frame);
     printf("v1=%x\n", v1);
     if (kAnimDelayFuncs[v1 & 0xF](p + samus_anim_frame))
-      samus_anim_frame_timer = samus_anim_frame_buffer + p[samus_anim_frame];
+      samus_anim_frame_timer = Samus_GetScaledRunCycleAnimDelay(samus_anim_frame_buffer + p[samus_anim_frame]);
   } else {
     if (samus_has_momentum_flag && samus_movement_type == 1) {
       uint16 addr = ((equipped_items & 0x2000) != 0) ? kSpeedBoostToAnimFramePtr[HIBYTE(speed_boost_counter)] : *kDefaultAnimFramePtr;
       p = RomPtr_91(addr);
     }
-    samus_anim_frame_timer = samus_anim_frame_buffer + p[samus_anim_frame];
+    samus_anim_frame_timer = Samus_GetScaledRunCycleAnimDelay(samus_anim_frame_buffer + p[samus_anim_frame]);
   }
 }
 
@@ -1702,7 +1738,7 @@ static bool IsGreaterThanQuirked(uint16 vhi, uint16 vlo, uint16 cmphi, uint16 cm
 
 int32 Samus_CalcBaseSpeed_X(uint16 k) {  // 0x909A7E
   SamusSpeedTableEntry *sste = get_SamusSpeedTableEntry(k);
-  int32 max_speed = __PAIR32__(sste->max_speed, sste->max_speed_sub);
+  int32 max_speed = Samus_GetMovementMaxSpeedForAnalogCap(k);
   if (Samus_HasHorizontalMovementInput())
     max_speed = ScaleSpeedForAnalogInput(max_speed);
   if (samus_x_accel_mode) {
@@ -1727,7 +1763,7 @@ int32 Samus_CalcBaseSpeed_X(uint16 k) {  // 0x909A7E
 
 static Pair_Bool_Amt Samus_CalcBaseSpeed_NoDecel_X(uint16 k) {  // 0x909B1F
   SamusSpeedTableEntry *sste = get_SamusSpeedTableEntry(k);
-  int32 max_speed = __PAIR32__(sste->max_speed, sste->max_speed_sub);
+  int32 max_speed = Samus_GetMovementMaxSpeedForAnalogCap(k);
   if (Samus_HasHorizontalMovementInput())
     max_speed = ScaleSpeedForAnalogInput(max_speed);
   bool rv = false;
@@ -2181,6 +2217,9 @@ void Samus_Movement_0E_TurningAroundOnGround(void) {  // 0x90A67C
 }
 
 void Samus_Movement_10_Moonwalking(void) {  // 0x90A694
+  Samus_CancelSpeedBoost();
+  samus_x_extra_run_speed = 0;
+  samus_x_extra_run_subspeed = 0;
   Samus_HandleMovement_X();
   Samus_Move_NoSpeedCalc_Y();
 }

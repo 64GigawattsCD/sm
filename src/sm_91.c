@@ -163,6 +163,22 @@ void Samus_Input_0F_CrouchingEtcTransition(void) {  // 0x918146
 }
 
 void Samus_Input_10_Moonwalking(void) {  // 0x918147
+  if (!Samus_IsAiming()) {
+    int move_sign = Samus_GetMovementDirectionSign();
+    moonwalk_flag = 0;
+    if (move_sign > 0)
+      samus_new_pose = kPose_09_MoveR_NoAim;
+    else if (move_sign < 0)
+      samus_new_pose = kPose_0A_MoveL_NoAim;
+    else
+      samus_new_pose = samus_pose_x_dir == 4 ? kPose_02_FaceL_Normal : kPose_01_FaceR_Normal;
+    return;
+  }
+  if ((button_config_jump_a & joypad1_newkeys) != 0) {
+    samus_new_pose = samus_pose_x_dir == 4 ? kPose_4C_FaceL_Jumptrans : kPose_4B_FaceR_Jumptrans;
+    bomb_jump_dir = 0;
+    return;
+  }
   Samus_LookupTransitionTable();
 }
 
@@ -282,12 +298,47 @@ static bool Samus_ShouldAnalogMoonwalk(int move_sign, float aim_x) {
   return move_sign != 0 && fabsf(aim_x) >= 0.2f && ((move_sign > 0) != (aim_x > 0.0f));
 }
 
+static bool Samus_IsRunCyclePose(uint16 pose) {
+  switch (pose) {
+  case kPose_09_MoveR_NoAim:
+  case kPose_0A_MoveL_NoAim:
+  case kPose_0B_MoveR_Gun:
+  case kPose_0C_MoveL_Gun:
+  case kPose_0F_MoveR_AimUR:
+  case kPose_10_MoveL_AimUL:
+  case kPose_11_MoveR_AimDR:
+  case kPose_12_MoveL_AimDL:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool Samus_IsMoonwalkCyclePose(uint16 pose) {
+  switch (pose) {
+  case kPose_49_FaceL_Moonwalk:
+  case kPose_4A_FaceR_Moonwalk:
+  case kPose_75_FaceL_Moonwalk_AimUL:
+  case kPose_76_FaceR_Moonwalk_AimUR:
+  case kPose_77_FaceL_Moonwalk_AimDL:
+  case kPose_78_FaceR_Moonwalk_AimDR:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool Samus_ShouldPreserveRunCycleAnimFrame(uint16 old_pose, uint16 new_pose) {
+  return (Samus_IsRunCyclePose(old_pose) && Samus_IsRunCyclePose(new_pose)) ||
+         (Samus_IsMoonwalkCyclePose(old_pose) && Samus_IsMoonwalkCyclePose(new_pose));
+}
+
 static uint16 Samus_GetAnalogAimPoseForState(uint8 movement_type, float aim_x, float aim_y) {
   static const AnalogAimPoseCandidate kStandingPoses[] = {
     { kPose_01_FaceR_Normal, 1.0f, 0.0f },
     { kPose_02_FaceL_Normal, -1.0f, 0.0f },
-    { kPose_03_FaceR_AimU, 0.0f, -1.0f },
-    { kPose_04_FaceL_AimU, 0.0f, -1.0f },
+    { kPose_03_FaceR_AimU, 0.001f, -1.0f },
+    { kPose_04_FaceL_AimU, -0.001f, -1.0f },
     { kPose_05_FaceR_AimUR, 0.70710677f, -0.70710677f },
     { kPose_06_FaceL_AimUL, -0.70710677f, -0.70710677f },
     { kPose_07_FaceR_AimDR, 0.70710677f, 0.70710677f },
@@ -312,8 +363,10 @@ static uint16 Samus_GetAnalogAimPoseForState(uint8 movement_type, float aim_x, f
   static const AnalogAimPoseCandidate kJumpingPoses[] = {
     { kPose_13_FaceR_Jump_NoAim_NoMove_Gun, 1.0f, 0.0f },
     { kPose_14_FaceL_Jump_NoAim_NoMove_Gun, -1.0f, 0.0f },
-    { kPose_15_FaceR_Jump_AimU, 0.0f, -1.0f },
-    { kPose_16_FaceL_Jump_AimU, 0.0f, -1.0f },
+    { kPose_15_FaceR_Jump_AimU, 0.001f, -1.0f },
+    { kPose_16_FaceL_Jump_AimU, -0.001f, -1.0f },
+    { kPose_17_FaceR_Jump_AimD, 0.001f, 1.0f },
+    { kPose_18_FaceL_Jump_AimD, -0.001f, 1.0f },
     { kPose_69_FaceR_Jump_AimUR, 0.70710677f, -0.70710677f },
     { kPose_6A_FaceL_Jump_AimUL, -0.70710677f, -0.70710677f },
     { kPose_6B_FaceR_Jump_AimDR, 0.70710677f, 0.70710677f },
@@ -322,8 +375,10 @@ static uint16 Samus_GetAnalogAimPoseForState(uint8 movement_type, float aim_x, f
   static const AnalogAimPoseCandidate kFallingPoses[] = {
     { kPose_67_FaceR_Fall_Gun, 1.0f, 0.0f },
     { kPose_68_FaceL_Fall_Gun, -1.0f, 0.0f },
-    { kPose_2B_FaceR_Fall_AimU, 0.0f, -1.0f },
-    { kPose_2C_FaceL_Fall_AimU, 0.0f, -1.0f },
+    { kPose_2B_FaceR_Fall_AimU, 0.001f, -1.0f },
+    { kPose_2C_FaceL_Fall_AimU, -0.001f, -1.0f },
+    { kPose_2D_FaceR_Fall_AimD, 0.001f, 1.0f },
+    { kPose_2E_FaceL_Fall_AimD, -0.001f, 1.0f },
     { kPose_6D_FaceR_Fall_AimUR, 0.70710677f, -0.70710677f },
     { kPose_6E_FaceL_Fall_AimUL, -0.70710677f, -0.70710677f },
     { kPose_6F_FaceR_Fall_AimDR, 0.70710677f, 0.70710677f },
@@ -332,8 +387,8 @@ static uint16 Samus_GetAnalogAimPoseForState(uint8 movement_type, float aim_x, f
   static const AnalogAimPoseCandidate kCrouchingPoses[] = {
     { kPose_27_FaceR_Crouch, 1.0f, 0.0f },
     { kPose_28_FaceL_Crouch, -1.0f, 0.0f },
-    { kPose_85_FaceR_Crouch_AimU, 0.0f, -1.0f },
-    { kPose_86_FaceL_Crouch_AimU, 0.0f, -1.0f },
+    { kPose_85_FaceR_Crouch_AimU, 0.001f, -1.0f },
+    { kPose_86_FaceL_Crouch_AimU, -0.001f, -1.0f },
     { kPose_71_FaceR_Crouch_AimUR, 0.70710677f, -0.70710677f },
     { kPose_72_FaceL_Crouch_AimUL, -0.70710677f, -0.70710677f },
     { kPose_73_FaceR_Crouch_AimDR, 0.70710677f, 0.70710677f },
@@ -352,6 +407,7 @@ static uint16 Samus_GetAnalogAimPoseForState(uint8 movement_type, float aim_x, f
     return Samus_SelectBestAnalogAimPose(cands, count, aim_x, aim_y);
   }
   case kMovementType_02_NormalJumping:
+  case kMovementType_03_SpinJumping:
   case kMovementType_17_TurningAroundJumping:
     return Samus_SelectBestAnalogAimPose(kJumpingPoses, sizeof(kJumpingPoses) / sizeof(kJumpingPoses[0]), aim_x, aim_y);
   case kMovementType_06_Falling:
@@ -378,9 +434,15 @@ static void Samus_ApplyAnalogAimPose(void) {
   if (samus_new_pose != 0 && samus_new_pose != 0xFFFF)
     movement_type = kPoseParams[samus_new_pose].movement_type;
   int move_sign = Samus_GetMovementDirectionSign();
-  if (Samus_ShouldAnalogMoonwalk(move_sign, aim_x)) {
+  bool can_moonwalk = movement_type == kMovementType_01_Running ||
+                      movement_type == kMovementType_0E_TurningAroundOnGround ||
+                      movement_type == kMovementType_10_Moonwalking;
+  if (can_moonwalk && Samus_ShouldAnalogMoonwalk(move_sign, aim_x)) {
     movement_type = kMovementType_10_Moonwalking;
     moonwalk_flag = 1;
+    Samus_CancelSpeedBoost();
+    samus_x_extra_run_speed = 0;
+    samus_x_extra_run_subspeed = 0;
   } else if (movement_type == kMovementType_0E_TurningAroundOnGround) {
     return;
   }
@@ -3684,7 +3746,7 @@ uint8 SamusFunc_F468_TurningAroundOnGround(void) {  // 0x91F8D3
     uint16 v0 = kPoseParams[samus_prev_pose].direction_shots_fired;
     if (samus_prev_movement_type2 == kMovementType_10_Moonwalking) {
       new_projectile_direction_changed_pose = v0 | 0x100;
-      if ((button_config_jump_a & joypad1_lastkeys) != 0) {
+      if ((button_config_jump_a & joypad1_newkeys) != 0) {
         samus_pose = kSamusTurnPose_Moonwalk[v0];
       } else {
         samus_pose = kSamusTurnPose_Standing[v0];
@@ -3809,8 +3871,12 @@ void Samus_SetAnimationFrameIfPoseChanged(void) {  // 0x91FB08
     }
   }
   if ((samus_anim_frame_skip & 0x8000) == 0 && samus_pose != samus_prev_pose) {
+    if (Samus_ShouldPreserveRunCycleAnimFrame(samus_prev_pose, samus_pose)) {
+      samus_anim_frame_timer = Samus_GetScaledRunCycleAnimDelay(t + *RomPtr_91(kSamusAnimationDelayData[samus_pose] + samus_anim_frame));
+      return;
+    }
     samus_anim_frame = samus_anim_frame_skip;
-    samus_anim_frame_timer = t + *RomPtr_91(kSamusAnimationDelayData[samus_pose] + samus_anim_frame_skip);
+    samus_anim_frame_timer = Samus_GetScaledRunCycleAnimDelay(t + *RomPtr_91(kSamusAnimationDelayData[samus_pose] + samus_anim_frame_skip));
   }
 }
 

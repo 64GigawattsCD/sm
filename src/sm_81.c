@@ -33,6 +33,35 @@
 
 static const uint16 kFileSelectMap_AreaIndexes[6] = { 0, 3, 5, 1, 4, 2 };
 
+static void GrantSkipMenuLoadout(void) {
+  const uint16 kAllEquipment = 0xF337;
+  const uint16 kAllBeams = 0x100F;
+
+  equipped_items |= kAllEquipment;
+  collected_items |= kAllEquipment;
+  equipped_beams |= kAllBeams;
+  collected_beams |= kAllBeams;
+
+  if ((int16)(samus_max_health - 700) < 0)
+    samus_max_health = 700;
+  samus_health = samus_max_health;
+  if ((int16)(samus_max_reserve_health - 300) < 0)
+    samus_max_reserve_health = 300;
+  samus_reserve_health = samus_max_reserve_health;
+  if (!reserve_health_mode)
+    reserve_health_mode = 1;
+
+  if ((int16)(samus_max_missiles - 100) < 0)
+    samus_max_missiles = 100;
+  samus_missiles = samus_max_missiles;
+  if ((int16)(samus_max_super_missiles - 20) < 0)
+    samus_max_super_missiles = 20;
+  samus_super_missiles = samus_max_super_missiles;
+  if ((int16)(samus_max_power_bombs - 20) < 0)
+    samus_max_power_bombs = 20;
+  samus_power_bombs = samus_max_power_bombs;
+}
+
 static void TrySkipFileSelectMenu(void) {
   if (!g_skip_menu)
     return;
@@ -43,6 +72,7 @@ static void TrySkipFileSelectMenu(void) {
   RtlWriteSram();
   if (LoadFromSram(selected_save_slot)) {
     NewSaveFile();
+    GrantSkipMenuLoadout();
     has_area_map = 0;
     loading_game_state = kGameState_31_SetUpNewGame;
     game_state = kGameState_31_SetUpNewGame;
@@ -50,6 +80,7 @@ static void TrySkipFileSelectMenu(void) {
     load_station_index = 0;
     SaveToSram(selected_save_slot);
   } else {
+    GrantSkipMenuLoadout();
     LoadMirrorOfExploredMapTiles();
     game_state = kGameState_6_LoadingGameData;
   }

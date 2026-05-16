@@ -19,8 +19,18 @@ This file is for future coding agents working in this repository.
 - Right-stick aiming must not synthesize left/right/up/down input for movement or pose-transition lookup; aim poses should be applied through the analog pose override path.
 - Near-vertical right-stick aim should preserve current facing until horizontal aim crosses the flip threshold, to avoid rapid left/right pose flicker.
 - When left-stick movement and right-stick aim are horizontally opposed beyond the flip threshold, analog pose override should force moonwalk instead of allowing vanilla ground turn-around transitions to flicker.
+- Moonwalk should end as soon as right-stick aiming stops; left-stick fallback aim should not keep moonwalk active.
+- Held jump should not retrigger jumps during analog-driven facing flips; moonwalk jumps should require a fresh jump press.
+- Analog moonwalk should clear extra run/speed-boost velocity so moonwalk speed is governed consistently by moonwalk movement and stick tilt, not inherited running momentum.
+- Moonwalk's actual horizontal speed cap is being raised to 1.0, while animation cadence still uses the vanilla moonwalk reference speed so full-speed moonwalk animates about twice as fast.
+- Walking/running/moonwalking animation cadence should be governed by Samus's horizontal speed divided by the relevant state reference speed, not directly by stick magnitude. Running/walking should not scale above vanilla full-speed cadence because vanilla already has extra run/speed-booster animation handling; moonwalk may scale up to 2x.
+- Compatible run/aim-run pose changes and compatible moonwalk/aim-moonwalk pose changes should preserve the current animation frame to avoid gait resets while aiming.
+- Analog moonwalk forcing should only apply on ground running/moonwalk/turn-around states; airborne opposed-stick aiming should use normal jump/fall aim poses.
+- Jumping from moonwalk should enter the non-spinning jump transition poses rather than spin jump or turn-jump.
+- Right-stick analog pose selection should include the vanilla straight-down jump/fall aim poses, preserve facing for pure vertical aim, and break spin jump into normal jump aim poses when active.
 - Projectile heading/inherited-velocity physics looked good in the latest user test; keep tuning focused on movement and pose interaction unless new projectile issues appear.
 - Reference-behavior mismatch checking has been intentionally disabled while analog movement work is underway.
+- When `g_skip_menu` is enabled, slot 1 loads directly and receives the all-items debug loadout if anything is missing.
 
 ## Update Guidance
 
