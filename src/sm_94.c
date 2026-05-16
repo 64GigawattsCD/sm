@@ -551,6 +551,32 @@ void Samus_AlignYPosSlope(void) {  // 0x9487F4
   }
 }
 
+static bool Samus_GetFloorSlopeSurfaceY(uint16 x, uint16 y, int16 *surface_y) {
+  CalculateBlockAt(x, y, 0, 0);
+  if ((level_data[cur_block_index] & 0xF000) != 4096)
+    return false;
+
+  uint8 bts = BTS[cur_block_index];
+  uint16 slope_type = bts & 0x1F;
+  if (slope_type < 5 || (bts & 0x80) != 0)
+    return false;
+
+  uint16 local_x = (bts & 0x40) != 0 ? x ^ 0xF : x;
+  int16 height = kAlignYPos_Tab0[16 * slope_type + (local_x & 0xF)] & 0x1F;
+  *surface_y = (y & 0xFFF0) + height - 1;
+  return true;
+}
+
+int16 Samus_GetFloorSlopeRightDrop(void) {
+  uint16 y = samus_y_radius + samus_y_pos - 1;
+  int16 left_surface_y, right_surface_y;
+  if (!Samus_GetFloorSlopeSurfaceY(samus_x_pos - 6, y, &left_surface_y) ||
+      !Samus_GetFloorSlopeSurfaceY(samus_x_pos + 6, y, &right_surface_y))
+    return 0;
+
+  return right_surface_y - left_surface_y;
+}
+
 static uint8 BlockColl_Horiz_Slope_Square(CollInfo *ci, uint16 a, uint16 k) {  // 0x948D2B
   uint16 temp_collision_DD4 = 4 * a;
   uint16 temp_collision_DD6 = BTS[k] >> 6;

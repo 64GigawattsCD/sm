@@ -50,6 +50,7 @@ typedef struct AnalogAimPoseCandidate {
 Pair_R18_R20 TranslateCustomControllerBindingsToDefault(void);
 static void Samus_ApplyAnalogAimPose(void);
 static bool Samus_TryStartAirShinesparkWindup(void);
+static bool Samus_ShouldIgnoreAimForCurrentMovement(void);
 
 
 static Func_V *const kSamusInputHandlers[28] = {
@@ -240,7 +241,8 @@ void Samus_Input_1B_ShinesparkEtc(void) {  // 0x9181A1
 
 void Samus_LookupTransitionTable(void) {  // 0x9181A9
   Pair_R18_R20 pair = TranslateCustomControllerBindingsToDefault();
-  if (joypad1_lastkeys || joypad1_newkeys || Samus_IsAiming()) {
+  bool analog_aim_active = Samus_IsAiming() && !Samus_ShouldIgnoreAimForCurrentMovement();
+  if (joypad1_lastkeys || joypad1_newkeys || analog_aim_active) {
     PoseEntry *pe = get_PoseEntry(kPoseTransitionTable[samus_pose]);
     if (pe->new_input == 0xFFFF) {
       Samus_ApplyAnalogAimPose();
@@ -259,7 +261,7 @@ void Samus_LookupTransitionTable(void) {  // 0x9181A9
     } while (pe->new_input != 0xFFFF);
   }
   Samus_ApplyAnalogAimPose();
-  if (Samus_IsAiming() && samus_new_pose != 0)
+  if (analog_aim_active && samus_new_pose != 0)
     return;
   UNUSED_word_7E0A18 = 0;
   Samus_Pose_CancelGrapple();
@@ -303,6 +305,19 @@ static bool Samus_TryStartAirShinesparkWindup(void) {
     samus_prev_y_pos = --samus_y_pos;
   bomb_jump_dir = 0;
   return true;
+}
+
+static bool Samus_ShouldIgnoreAimForCurrentMovement(void) {
+  switch (samus_movement_type) {
+  case kMovementType_04_MorphBallOnGround:
+  case kMovementType_08_MorphBallFalling:
+  case kMovementType_11_SpringBallOnGround:
+  case kMovementType_12_SpringBallInAir:
+  case kMovementType_13_SpringBallFalling:
+    return true;
+  default:
+    return false;
+  }
 }
 
 static uint16 Samus_SelectBestAnalogAimPose(const AnalogAimPoseCandidate *candidates, int count,
@@ -3274,7 +3289,7 @@ uint8 Samus_HandleTransitionsA_5_1_0(void) {  // 0x91F1EC
   return 0;
 }
 static const uint16 g_word_909EB5 = 1;
-static const uint16 g_word_909EB7 = 0;
+static const uint16 g_word_909EB7 = 0x8000;
 uint8 Samus_MorphBallBounceNoSpringballTrans(void) {  // 0x91F1FC
   int16 v0;
 

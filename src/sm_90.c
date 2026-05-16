@@ -79,8 +79,162 @@ static float g_projectile_heading_y[10];
 static int g_shinespark_sprite_rotation;
 static bool g_shinespark_downward;
 static bool g_shinespark_jump_was_held;
+static bool g_shinespark_resume_speedboost_after_impact;
 static float g_shinespark_aim_x;
 static float g_shinespark_aim_y;
+static int32 g_morph_ball_roll_velocity;
+static int32 g_morph_ball_rotation;
+
+static bool Samus_IsMorphBallMovementType(void) {
+  return samus_movement_type == kMovementType_04_MorphBallOnGround ||
+         samus_movement_type == kMovementType_08_MorphBallFalling ||
+         samus_movement_type == kMovementType_11_SpringBallOnGround ||
+         samus_movement_type == kMovementType_12_SpringBallInAir ||
+         samus_movement_type == kMovementType_13_SpringBallFalling;
+}
+
+static float Samus_GetMorphBallTorqueInput(void) {
+  if (fabsf(g_left_stick_x) >= 0.1f)
+    return g_left_stick_x;
+  return 0.0f;
+}
+
+static void Samus_ClampMorphBallRollVelocity(void) {
+  static const int32 kMorphRollMaxSpeed = INT16_SHL16(5);
+  if (g_morph_ball_roll_velocity > kMorphRollMaxSpeed)
+    g_morph_ball_roll_velocity = kMorphRollMaxSpeed;
+  else if (g_morph_ball_roll_velocity < -kMorphRollMaxSpeed)
+    g_morph_ball_roll_velocity = -kMorphRollMaxSpeed;
+}
+
+static void Samus_ApplyMorphBallTorque(bool airborne) {
+  float torque = Samus_GetMorphBallTorqueInput();
+  if (torque == 0.0f)
+    return;
+  g_morph_ball_roll_velocity += (int32)lroundf((airborne ? 0x800 : 0x1C00) * torque);
+  Samus_ClampMorphBallRollVelocity();
+}
+
+static void Samus_ApplyMorphBallFriction(void) {
+  static const int32 kMorphRollFriction = 0x260;
+  if (g_morph_ball_roll_velocity > 0) {
+    g_morph_ball_roll_velocity -= kMorphRollFriction;
+    if (g_morph_ball_roll_velocity < 0)
+      g_morph_ball_roll_velocity = 0;
+  } else if (g_morph_ball_roll_velocity < 0) {
+    g_morph_ball_roll_velocity += kMorphRollFriction;
+    if (g_morph_ball_roll_velocity > 0)
+      g_morph_ball_roll_velocity = 0;
+  }
+}
+
+static bool Samus_IsMorphBallPose(void) {
+  return samus_pose == kPose_1D_FaceR_Morphball_Ground ||
+         samus_pose == kPose_1E_MoveR_Morphball_Ground ||
+         samus_pose == kPose_1F_MoveL_Morphball_Ground ||
+         samus_pose == kPose_31_FaceR_Morphball_Air ||
+         samus_pose == kPose_32_FaceL_Morphball_Air ||
+         samus_pose == kPose_41_FaceL_Morphball_Ground ||
+         samus_pose == kPose_79_FaceR_Springball_Ground ||
+         samus_pose == kPose_7A_FaceL_Springball_Ground ||
+         samus_pose == kPose_7B_MoveR_Springball_Ground ||
+         samus_pose == kPose_7C_MoveL_Springball_Ground ||
+         samus_pose == kPose_7D_FaceR_Springball_Fall ||
+         samus_pose == kPose_7E_FaceL_Springball_Fall ||
+         samus_pose == kPose_7F_FaceR_Springball_Air ||
+         samus_pose == kPose_80_FaceL_Springball_Air;
+}
+
+static bool Samus_IsLeftFacingMorphBallPose(void) {
+  return samus_pose == kPose_1F_MoveL_Morphball_Ground ||
+         samus_pose == kPose_32_FaceL_Morphball_Air ||
+         samus_pose == kPose_41_FaceL_Morphball_Ground ||
+         samus_pose == kPose_7A_FaceL_Springball_Ground ||
+         samus_pose == kPose_7C_MoveL_Springball_Ground ||
+         samus_pose == kPose_7E_FaceL_Springball_Fall ||
+         samus_pose == kPose_80_FaceL_Springball_Air;
+}
+
+static void Samus_UpdateMorphBallRotationAnimation(void) {
+  static const uint16 kMorphBallAnimFrames = 8;
+  static const int32 kMorphBallFullRotation = 0x10000;
+
+  int32 frame_angle = kMorphBallFullRotation / kMorphBallAnimFrames;
+  int32 display_rotation = Samus_IsLeftFacingMorphBallPose() ? -g_morph_ball_rotation : g_morph_ball_rotation;
+  display_rotation &= kMorphBallFullRotation - 1;
+  samus_anim_frame = (uint16)((display_rotation + frame_angle / 2) / frame_angle) & (kMorphBallAnimFrames - 1);
+  samus_anim_frame_timer = 1;
+}
+
+static void Samus_UpdateMorphBallRotationFromRollVelocity(void) {
+  static const int32 kMorphBallFullRotation = 0x10000;
+  static const int32 kMorphBallPixelsPerRotation = 24;
+
+  if (g_morph_ball_roll_velocity)
+    g_morph_ball_rotation = (g_morph_ball_rotation + g_morph_ball_roll_velocity / kMorphBallPixelsPerRotation) &
+                            (kMorphBallFullRotation - 1);
+  Samus_UpdateMorphBallRotationAnimation();
+}
+
+static void Samus_SetMorphBallSpeedVars(uint32 abs_speed) {
+  SetHiLo(&samus_x_base_speed, &samus_x_base_subspeed, abs_speed);
+  SetHiLo(&samus_total_x_speed, &samus_total_x_subspeed, abs_speed);
+  samus_x_accel_mode = 0;
+  samus_x_extra_run_speed = 0;
+  samus_x_extra_run_subspeed = 0;
+  Samus_CancelSpeedBoost();
+}
+
+static void Samus_MoveMorphBallWithRollVelocity(void) {
+  int32 speed = g_morph_ball_roll_velocity;
+  uint32 abs_speed = speed < 0 ? (uint32)-speed : (uint32)speed;
+  Samus_SetMorphBallSpeedVars(abs_speed);
+
+  if (abs_speed < 0x80) {
+    g_morph_ball_roll_velocity = 0;
+    Samus_Move_NoBaseSpeed_X();
+  } else if (speed > 0) {
+    if (samus_movement_type == kMovementType_04_MorphBallOnGround) {
+      if (samus_pose != kPose_1E_MoveR_Morphball_Ground)
+        samus_new_pose = kPose_1E_MoveR_Morphball_Ground;
+    } else if (samus_movement_type == kMovementType_11_SpringBallOnGround &&
+               samus_pose != kPose_7B_MoveR_Springball_Ground) {
+      samus_new_pose = kPose_7B_MoveR_Springball_Ground;
+    }
+    Samus_MoveRight(speed);
+    if (samus_collision_flag)
+      g_morph_ball_roll_velocity = 0;
+  } else {
+    if (samus_movement_type == kMovementType_04_MorphBallOnGround) {
+      if (samus_pose != kPose_1F_MoveL_Morphball_Ground)
+        samus_new_pose = kPose_1F_MoveL_Morphball_Ground;
+    } else if (samus_movement_type == kMovementType_11_SpringBallOnGround &&
+               samus_pose != kPose_7C_MoveL_Springball_Ground) {
+      samus_new_pose = kPose_7C_MoveL_Springball_Ground;
+    }
+    Samus_MoveLeft(speed);
+    if (samus_collision_flag)
+      g_morph_ball_roll_velocity = 0;
+  }
+  Samus_UpdateMorphBallRotationFromRollVelocity();
+}
+
+static void Samus_Movement_MorphBallRollingOnGround(void) {
+  static const int32 kMorphRollSlopeAccel = 0xC00;
+
+  float torque = Samus_GetMorphBallTorqueInput();
+  int16 slope_drop = Samus_GetFloorSlopeRightDrop();
+  Samus_ApplyMorphBallTorque(false);
+  if (slope_drop)
+    g_morph_ball_roll_velocity += slope_drop * kMorphRollSlopeAccel;
+  else if (torque == 0.0f)
+    Samus_ApplyMorphBallFriction();
+  Samus_ClampMorphBallRollVelocity();
+  Samus_MoveMorphBallWithRollVelocity();
+
+  if (!(Samus_CheckAndMoveY() & 1))
+    Samus_Move_NoSpeedCalc_Y();
+}
 
 static int16 RoundProjectileSpeed(float value) {
   if (value > 32767.0f)
@@ -180,6 +334,10 @@ static Func_V *const kSamusFxHandlers[8] = {
 
 void Samus_Animate(void) {  // 0x908000
   kSamusFxHandlers[(fx_type & 0xF) >> 1]();
+  if (Samus_IsMorphBallPose()) {
+    Samus_UpdateMorphBallRotationAnimation();
+    return;
+  }
   if (samus_pose == kPose_4D_FaceR_Jump_NoAim_NoMove_NoGun || samus_pose == kPose_4E_FaceL_Jump_NoAim_NoMove_NoGun) {
     if (samus_y_dir != 2 && samus_anim_frame == 1 && samus_anim_frame_timer == 1)
       samus_anim_frame_timer = 4;
@@ -634,6 +792,67 @@ static bool Samus_ReadShinesparkAimInput(float *out_x, float *out_y) {
     return true;
   }
   return false;
+}
+
+static bool Samus_IsHorizontalShinesparkPose(void) {
+  return samus_pose == kPose_C9_FaceR_Shinespark_Horiz ||
+         samus_pose == kPose_CA_FaceL_Shinespark_Horiz;
+}
+
+static bool Samus_IsDownwardDiagonalShinesparkPose(void) {
+  return g_shinespark_downward &&
+         (samus_pose == kPose_CD_FaceR_Shinespark_Diag ||
+          samus_pose == kPose_CE_FaceL_Shinespark_Diag);
+}
+
+static void Samus_StartSpeedBoosterRunAfterShinesparkImpact(void) {
+  uint16 run_pose = samus_pose_x_dir == 4 ? kPose_0A_MoveL_NoAim : kPose_09_MoveR_NoAim;
+
+  g_shinespark_resume_speedboost_after_impact = false;
+  g_shinespark_downward = false;
+  g_shinespark_sprite_rotation = 0;
+  g_samus_sprite_transform_enabled = false;
+
+  samus_pose = run_pose;
+  *(uint16 *)&samus_pose_x_dir = *(uint16 *)(&kPoseParams[0].pose_x_dir + (8 * samus_pose));
+  samus_movement_handler = FUNC16(Samus_MovementHandler_Normal);
+  samus_input_handler = FUNC16(Samus_InputHandler_E913);
+  samus_draw_handler = FUNC16(SamusDrawHandler_Default);
+  samus_new_pose = -1;
+  samus_new_pose_interrupted = -1;
+  samus_new_pose_transitional = -1;
+  samus_hurt_switch_index = 0;
+  samus_collision_flag = 0;
+  input_to_pose_calc = 0;
+  cooldown_timer = 0;
+  samus_hurt_flash_counter = 0;
+
+  samus_y_dir = 0;
+  samus_y_speed = 0;
+  samus_y_subspeed = 0;
+  samus_x_accel_mode = 0;
+  samus_x_base_speed = 0;
+  samus_x_base_subspeed = 0;
+  samus_x_extra_run_speed = 7;
+  samus_x_extra_run_subspeed = 0;
+  samus_has_momentum_flag = 1;
+  speed_boost_counter = 0x0401;
+  speed_echoes_index = 0;
+  speed_echo_xpos[0] = 0;
+  speed_echo_xpos[1] = 0;
+  speed_echo_ypos[0] = 0;
+  speed_echo_ypos[1] = 0;
+  speed_echo_xspeed[0] = 0;
+  speed_echo_xspeed[1] = 0;
+  samus_contact_damage_index = 1;
+  samus_shine_timer = 0;
+  timer_for_shine_timer = 0;
+  special_samus_palette_timer = 1;
+  special_samus_palette_frame = 0;
+  samus_echoes_sound_flag = 1;
+
+  SamusFunc_F433();
+  Samus_SetAnimationFrameIfPoseChanged();
 }
 
 static void Samus_InitShinesparkAimDirection(void) {
@@ -1327,27 +1546,15 @@ void Samus_FallingMovement(void) {  // 0x909168
 }
 
 void Samus_MorphedFallingMovement(void) {  // 0x90919F
-  Pair_Bool_Amt pair = Samus_CalcBaseSpeed_NoDecel_X(Samus_DetermineSpeedTableEntryPtr_X());
-  if (!samus_x_accel_mode && (joypad1_lastkeys & kButton_Right) == 0 && (joypad1_lastkeys & kButton_Left) == 0) {
-    pair.amt = 0;
-    samus_x_base_speed = 0;
-    samus_x_base_subspeed = 0;
-    samus_collision_flag = 0;
-  }
-  Samus_MoveX(pair.amt);
+  Samus_ApplyMorphBallTorque(true);
+  Samus_MoveMorphBallWithRollVelocity();
   Samus_CheckStartFalling();
   Samus_MoveY_WithSpeedCalc();
 }
 
 void Samus_MorphedBouncingMovement(void) {  // 0x9091D1
-  Pair_Bool_Amt pair = Samus_CalcBaseSpeed_NoDecel_X(Samus_DetermineSpeedTableEntryPtr_X());
-  if (!samus_x_accel_mode && (joypad1_lastkeys & kButton_Right) == 0 && (joypad1_lastkeys & kButton_Left) == 0) {
-    pair.amt = 0;
-    samus_x_base_speed = 0;
-    samus_x_base_subspeed = 0;
-    samus_collision_flag = 0;
-  }
-  Samus_MoveX(pair.amt);
+  Samus_ApplyMorphBallTorque(true);
+  Samus_MoveMorphBallWithRollVelocity();
   if (!knockback_dir) {
     if (extra_samus_y_displacement || extra_samus_y_subdisplacement) {
       samus_y_dir = 2;
@@ -2100,6 +2307,8 @@ static HandlerFunc *const kSamusMovementHandlers[28] = {  // 0x90A337
 
 void Samus_MovementHandler_Normal(void) {
   if (!time_is_frozen_flag) {
+    if (!Samus_IsMorphBallMovementType())
+      g_morph_ball_roll_velocity = 0;
     kSamusMovementHandlers[samus_movement_type]();
     Samus_UpdateSpeedEchoPos();
   }
@@ -2194,28 +2403,7 @@ LABEL_24:;
 }
 
 void Samus_Movement_04_MorphBallOnGround(void) {  // 0x90A521
-  if (!samus_x_accel_mode) {
-    if (samus_pose_x_dir == 4) {
-      if (samus_pose == kPose_41_FaceL_Morphball_Ground)
-        goto LABEL_6;
-    } else if (samus_pose == kPose_1D_FaceR_Morphball_Ground) {
-LABEL_6:
-      Samus_Move_NoBaseSpeed_X();
-      if (!(Samus_CheckAndMoveY() & 1)) {
-        Samus_Move_NoSpeedCalc_Y();
-        Samus_CancelSpeedBoost();
-        samus_x_extra_run_speed = 0;
-        samus_x_extra_run_subspeed = 0;
-        samus_x_base_speed = 0;
-        samus_x_base_subspeed = 0;
-        samus_x_accel_mode = 0;
-      }
-      return;
-    }
-  }
-  Samus_HandleMovement_X();
-  if (!(Samus_CheckAndMoveY() & 1))
-    Samus_Move_NoSpeedCalc_Y();
+  Samus_Movement_MorphBallRollingOnGround();
 }
 
 void Samus_Movement_05_Crouching(void) {  // 0x90A573
@@ -2243,14 +2431,6 @@ void Samus_Movement_06_Falling(void) {  // 0x90A58D
 }
 
 void Samus_Movement_08_MorphBallFalling(void) {  // 0x90A5CA
-  if (!Samus_HasHorizontalMovementInput() && !samus_x_accel_mode) {
-    Samus_CancelSpeedBoost();
-    samus_x_extra_run_speed = 0;
-    samus_x_extra_run_subspeed = 0;
-    samus_x_base_speed = 0;
-    samus_x_base_subspeed = 0;
-    samus_x_accel_mode = 0;
-  }
   if (used_for_ball_bounce_on_landing)
     Samus_MorphedBouncingMovement();
   else
@@ -2337,46 +2517,17 @@ void Samus_Movement_10_Moonwalking(void) {  // 0x90A694
 }
 
 void Samus_Movement_11_SpringBallOnGround(void) {  // 0x90A69F
-  if (!samus_x_accel_mode) {
-    if (samus_pose_x_dir == 4) {
-      if (samus_pose == kPose_7A_FaceL_Springball_Ground)
-        goto LABEL_6;
-    } else if (samus_pose == kPose_79_FaceR_Springball_Ground) {
-LABEL_6:
-      Samus_Move_NoBaseSpeed_X();
-      if (!(Samus_CheckAndMoveY() & 1)) {
-        Samus_Move_NoSpeedCalc_Y();
-        Samus_CancelSpeedBoost();
-        samus_x_extra_run_speed = 0;
-        samus_x_extra_run_subspeed = 0;
-        samus_x_base_speed = 0;
-        samus_x_base_subspeed = 0;
-        samus_x_accel_mode = 0;
-      }
-      return;
-    }
-  }
-  Samus_HandleMovement_X();
-  if (!(Samus_CheckAndMoveY() & 1))
-    Samus_Move_NoSpeedCalc_Y();
+  Samus_Movement_MorphBallRollingOnGround();
 }
 
 void Samus_Movement_12_SpringBallInAir(void) {  // 0x90A6F1
   if (used_for_ball_bounce_on_landing)
     Samus_MorphedBouncingMovement();
   else
-    Samus_JumpingMovement();
+    Samus_MorphedFallingMovement();
 }
 
 void Samus_Movement_13_SpringBallFalling(void) {  // 0x90A703
-  if (!Samus_HasHorizontalMovementInput() && !samus_x_accel_mode) {
-    Samus_CancelSpeedBoost();
-    samus_x_extra_run_speed = 0;
-    samus_x_extra_run_subspeed = 0;
-    samus_x_base_speed = 0;
-    samus_x_base_subspeed = 0;
-    samus_x_accel_mode = 0;
-  }
   if (used_for_ball_bounce_on_landing)
     Samus_MorphedBouncingMovement();
   else
@@ -4851,6 +5002,7 @@ void Projectile_Func7_Shinespark(void) {  // 0x90CFFA
   samus_input_handler = FUNC16(nullsub_152);
   g_shinespark_downward = false;
   g_shinespark_sprite_rotation = 0;
+  g_shinespark_resume_speedboost_after_impact = false;
   g_shinespark_jump_was_held = (button_config_jump_a & joypad1_lastkeys) != 0;
   Samus_InitShinesparkAimDirection();
   samus_y_dir = 1;
@@ -4964,6 +5116,7 @@ void Samus_ShinesparkMove_X(void) {  // 0x90D132
   int16 v4;
 
   samus_shine_timer = 15;
+  samus_pos_adjusted_by_slope_flag = 0;
   AddToHiLo(&samus_x_extra_run_speed, &samus_x_extra_run_subspeed, __PAIR32__(samus_y_accel, samus_y_subaccel));
   if (!sign16(samus_x_extra_run_speed - 15))
     SetHiLo(&samus_x_extra_run_speed, &samus_x_extra_run_subspeed, INT16_SHL16(15));
@@ -4988,6 +5141,10 @@ void Samus_ShinesparkMove_X(void) {  // 0x90D132
   }
   Samus_MoveRight_NoSolidColl(amt);
   Samus_AlignYPosSlope();
+  if (Samus_IsHorizontalShinesparkPose() && samus_pos_adjusted_by_slope_flag) {
+    g_shinespark_resume_speedboost_after_impact = true;
+    samus_collision_flag = 1;
+  }
 LABEL_18:
   v4 = samus_x_pos - samus_prev_x_pos;
   if ((int16)(samus_x_pos - samus_prev_x_pos) < 0) {
@@ -5015,6 +5172,8 @@ void Samus_ShinesparkMove_Y(void) {  // 0x90D1FF
   amt = cres.amt;
   if (cres.collision) {
     samus_collision_flag = cres.collision;
+    if (Samus_IsDownwardDiagonalShinesparkPose())
+      g_shinespark_resume_speedboost_after_impact = true;
   } else {
     Samus_MoveDown_NoSolidColl(amt);
   }
@@ -5056,6 +5215,10 @@ uint8 Samus_EndSuperJump(void) {  // 0x90D2BA
   samus_hurt_flash_counter = 0;
   QueueSfx1_Max6(0x35);
   QueueSfx3_Max6(0x10);
+  if (g_shinespark_resume_speedboost_after_impact) {
+    Samus_MoveHandler_ShinesparkCrashFinish();
+    return 1;
+  }
   return 1;
 }
 
@@ -5114,8 +5277,10 @@ void Samus_MoveHandler_ShinesparkCrashEchoCircle(void) {  // 0x90D3F3
 
 void Samus_MoveHandler_ShinesparkCrashFinish(void) {  // 0x90D40D
   static const uint8 kShinesparkCrashFinish_Tab0[12] = { 0, 0x80, 0, 0x80, 0x40, 0xc0, 0x40, 0xc0, 0xe0, 0x60, 0x20, 0xa0 };
+  bool resume_speedboost = g_shinespark_resume_speedboost_after_impact;
   g_shinespark_downward = false;
   g_shinespark_sprite_rotation = 0;
+  g_shinespark_resume_speedboost_after_impact = false;
   speed_echoes_index = 0;
   if (sign16(projectile_counter - 5)) {
     if (sign16(projectile_counter - 4)) {
@@ -5138,6 +5303,10 @@ void Samus_MoveHandler_ShinesparkCrashFinish(void) {  // 0x90D40D
     projectile_bomb_pre_instructions[4] = FUNC16(ProjPreInstr_SpeedEcho);
     projectile_variables[4] = kShinesparkCrashFinish_Tab0[(uint16)(2 * (samus_pose - 201)) + 1];
     projectile_bomb_x_speed[4] = 0;
+  }
+  if (resume_speedboost) {
+    Samus_StartSpeedBoosterRunAfterShinesparkImpact();
+    return;
   }
   cooldown_timer = 0;
   samus_shine_timer = 1;

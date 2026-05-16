@@ -1299,6 +1299,7 @@ void Samus_Func8(void);
 void Samus_Func9(void);
 uint16 Samus_GetTop_R20(void);
 uint16 Samus_GetBottom_R18(void);
+int16 Samus_GetFloorSlopeRightDrop(void);
 void Samus_GrabbedByDraygonFrameHandler(void);
 static void Samus_HandleAnimDelay(void);
 void Samus_HandleCooldown(void);

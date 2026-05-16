@@ -46,6 +46,8 @@ This file is for future coding agents working in this repository.
 - Shinespark launch direction should be cached during windup from the latest meaningful right-stick aim input, or left-stick fallback input if the right stick is idle; if input returns to neutral before launch, use the last cached direction rather than falling back to facing direction.
 - During shinespark windup, keep the normal Samus input handler disabled so analog/directional input updates the cached launch vector without triggering the vanilla windup pose transition table early.
 - With shine charge stored, pressing jump while airborne in non-spinning jump/fall states should enter shinespark windup even if Samus is not aiming upward; this path must assign the windup pose immediately rather than only queuing `samus_new_pose`, but must not call `SamusFunc_F433()` on the windup pose because the shinespark movement-type hook only has handlers for launched spark poses.
+- Horizontal shinesparks that impact a slope, and downward diagonal shinesparks that impact the ground, should still fire impact effects but should transfer immediately into a charged speedbooster run rather than freezing Samus in the crash handler.
+- Morph ball physics are being rewritten toward Sonic-like rolling: right-stick aim should have no effect on morph/springball physics, left/right analog input applies torque, roll velocity should conserve through ground/air/bounce states, flat-ground friction should be gentle, and slopes should accelerate the ball downhill without player input.
 
 ## Update Guidance
 

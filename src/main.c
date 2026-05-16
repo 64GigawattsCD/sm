@@ -46,6 +46,7 @@ static void HandleCommand(uint32 j, bool pressed);
 static uint16 GetInputBitForControlCommand(uint32 j);
 static bool IsDirectionalControlCommand(uint16 cmd);
 static bool IsGameplayMovementState(void);
+static int NormalizeGamepadButtonsForMenus(int inputs);
 static void UpdateOpeningIntroSkipState(uint16 inputs);
 static void RenderOpeningIntroSkipPrompt(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void RenderAnalogDebugOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height);
@@ -86,6 +87,7 @@ static uint8 g_paused, g_turbo, g_replay_turbo = true, g_cursor = true;
 static uint8 g_current_window_scale;
 static uint8 g_gamepad_analog_buttons;
 static uint8 g_gamepad_dpad_buttons;
+static int g_gamepad_button_inputs;
 static int g_input1_state;
 static bool g_display_perf;
 static int g_curr_fps;
@@ -103,7 +105,12 @@ enum {
   // main.c feeds RtlRunFrame a packed 12-button frontend bitfield.
   // The SNES Start mask is produced later after SwapInputBits(), so use the
   // frontend bit here instead of kButton_Start.
+  kInputBit_B = 1 << 0,
+  kInputBit_Y = 1 << 1,
+  kInputBit_Select = 1 << 2,
   kInputBit_Start = 1 << 3,
+  kInputBit_A = 1 << 8,
+  kInputBit_X = 1 << 9,
 };
 
 void NORETURN Die(const char *error) {
@@ -600,7 +607,7 @@ int main(int argc, char** argv) {
     }
 
     // Clear gamepad inputs when joypad directional inputs to avoid wonkiness
-    int inputs = g_input1_state;
+    int inputs = g_input1_state | NormalizeGamepadButtonsForMenus(g_gamepad_button_inputs);
     uint8 analog_buttons = g_gamepad_analog_buttons;
     if (g_input1_state & 0xf0)
       analog_buttons = 0;
@@ -915,6 +922,24 @@ static bool IsGameplayMovementState(void) {
   return game_state == kGameState_7_MainGameplayFadeIn || game_state == kGameState_8_MainGameplay;
 }
 
+static int NormalizeGamepadButtonsForMenus(int inputs) {
+  if (IsGameplayMovementState())
+    return inputs;
+
+  // Gameplay remaps move jump/fire off face buttons. Menus should still use
+  // physical A/B as yes/no, and physical X/Y should not inherit gameplay actions.
+  inputs &= ~(kInputBit_A | kInputBit_B | kInputBit_X | kInputBit_Y);
+  if (g_gamepad_modifiers & (1 << kGamepadBtn_B))
+    inputs |= kInputBit_A;
+  if (g_gamepad_modifiers & (1 << kGamepadBtn_A))
+    inputs |= kInputBit_B;
+  if (g_gamepad_modifiers & (1 << kGamepadBtn_Start))
+    inputs |= kInputBit_Start;
+  if (g_gamepad_modifiers & (1 << kGamepadBtn_Back))
+    inputs |= kInputBit_Select;
+  return inputs;
+}
+
 static void HandleCommand(uint32 j, bool pressed) {
   if (j <= kKeys_Controls_Last) {
     uint16 bit = GetInputBitForControlCommand(j);
@@ -1037,6 +1062,14 @@ static void HandleGamepadInput(int button, bool pressed) {
         g_gamepad_dpad_buttons |= bit;
       else
         g_gamepad_dpad_buttons &= ~bit;
+      return;
+    }
+    if (g_gamepad_last_cmd[button] <= kKeys_Controls_Last) {
+      uint16 bit = GetInputBitForControlCommand(g_gamepad_last_cmd[button]);
+      if (pressed)
+        g_gamepad_button_inputs |= bit;
+      else
+        g_gamepad_button_inputs &= ~bit;
       return;
     }
     HandleCommand(g_gamepad_last_cmd[button], pressed);
