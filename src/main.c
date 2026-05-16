@@ -27,6 +27,7 @@
 #include "config.h"
 #include "util.h"
 #include "spc_player.h"
+#include "enemy_types.h"
 
 #ifdef __SWITCH__
 #include "switch_impl.h"
@@ -38,6 +39,8 @@ static void SDLCALL AudioCallback(void *userdata, Uint8 *stream, int len);
 static void SwitchDirectory();
 static void RenderNumber(uint8 *dst, size_t pitch, int n, uint8 big);
 static void OpenOneGamepad(int i);
+static int GetCurrentVolumePercent(void);
+static void SetCurrentVolumePercent(int new_volume);
 static void HandleVolumeAdjustment(int volume_adjustment);
 static void HandleGamepadAxisInput(int gamepad_id, int axis, int value);
 static int RemapSdlButton(int button);
@@ -52,7 +55,10 @@ static void UpdateOpeningIntroSkipState(uint16 inputs);
 static void MaybeActivateNativeMainMenu(void);
 static void UpdateNativeMainMenu(uint16 inputs);
 static uint16 MaskNativeMainMenuInputs(uint16 inputs);
+static uint16 GetMenuAnalogDirectionalInputs(void);
 static void RenderNativeMainMenu(uint8 *pixel_buffer, size_t pitch, int width, int height);
+static void RenderOptionsVolumeOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height);
+static void RenderBuildTimestampOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void ShowExitToMainMenuPrompt(void);
 static void UpdateExitToMainMenuPrompt(uint16 inputs);
 static uint16 MaskExitToMainMenuPromptInputs(uint16 inputs);
@@ -60,6 +66,7 @@ static void RenderExitToMainMenuPrompt(uint8 *pixel_buffer, size_t pitch, int wi
 static void RenderOpeningIntroSkipPrompt(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void RenderAnalogDebugOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void RenderModernFrontCustomLayer(uint32 *pixels, int width, int height);
+static void RenderModernGunshipCustomLayerLine(int custom_slot, int y, uint32 *pixels, int width, int height);
 static void CompositeModernFrontCustomLayer(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void SaveDebugScreenshot(uint8 *pixel_buffer, size_t pitch, int width, int height, const char *prefix, int *counter);
 static void WidescreenDebugLog(const char *fmt, ...);
@@ -146,6 +153,57 @@ enum {
   kInputBit_A = 1 << 8,
   kInputBit_X = 1 << 9,
 };
+
+static const int kNativeSpriteSizes[8][2] = {
+  {8, 16}, {8, 32}, {8, 64}, {16, 32},
+  {16, 64}, {32, 64}, {16, 32}, {16, 32}
+};
+
+enum {
+  kMenuConfirmInputs = kInputBit_A | kInputBit_Start,
+  kMenuCancelInputs = kInputBit_B,
+};
+
+static bool MenuHasConfirmInput(uint16 new_inputs) {
+  return (new_inputs & kMenuConfirmInputs) != 0;
+}
+
+static bool MenuHasCancelInput(uint16 new_inputs) {
+  return (new_inputs & kMenuCancelInputs) != 0;
+}
+
+static uint16 GetMenuAnalogDirectionalInputs(void) {
+  const float deadzone = 0.45f;
+  float abs_x = fabsf(g_left_stick_x);
+  float abs_y = fabsf(g_left_stick_y);
+  if (abs_x < deadzone && abs_y < deadzone)
+    return 0;
+  if (abs_y >= abs_x)
+    return g_left_stick_y < 0.0f ? kInputBit_Up : kInputBit_Down;
+  return g_left_stick_x < 0.0f ? kInputBit_Left : kInputBit_Right;
+}
+
+static bool IsOptionsVolumeSliderVisible(void) {
+  return game_state == kGameState_2_GameOptionsMenu &&
+         game_options_screen_index == 3 &&
+         g_native_main_menu_return_from_options;
+}
+
+static void UpdateOptionsVolumeSlider(uint16 menu_inputs) {
+  static uint16 prev_inputs;
+  if (!IsOptionsVolumeSliderVisible()) {
+    prev_inputs = 0;
+    return;
+  }
+
+  uint16 new_inputs = menu_inputs & ~prev_inputs;
+  prev_inputs = menu_inputs;
+
+  if (new_inputs & kInputBit_Left)
+    HandleVolumeAdjustment(-1);
+  if (new_inputs & kInputBit_Right)
+    HandleVolumeAdjustment(1);
+}
 
 static void WidescreenDebugLog(const char *fmt, ...) {
   FILE *f = fopen("debug_widescreen.log", "ab");
@@ -292,7 +350,9 @@ static void DrawPpuFrameWithPerf(void) {
     RenderAnalogDebugOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
     RenderOpeningIntroSkipPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
     RenderNativeMainMenu(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+    RenderOptionsVolumeOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
     RenderExitToMainMenuPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+    RenderBuildTimestampOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
   } else {
     CompositeModernFrontCustomLayer(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
   }
@@ -712,25 +772,27 @@ int main(int argc, char** argv) {
       continue;
     }
 
-    // Clear gamepad inputs when joypad directional inputs to avoid wonkiness
-    int inputs = g_input1_state | NormalizeGamepadButtonsForMenus(g_gamepad_button_inputs);
+    // Gameplay uses analog-derived directions. Native menus should only read
+    // digital d-pad plus the configured logical SNES button mappings.
+    int menu_inputs = g_input1_state | NormalizeGamepadButtonsForMenus(g_gamepad_button_inputs) |
+                      g_gamepad_dpad_buttons | GetMenuAnalogDirectionalInputs();
+    int inputs = menu_inputs;
     uint8 analog_buttons = g_gamepad_analog_buttons;
     if (g_input1_state & 0xf0)
       analog_buttons = 0;
     inputs |= analog_buttons;
-    if (!IsGameplayMovementState())
-      inputs |= g_gamepad_dpad_buttons;
 
     MaybeActivateNativeMainMenu();
+    UpdateOptionsVolumeSlider((uint16)menu_inputs);
     uint8 is_replay = 0;
     if (g_exit_to_main_menu_prompt_active) {
-      uint16 game_inputs = MaskExitToMainMenuPromptInputs((uint16)inputs);
-      UpdateExitToMainMenuPrompt((uint16)inputs);
+      uint16 game_inputs = MaskExitToMainMenuPromptInputs((uint16)menu_inputs);
+      UpdateExitToMainMenuPrompt((uint16)menu_inputs);
       is_replay = RtlRunFrame(game_inputs);
       g_snes->disableRender = (g_turbo ^ (is_replay & g_replay_turbo)) && (frameCtr & (g_turbo ? 0xf : 0x7f)) != 0;
     } else if (g_native_main_menu_active) {
-      uint16 game_inputs = MaskNativeMainMenuInputs((uint16)inputs);
-      UpdateNativeMainMenu((uint16)inputs);
+      uint16 game_inputs = MaskNativeMainMenuInputs((uint16)menu_inputs);
+      UpdateNativeMainMenu((uint16)menu_inputs);
       if (g_native_main_menu_quit_requested) {
         running = false;
         continue;
@@ -996,11 +1058,16 @@ static bool NativeMainMenuCanOpenOnTitleScene(void) {
 }
 
 static void ClearTransientMenuInputs(void) {
+  g_input1_state = 0;
+  g_gamepad_button_inputs = 0;
   g_gamepad_analog_buttons = 0;
   g_gamepad_dpad_buttons = 0;
-  g_gamepad_modifiers &= ~((1u << kGamepadBtn_DpadUp) | (1u << kGamepadBtn_DpadDown) |
+  g_gamepad_modifiers &= ~((1u << kGamepadBtn_A) | (1u << kGamepadBtn_B) |
+                           (1u << kGamepadBtn_X) | (1u << kGamepadBtn_Y) |
+                           (1u << kGamepadBtn_Back) | (1u << kGamepadBtn_Start) |
+                           (1u << kGamepadBtn_DpadUp) | (1u << kGamepadBtn_DpadDown) |
                            (1u << kGamepadBtn_DpadLeft) | (1u << kGamepadBtn_DpadRight));
-  for (int button = kGamepadBtn_DpadUp; button <= kGamepadBtn_DpadRight; button++)
+  for (int button = kGamepadBtn_A; button <= kGamepadBtn_DpadRight; button++)
     g_gamepad_last_cmd[button] = 0;
   g_native_main_menu_prev_inputs = 0;
   g_exit_to_main_menu_prompt_prev_inputs = 0;
@@ -1048,7 +1115,6 @@ void RequestNativeMainMenuFromFileSelect(void) {
 
 static void UpdateNativeMainMenu(uint16 inputs) {
   enum { kNativeMainMenuItemCount = 4 };
-  const uint16 confirm_inputs = kInputBit_A | kInputBit_Start;
   uint16 new_inputs = inputs & ~g_native_main_menu_prev_inputs;
   g_native_main_menu_prev_inputs = inputs;
 
@@ -1060,7 +1126,7 @@ static void UpdateNativeMainMenu(uint16 inputs) {
     g_native_main_menu_selection = (g_native_main_menu_selection + 1) % kNativeMainMenuItemCount;
     return;
   }
-  if ((new_inputs & confirm_inputs) == 0)
+  if (!MenuHasConfirmInput(new_inputs))
     return;
 
   g_native_main_menu_active = false;
@@ -1097,7 +1163,7 @@ static void ShowExitToMainMenuPrompt(void) {
   if (g_native_main_menu_active || g_exit_to_main_menu_prompt_active)
     return;
   g_exit_to_main_menu_prompt_active = true;
-  g_exit_to_main_menu_prompt_selection_yes = false;
+  g_exit_to_main_menu_prompt_selection_yes = true;
   g_exit_to_main_menu_prompt_prev_inputs = 0;
   g_gamepad_analog_buttons = 0;
   g_gamepad_dpad_buttons = 0;
@@ -1110,13 +1176,13 @@ static void UpdateExitToMainMenuPrompt(uint16 inputs) {
   if (new_inputs & (kInputBit_Left | kInputBit_Right | kInputBit_Up | kInputBit_Down))
     g_exit_to_main_menu_prompt_selection_yes = !g_exit_to_main_menu_prompt_selection_yes;
 
-  if (new_inputs & (kInputBit_B | kInputBit_Select)) {
+  if (MenuHasCancelInput(new_inputs) || (new_inputs & kInputBit_Select)) {
     g_exit_to_main_menu_prompt_active = false;
     g_exit_to_main_menu_prompt_prev_inputs = 0;
     return;
   }
 
-  if (new_inputs & (kInputBit_A | kInputBit_Start)) {
+  if (MenuHasConfirmInput(new_inputs)) {
     if (g_exit_to_main_menu_prompt_selection_yes)
       OpenNativeMainMenuScene();
     else {
@@ -1200,6 +1266,214 @@ static void RenderNativeMainMenu(uint8 *pixel_buffer, size_t pitch, int width, i
     DrawText5x7(pixel_buffer, pitch, width, height, item_x, y, kMenuItems[i], scale, text_color);
   }
 
+}
+
+static int GetCurrentVolumePercent(void) {
+#if SYSTEM_VOLUME_MIXER_AVAILABLE
+  int volume = GetApplicationVolume();
+  return volume >= 0 ? volume : 100;
+#else
+  return (g_sdl_audio_mixer_volume * 100 + SDL_MIX_MAXVOLUME / 2) / SDL_MIX_MAXVOLUME;
+#endif
+}
+
+static void SetCurrentVolumePercent(int new_volume) {
+  new_volume = IntMin(IntMax(0, new_volume), 100);
+#if SYSTEM_VOLUME_MIXER_AVAILABLE
+  SetApplicationVolume(new_volume);
+#else
+  g_sdl_audio_mixer_volume = (new_volume * SDL_MIX_MAXVOLUME + 50) / 100;
+#endif
+  g_config.msuvolume = (uint8)new_volume;
+}
+
+static void RenderOptionsVolumeOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height) {
+  if (!IsOptionsVolumeSliderVisible())
+    return;
+
+  int scale = IntMax(1, height / 240);
+  int panel_w = 152 * scale;
+  int panel_h = 34 * scale;
+  int panel_x = (width - panel_w) / 2;
+  int panel_y = height - panel_h - 14 * scale;
+  int slider_x = panel_x + 40 * scale;
+  int slider_y = panel_y + 18 * scale;
+  int slider_w = 86 * scale;
+  int slider_h = 6 * scale;
+  int volume = GetCurrentVolumePercent();
+  int fill_w = (slider_w * volume) / 100;
+  int knob_x = slider_x + IntMin(IntMax(fill_w - scale, 0), slider_w - 2 * scale);
+  char volume_text[8];
+  snprintf(volume_text, sizeof(volume_text), "%d", volume);
+
+  FillRectAlpha(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, 0x101722, 176);
+  DrawRectOutline(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, IntMax(1, scale), 0x8FEA7D);
+  DrawText5x7(pixel_buffer, pitch, width, height, panel_x + 8 * scale, panel_y + 6 * scale, "VOLUME", scale, 0xFFFFFF);
+  FillRect(pixel_buffer, pitch, width, height, slider_x, slider_y, slider_w, slider_h, 0x2C3440);
+  if (fill_w > 0)
+    FillRect(pixel_buffer, pitch, width, height, slider_x, slider_y, fill_w, slider_h, 0x8FEA7D);
+  DrawRectOutline(pixel_buffer, pitch, width, height, slider_x, slider_y, slider_w, slider_h, IntMax(1, scale), 0xC5D0D8);
+  FillRect(pixel_buffer, pitch, width, height, knob_x, slider_y - scale, 2 * scale, slider_h + 2 * scale, 0xFFFFFF);
+  DrawText5x7(pixel_buffer, pitch, width, height, panel_x + 131 * scale, panel_y + 6 * scale, volume_text, scale, 0xFFFFFF);
+}
+
+static void RenderBuildTimestampOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height) {
+  static const char kBuildTimestamp[] = __DATE__ " " __TIME__;
+  int scale = IntMax(1, height / 240);
+  int margin = 4 * scale;
+  int text_width = ((int)strlen(kBuildTimestamp) * 6 - 1) * scale;
+  int text_height = 7 * scale;
+  int panel_x = margin;
+  int panel_y = height - text_height - 2 * margin;
+  int panel_w = text_width + 2 * margin;
+  int panel_h = text_height + 2 * margin;
+
+  FillRectAlpha(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, 0x101722, 144);
+  DrawRectOutline(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, IntMax(1, scale), 0x4F6B5C);
+  DrawText5x7(pixel_buffer, pitch, width, height, panel_x + margin, panel_y + margin, kBuildTimestamp, scale, 0xC5D0D8);
+}
+
+static bool IsGunshipEnemyData(const EnemyData *E) {
+  EnemyDef *ED = get_EnemyDef_A2(E->enemy_ptr);
+  return ED->ai_init == fnGunshipTop_Init || ED->ai_init == fnGunshipBottom_Init;
+}
+
+static uint32 NativeRgbFromCgram(Ppu *ppu, uint16 color) {
+  uint32 r = color & 0x1f;
+  uint32 g = (color >> 5) & 0x1f;
+  uint32 b = (color >> 10) & 0x1f;
+  return 0xff000000 |
+         ppu->brightnessMult[b] |
+         (uint32)ppu->brightnessMult[g] << 8 |
+         (uint32)ppu->brightnessMult[r] << 16;
+}
+
+static int GetGunshipCustomSlotForOamPriority(uint16 oam1) {
+  int sprite_priority = (oam1 & 0x3000) >> 12;
+  int slot = sprite_priority * 4 + 3;
+  return IntMin(slot, kModernFrontCustomLayer - 1);
+}
+
+static void RenderNativeSpritePieceLine(Ppu *ppu, int custom_slot, int row_y, uint32 *pixels,
+                                        int sprite_x, int sprite_y, bool size_bit, uint16 oam1) {
+  int sprite_size = kNativeSpriteSizes[ppu->objSize][size_bit ? 1 : 0];
+  if (row_y < sprite_y || row_y >= sprite_y + sprite_size)
+    return;
+  if (GetGunshipCustomSlotForOamPriority(oam1) != custom_slot)
+    return;
+
+  int row = row_y - sprite_y;
+  int obj_adr = (oam1 & 0x100) ? ppu->objTileAdr2 : ppu->objTileAdr1;
+  bool h_flipped = (oam1 & 0x4000) != 0;
+  bool v_flipped = (oam1 & 0x8000) != 0;
+  int palette_base = 0x80 + 16 * ((oam1 & 0xe00) >> 9);
+  int screen_left = -kPpuExtraLeftRight;
+  int screen_right = 256 + kPpuExtraLeftRight;
+
+  if (v_flipped)
+    row = sprite_size - 1 - row;
+
+  for (int col = 0; col < sprite_size; col += 8) {
+    int tile_x = sprite_x + col;
+    int px_left = IntMax(screen_left - tile_x, 0);
+    int px_right = IntMin(screen_right - tile_x, 8);
+    if (px_left >= px_right)
+      continue;
+
+    int used_col = h_flipped ? sprite_size - 1 - col : col;
+    int used_tile = ((((oam1 & 0xff) >> 4) + (row >> 3)) << 4) |
+                    (((oam1 & 0xf) + (used_col >> 3)) & 0xf);
+    uint16 *addr = &ppu->vram[(obj_adr + used_tile * 16 + (row & 0x7)) & 0x7fff];
+    uint32 plane = addr[0] | addr[8] << 16;
+
+    for (int px = px_left; px < px_right; px++) {
+      int shift = h_flipped ? px : 7 - px;
+      uint32 bits = plane >> shift;
+      int pixel = (bits >> 0) & 1 | (bits >> 7) & 2 | (bits >> 14) & 4 | (bits >> 21) & 8;
+      if (pixel == 0)
+        continue;
+      int dst_x = tile_x + px + kPpuExtraLeftRight;
+      if ((unsigned)dst_x >= kPpuXPixels)
+        continue;
+      pixels[dst_x] = NativeRgbFromCgram(ppu, ppu->cgram[palette_base + pixel]);
+    }
+  }
+}
+
+static void RenderNativeSpritemapLine(Ppu *ppu, int custom_slot, int row_y, uint32 *pixels,
+                                      uint8 db, uint16 spritemap, int base_x, int base_y,
+                                      uint16 palette_bits, uint16 tile_base) {
+  if (!spritemap)
+    return;
+
+  const uint8 *pp = RomPtrWithBank(db, spritemap);
+  int n = GET_WORD(pp);
+  pp += 2;
+  for (; n != 0; n--, pp += 5) {
+    int sprite_x = base_x + (int16)GET_WORD(pp);
+    int sprite_y = base_y + (int8)pp[2];
+    uint16 oam1 = palette_bits | (tile_base + GET_WORD(pp + 3));
+    RenderNativeSpritePieceLine(ppu, custom_slot, row_y, pixels, sprite_x, sprite_y,
+                                (*(int16 *)pp) < 0, oam1);
+  }
+}
+
+static void RenderNativeExtendedSpritemapLine(Ppu *ppu, int custom_slot, int row_y, uint32 *pixels,
+                                              const EnemyData *E, int x2, int y2,
+                                              uint16 palette_bits, uint16 tile_base) {
+  int n = *RomPtrWithBank(E->bank, E->spritemap_pointer);
+  uint16 ptr = E->spritemap_pointer + 2;
+  while (n-- > 0) {
+    ExtendedSpriteMap *ext = get_ExtendedSpriteMap(E->bank, ptr);
+    if (*(uint16 *)RomPtrWithBank(E->bank, ext->spritemap) != 0xFFFE) {
+      RenderNativeSpritemapLine(ppu, custom_slot, row_y, pixels, E->bank, ext->spritemap,
+                                x2 + ext->xpos, y2 + ext->ypos, palette_bits, tile_base);
+    }
+    ptr += 8;
+  }
+}
+
+static void RenderNativeGunshipEnemyLine(Ppu *ppu, int custom_slot, int y, uint32 *pixels,
+                                         const EnemyData *E, const EnemySpawnData *ES) {
+  if (!IsGunshipEnemyData(E))
+    return;
+  if (!E->spritemap_pointer || E->spritemap_pointer == addr_kSpritemap_Nothing_A0)
+    return;
+
+  int x2 = ES->xpos2 + E->x_pos - layer1_x_pos;
+  int y2 = ES->ypos2 + E->y_pos - layer1_y_pos;
+  if (E->shake_timer)
+    x2 += ((E->frame_counter & 2) == 0) ? 1 : -1;
+
+  uint16 palette_bits;
+  if (E->flash_timer && (random_enemy_counter & 2) != 0)
+    palette_bits = 0;
+  else if (E->frozen_timer && (E->frozen_timer >= 0x5A || (E->frozen_timer & 2) != 0))
+    palette_bits = 3072;
+  else
+    palette_bits = E->palette_index;
+
+  if ((E->extra_properties & 4) != 0) {
+    RenderNativeExtendedSpritemapLine(ppu, custom_slot, y - 1, pixels, E, x2, y2,
+                                      palette_bits, E->vram_tiles_index);
+  } else {
+    RenderNativeSpritemapLine(ppu, custom_slot, y - 1, pixels, E->bank, E->spritemap_pointer,
+                              x2, y2, palette_bits, E->vram_tiles_index);
+  }
+}
+
+static void RenderModernGunshipCustomLayerLine(int custom_slot, int y, uint32 *pixels, int width, int height) {
+  if (width != kPpuXPixels || height != kSnesNativeHeight || y <= 0 || y > kSnesNativeHeight)
+    return;
+  if (!g_modern_layer_renderer)
+    return;
+
+  Ppu *ppu = g_snes->ppu;
+  for (int i = 0; i < num_enemies_in_room; i++) {
+    int enemy_index = i * 64;
+    RenderNativeGunshipEnemyLine(ppu, custom_slot, y, pixels,
+                                 gEnemyData(enemy_index), gEnemySpawnData(enemy_index));
+  }
 }
 
 static void DrawPoint(uint8 *pixel_buffer, size_t pitch, int width, int height, int x, int y, int size, uint32 color) {
@@ -1303,7 +1577,9 @@ static void RenderModernFrontCustomLayer(uint32 *pixels, int width, int height) 
   RenderOpeningIntroSkipPrompt((uint8 *)pixels, width * sizeof(uint32), width, height);
   RenderAnalogDebugOverlay((uint8 *)pixels, width * sizeof(uint32), width, height);
   RenderNativeMainMenu((uint8 *)pixels, width * sizeof(uint32), width, height);
+  RenderOptionsVolumeOverlay((uint8 *)pixels, width * sizeof(uint32), width, height);
   RenderExitToMainMenuPrompt((uint8 *)pixels, width * sizeof(uint32), width, height);
+  RenderBuildTimestampOverlay((uint8 *)pixels, width * sizeof(uint32), width, height);
   for (int i = 0; i < width * height; i++) {
     if ((pixels[i] & 0xffffff) != 0 && (pixels[i] & 0xff000000) == 0)
       pixels[i] |= 0xff000000;
@@ -1313,22 +1589,21 @@ static void RenderModernFrontCustomLayer(uint32 *pixels, int width, int height) 
 }
 
 void RtlRenderModernCustomLayer(int custom_slot, int y, uint32 *pixels, int width, int height) {
-  if (custom_slot != kModernFrontCustomLayer || width != kSnesNativeWidth || height != kSnesNativeHeight)
-    return;
-  if (g_snes_width != kSnesNativeWidth) {
-    memset(pixels, 0, sizeof(uint32) * width);
+  if (custom_slot == kModernFrontCustomLayer && width == g_snes_width && height == g_snes_height) {
+    if (g_modern_front_custom_layer_size < (size_t)width * height) {
+      g_modern_front_custom_layer_size = (size_t)width * height;
+      g_modern_front_custom_layer = (uint32 *)realloc(g_modern_front_custom_layer,
+                                                      g_modern_front_custom_layer_size * sizeof(uint32));
+      if (!g_modern_front_custom_layer)
+        Die("Unable to allocate modern front layer");
+    }
+    if (y <= 1)
+      RenderModernFrontCustomLayer(g_modern_front_custom_layer, width, height);
+    memcpy(pixels, &g_modern_front_custom_layer[(y - 1) * width], sizeof(uint32) * width);
     return;
   }
-  if (g_modern_front_custom_layer_size < (size_t)width * height) {
-    g_modern_front_custom_layer_size = (size_t)width * height;
-    g_modern_front_custom_layer = (uint32 *)realloc(g_modern_front_custom_layer,
-                                                    g_modern_front_custom_layer_size * sizeof(uint32));
-    if (!g_modern_front_custom_layer)
-      Die("Unable to allocate modern front layer");
-  }
-  if (y <= 1)
-    RenderModernFrontCustomLayer(g_modern_front_custom_layer, width, height);
-  memcpy(pixels, &g_modern_front_custom_layer[(y - 1) * width], sizeof(uint32) * width);
+  memset(pixels, 0, sizeof(uint32) * width);
+  RenderModernGunshipCustomLayerLine(custom_slot, y, pixels, width, height);
 }
 
 static uint32 BlendArgbOverBgr(uint32 dst_bgr, uint32 src_argb) {
@@ -1389,20 +1664,6 @@ static bool IsGameplayMovementState(void) {
 }
 
 static int NormalizeGamepadButtonsForMenus(int inputs) {
-  if (IsGameplayMovementState())
-    return inputs;
-
-  // Gameplay remaps move jump/fire off face buttons. Menus should still use
-  // physical A/B as yes/no, and physical X/Y should not inherit gameplay actions.
-  inputs &= ~(kInputBit_A | kInputBit_B | kInputBit_X | kInputBit_Y);
-  if (g_gamepad_modifiers & (1 << kGamepadBtn_A))
-    inputs |= kInputBit_A;
-  if (g_gamepad_modifiers & (1 << kGamepadBtn_B))
-    inputs |= kInputBit_B;
-  if (g_gamepad_modifiers & (1 << kGamepadBtn_Start))
-    inputs |= kInputBit_Start;
-  if (g_gamepad_modifiers & (1 << kGamepadBtn_Back))
-    inputs |= kInputBit_Select;
   return inputs;
 }
 
@@ -1565,15 +1826,10 @@ static void HandleGamepadInput(int button, bool pressed) {
 }
 
 static void HandleVolumeAdjustment(int volume_adjustment) {
-#if SYSTEM_VOLUME_MIXER_AVAILABLE
-  int current_volume = GetApplicationVolume();
+  int current_volume = GetCurrentVolumePercent();
   int new_volume = IntMin(IntMax(0, current_volume + volume_adjustment * 5), 100);
-  SetApplicationVolume(new_volume);
-  printf("[System Volume]=%i\n", new_volume);
-#else
-  g_sdl_audio_mixer_volume = IntMin(IntMax(0, g_sdl_audio_mixer_volume + volume_adjustment * (SDL_MIX_MAXVOLUME >> 4)), SDL_MIX_MAXVOLUME);
-  printf("[SDL mixer volume]=%i\n", g_sdl_audio_mixer_volume);
-#endif
+  SetCurrentVolumePercent(new_volume);
+  printf("[Volume]=%i\n", new_volume);
 }
 
 // Approximates atan2(y, x) normalized to the [0,4) range

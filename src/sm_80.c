@@ -4,6 +4,7 @@
 #include "ida_types.h"
 #include "variables.h"
 #include "funcs.h"
+#include "config.h"
 #include "enemy_types.h"
 #include "spc_player.h"
 
@@ -1960,7 +1961,10 @@ void HandleScrollingWhenTriggeringScrollRight(void) {  // 0x80A641
     layer1_x_pos = ideal_layer1_xpos;
     layer1_x_subpos = 0;
   }
-  uint16 v0 = swap16(room_width_in_scrolls - 1);
+  int max_layer1_x_pos = (int)swap16(room_width_in_scrolls - 1) - 2 * (int)GetGameplayExtendedMarginX();
+  if (max_layer1_x_pos < 0)
+    max_layer1_x_pos = 0;
+  uint16 v0 = (uint16)max_layer1_x_pos;
   if (v0 >= layer1_x_pos) {
     v1 = HIBYTE(layer1_x_pos);
     uint16 RegWord = Mult8x8((uint16)(layer1_y_pos + 128) >> 8, room_width_in_scrolls);

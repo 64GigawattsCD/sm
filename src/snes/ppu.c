@@ -267,6 +267,7 @@ void ppu_saveload(Ppu *ppu, SaveLoadFunc *func, void *ctx) {
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags) {
   ppu->renderPitch = (uint)pitch;
   ppu->renderBuffer = pixels;
+  ppu->renderFlags = render_flags;
   ppu->extraLeftRight = kPpuExtraLeftRight;
   ppu->extraLeftCur = kPpuExtraLeftRight;
   ppu->extraRightCur = kPpuExtraLeftRight;
@@ -1608,6 +1609,8 @@ static void PpuFixedTrigFromDegrees(int rotation_degrees, int *cos_fixed, int *s
 static bool ppu_evaluateTransformedSprite(Ppu* ppu, int line, int x, int y, int spriteSize,
                                           int oam1, int *tilesFound, int center_x2,
                                           int center_y2, int cos_fixed, int sin_fixed) {
+  int sprite_tile_limit = (ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits) ? 0x7fffffff :
+    (34 * (256 + ppu->extraLeftCur + ppu->extraRightCur) + 128) / 256;
   int sprite_center_x2 = 2 * x + spriteSize;
   int sprite_center_y2 = 2 * y + spriteSize;
   int rotated_center_x2 = PpuRotateFixedX2(sprite_center_x2, sprite_center_y2,
@@ -1618,15 +1621,15 @@ static bool ppu_evaluateTransformedSprite(Ppu* ppu, int line, int x, int y, int 
   int dst_top = PpuFloorDiv2(rotated_center_y2 - spriteSize);
   if (line < dst_top || line >= dst_top + spriteSize)
     return false;
-  int screen_left = -kPpuExtraLeftRight;
-  int screen_right = 256 + kPpuExtraLeftRight;
+  int screen_left = -ppu->extraLeftCur;
+  int screen_right = 256 + ppu->extraRightCur;
   if (dst_left <= screen_left - spriteSize || dst_left >= screen_right)
     return false;
 
   int px_left = IntMax(screen_left - dst_left, 0);
   int px_right = IntMin(screen_right - dst_left, spriteSize);
   *tilesFound += (px_right - px_left + 7) >> 3;
-  if (*tilesFound > 34) {
+  if (*tilesFound > sprite_tile_limit) {
     ppu->timeOver = true;
     return true;
   }
@@ -1679,6 +1682,12 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
   uint8_t index = ppu->objPriority ? (ppu->oamAdr & 0xfe) : 0;
   int spritesFound = 0;
   int tilesFound = 0;
+  int sprite_count_limit = (ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits) ? 0x7fffffff :
+    (32 * (256 + ppu->extraLeftCur + ppu->extraRightCur) + 128) / 256;
+  int sprite_tile_limit = (ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits) ? 0x7fffffff :
+    (34 * (256 + ppu->extraLeftCur + ppu->extraRightCur) + 128) / 256;
+  int screen_left = -ppu->extraLeftCur;
+  int screen_right = 256 + ppu->extraRightCur;
   for(int i = 0; i < 128; i++) {
     uint8_t y = ppu->oam[index] >> 8;
     // check if the sprite is on this line and get the sprite size
@@ -1700,12 +1709,12 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
                                         g_samus_sprite_transform_center_y2,
                                         cos_fixed, sin_fixed)) {
         spritesFound++;
-        if(spritesFound > 32) {
+        if(spritesFound > sprite_count_limit) {
           ppu->rangeOver = true;
           break;
         }
       }
-      if(tilesFound > 34)
+      if(tilesFound > sprite_tile_limit)
         break;
       index += 2;
       continue;
@@ -1721,12 +1730,12 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
                                         g_projectile_sprite_transform_cos[projectile_transform],
                                         g_projectile_sprite_transform_sin[projectile_transform])) {
         spritesFound++;
-        if(spritesFound > 32) {
+        if(spritesFound > sprite_count_limit) {
           ppu->rangeOver = true;
           break;
         }
       }
-      if(tilesFound > 34)
+      if(tilesFound > sprite_tile_limit)
         break;
       index += 2;
       continue;
@@ -1737,7 +1746,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
       if(x > -spriteSize) {
         // break if we found 32 sprites already
         spritesFound++;
-        if(spritesFound > 32) {
+        if(spritesFound > sprite_count_limit) {
           ppu->rangeOver = true;
           break;
         }
@@ -1755,10 +1764,10 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
         PpuZbufType z = paletteBase + (prio << 8);
 
         for(int col = 0; col < spriteSize; col += 8) {
-          if(col + x > -8 - kPpuExtraLeftRight && col + x < 256 + kPpuExtraLeftRight) {
+          if(col + x > screen_left - 8 && col + x < screen_right) {
             // break if we found 34 8*1 slivers already
             tilesFound++;
-            if(tilesFound > 34) {
+            if(tilesFound > sprite_tile_limit) {
               ppu->timeOver = true;
               break;
             }
@@ -1768,8 +1777,8 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
             uint16 *addr = &ppu->vram[(objAdr + usedTile * 16 + (row & 0x7)) & 0x7fff];
             uint32 plane = addr[0] | addr[8] << 16;
             // go over each pixel
-            int px_left = IntMax(-(col + x + kPpuExtraLeftRight), 0);
-            int px_right = IntMin(256 + kPpuExtraLeftRight - (col + x), 8);
+            int px_left = IntMax(screen_left - (col + x), 0);
+            int px_right = IntMin(screen_right - (col + x), 8);
             PpuZbufType *dst = ppu->objBuffer.data + col + x + px_left + kPpuExtraLeftRight;
 
             for (int px = px_left; px < px_right; px++, dst++) {
@@ -1783,7 +1792,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
 
           }
         }
-        if(tilesFound > 34) break; // break out of sprite-loop if max tiles found
+        if(tilesFound > sprite_tile_limit) break; // break out of sprite-loop if max tiles found
       }
     }
     index += 2;

@@ -3,7 +3,10 @@
 #include "ida_types.h"
 #include "variables.h"
 #include "funcs.h"
+#include "config.h"
 #include "enemy_types.h"
+
+extern bool g_modern_layer_renderer;
 
 #define kEnemyLayerToQueuePtr ((uint16*)RomFixedPtr(0xa0b133))
 #define kStandardSpriteTiles ((uint16*)RomFixedPtr(0x9ad200))
@@ -578,7 +581,7 @@ void DetermineWhichEnemiesToProcess(void) {  // 0xA08EB6
         } else if ((properties & 0x800) != 0
                    || (v1->ai_handler_bits & 4) != 0
                    || (int16)(v1->x_width + v1->x_pos - layer1_x_pos) >= 0
-                   && (int16)(v1->x_width + layer1_x_pos + 256 - v1->x_pos) >= 0
+                   && (int16)(v1->x_width + layer1_x_pos + GetGameplayVisibleWidth() - v1->x_pos) >= 0
                    && (int16)(v1->y_pos + 8 - layer1_y_pos) >= 0
                    && (int16)(layer1_y_pos + 248 - v1->y_pos) >= 0) {
           uint16 v3 = active_enemy_indexes_write_ptr;
@@ -1914,10 +1917,17 @@ void DrawOneEnemy(void) {  // 0xA09423
   enemy_drawing_queue_sizes[varE34 >> 1] += 2;
 }
 
+static bool IsGunshipEnemyForModernCustomLayer(const EnemyData *E) {
+  EnemyDef *ED = get_EnemyDef_A2(E->enemy_ptr);
+  return ED->ai_init == fnGunshipTop_Init || ED->ai_init == fnGunshipBottom_Init;
+}
+
 void WriteEnemyOams(void) {  // 0xA0944A
   VoidP palette_index;
   
   EnemyData *E = gEnemyData(cur_enemy_index);
+  if (g_modern_layer_renderer && IsGunshipEnemyForModernCustomLayer(E))
+    return;
   EnemySpawnData *ES = gEnemySpawnData(cur_enemy_index);
   uint16 x2 = ES->xpos2 + E->x_pos - layer1_x_pos;
   uint16 y2 = ES->ypos2 + E->y_pos - layer1_y_pos;
@@ -1951,7 +1961,10 @@ void WriteEnemyOams(void) {  // 0xA0944A
       } else {
         x = x2 + ext->xpos;
         y = y2 + ext->ypos;
-        if (((x + 128) & 0xFE00) == 0 && ((y + 128) & 0xFE00) == 0) {
+        int16 sx = (int16)x;
+        int16 sy = (int16)y;
+        if (sx >= -128 && sx < (int16)(GetGameplayVisibleWidth() + 128) &&
+            sy >= -128 && sy < 384) {
           if (HIBYTE(y))
             DrawSpritemapWithBaseTileOffscreen(E->bank, ext->spritemap, x, y, r3, r0);
           else
@@ -2996,19 +3009,22 @@ PairU16 EnemyFunc_ACA8(Point16U base_pt, Point16U samus_pt) {  // 0xA0ACA8
 
 uint16 CheckIfEnemyIsOnScreen(void) {  // 0xA0AD70
   EnemyData *v0 = gEnemyData(cur_enemy_index);
-  return (int16)(v0->x_pos - layer1_x_pos) < 0 || (int16)(layer1_x_pos + 256 - v0->x_pos) < 0 || 
+  uint16 visible_width = GetGameplayVisibleWidth();
+  return (int16)(v0->x_pos - layer1_x_pos) < 0 || (int16)(layer1_x_pos + visible_width - v0->x_pos) < 0 || 
       (int16)(v0->y_pos - layer1_y_pos) < 0 || (int16)(layer1_y_pos + 256 - v0->y_pos) < 0;
 }
 
 uint16 EnemyFunc_ADA3(uint16 a) {  // 0xA0ADA3
   EnemyData *E = gEnemyData(cur_enemy_index);
-  return (int16)(a + E->x_pos - layer1_x_pos) < 0 || (int16)(a + layer1_x_pos + 256 - E->x_pos) < 0 ||
+  uint16 visible_width = GetGameplayVisibleWidth();
+  return (int16)(a + E->x_pos - layer1_x_pos) < 0 || (int16)(a + layer1_x_pos + visible_width - E->x_pos) < 0 ||
       (int16)(a + E->y_pos - layer1_y_pos) < 0 || (int16)(a + layer1_y_pos + 256 - E->y_pos) < 0;
 }
 
 uint16 EnemyWithNormalSpritesIsOffScreen(void) {  // 0xA0ADE7
   EnemyData *E = gEnemyData(cur_enemy_index);
-  return (int16)(E->x_width + E->x_pos - layer1_x_pos) < 0 || (int16)(E->x_width + layer1_x_pos + 256 - E->x_pos) < 0 ||
+  uint16 visible_width = GetGameplayVisibleWidth();
+  return (int16)(E->x_width + E->x_pos - layer1_x_pos) < 0 || (int16)(E->x_width + layer1_x_pos + visible_width - E->x_pos) < 0 ||
       (int16)(E->y_pos + 8 - layer1_y_pos) < 0 || (int16)(layer1_y_pos + 248 - E->y_pos) < 0;
 }
 

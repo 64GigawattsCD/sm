@@ -106,6 +106,18 @@ enum {
 
 extern Config g_config;
 
+static inline uint16 GetGameplayVisibleWidth(void) {
+  return (uint16)(256 + 2 * g_config.extended_aspect_ratio);
+}
+
+static inline uint16 GetGameplayVisibleCenterX(void) {
+  return (uint16)(GetGameplayVisibleWidth() / 2);
+}
+
+static inline uint16 GetGameplayExtendedMarginX(void) {
+  return g_config.extended_aspect_ratio;
+}
+
 void ParseConfigFile(const char *filename);
 int FindCmdForSdlKey(SDL_Keycode code, SDL_Keymod mod);
 int FindCmdForGamepadButton(int button, uint32 modifiers);
