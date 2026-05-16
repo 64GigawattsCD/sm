@@ -4,6 +4,8 @@
 
 Move Super Metroid room and level parsing into BlockBox without breaking the current runtime. The first milestone is a read-only parser that can load the same room header, room-state, decompressed level-data, BTS, background payload, and scroll metadata that `sm` currently derives at runtime.
 
+Current submodule target: `BlockBox/` in this repo, sourced from `64GigawattsCD/BlocksBox` on branch `SuperMetroid`.
+
 ## Current parsing seam in `sm`
 
 - `src/ida_types.h`
