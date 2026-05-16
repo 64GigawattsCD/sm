@@ -58,6 +58,7 @@ This file is for future coding agents working in this repository.
 - 16:9 follow-up work remains on camera and special-object parity: room-edge camera clamping should stop early enough for the widened viewport, and gunship/other large enemy visibility should respect the widened horizontal view instead of culling against 256-wide assumptions.
 - `Screenshot = F12` captures the current presented framebuffer to `debug_screenshots/manual_####.bmp` for renderer debugging.
 - The vanilla options screen now has a native volume slider overlay on its main page; left/right adjusts the current runtime app volume in 5% steps.
+- BlockBox integration is starting on branch `BlockBoxIntegration`: add BlockBox as a submodule, branch the submodule to `SuperMetroid`, and migrate Super Metroid room/level parsing there in phases, beginning with read-only room/header/state/level-data parsing before runtime mutation helpers.
 
 ## Update Guidance
 
