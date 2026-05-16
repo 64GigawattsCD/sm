@@ -5,6 +5,7 @@
 #include "variables.h"
 #include "funcs.h"
 #include "enemy_types.h"
+#include <math.h>
 
 
 #define kOffsetToSaveSlot ((uint16*)RomFixedPtr(0x81812b))
@@ -39,6 +40,17 @@ int g_samus_sprite_transform_oam_start;
 int g_samus_sprite_transform_oam_end;
 int g_samus_sprite_transform_center_x2;
 int g_samus_sprite_transform_center_y2;
+int g_projectile_sprite_transform_count;
+int g_projectile_sprite_transform_oam_start[10];
+int g_projectile_sprite_transform_oam_end[10];
+int g_projectile_sprite_transform_center_x2[10];
+int g_projectile_sprite_transform_center_y2[10];
+int g_projectile_sprite_transform_cos[10];
+int g_projectile_sprite_transform_sin[10];
+
+void ResetProjectileSpriteTransforms(void) {
+  g_projectile_sprite_transform_count = 0;
+}
 
 static void GrantSkipMenuLoadout(void) {
   const uint16 kAllEquipment = 0xF337;
@@ -478,8 +490,77 @@ void DrawBeamGrappleSpritemap(uint16 a, uint16 x_r20, uint16 y_r18) {  // 0x818A
   DrawGrappleOrProjectileSpritemap(RomPtr_93(g_off_93A1A1[a]), x_r20, y_r18);
 }
 
+static float ProjectileVisualBaseAngle(uint16 dir) {
+  switch (dir & 0xf) {
+  case 0: return -0.5f * (float)M_PI;
+  case 1: return -0.25f * (float)M_PI;
+  case 2: return 0.0f;
+  case 3: return 0.25f * (float)M_PI;
+  case 4: return 0.5f * (float)M_PI;
+  case 6: return 0.75f * (float)M_PI;
+  case 7: return (float)M_PI;
+  case 8: return -0.75f * (float)M_PI;
+  default: return 0.0f;
+  }
+}
+
+static bool ProjectileSpritemapBounds(const uint8 *pp, uint16 x_r20, uint16 y_r18,
+                                      int16 *out_left, int16 *out_top,
+                                      int16 *out_right, int16 *out_bottom) {
+  int n = GET_WORD(pp);
+  pp += 2;
+  if (n == 0)
+    return false;
+  int16 left = 32767, top = 32767;
+  int16 right = -32768, bottom = -32768;
+  for (; n != 0; n--, pp += 5) {
+    int16 x = (int16)x_r20 + (int16)GET_WORD(pp);
+    int16 y = (int16)y_r18 + (int8)pp[2];
+    int16 size = (*(int16 *)pp < 0) ? 16 : 8;
+    if (x < left)
+      left = x;
+    if (y < top)
+      top = y;
+    if (x + size > right)
+      right = x + size;
+    if (y + size > bottom)
+      bottom = y + size;
+  }
+  *out_left = left;
+  *out_top = top;
+  *out_right = right;
+  *out_bottom = bottom;
+  return true;
+}
+
+static void RegisterProjectileSpriteTransform(int oam_start, int oam_end, uint16 x_r20,
+                                              uint16 y_r18, float rotation) {
+  if (oam_start == oam_end || g_projectile_sprite_transform_count >= 10)
+    return;
+  int slot = g_projectile_sprite_transform_count++;
+  g_projectile_sprite_transform_oam_start[slot] = oam_start;
+  g_projectile_sprite_transform_oam_end[slot] = oam_end;
+  g_projectile_sprite_transform_center_x2[slot] = 2 * (int16)x_r20;
+  g_projectile_sprite_transform_center_y2[slot] = 2 * (int16)y_r18;
+  g_projectile_sprite_transform_cos[slot] = (int)lroundf(cosf(rotation) * 4096.0f);
+  g_projectile_sprite_transform_sin[slot] = (int)lroundf(sinf(rotation) * 4096.0f);
+}
+
 void DrawProjectileSpritemap(uint16 k, uint16 x_r20, uint16 y_r18) {  // 0x818A4B
-  DrawGrappleOrProjectileSpritemap(RomPtr_93(projectile_spritemap_pointers[k >> 1]), x_r20, y_r18);
+  int slot = k >> 1;
+  const uint8 *pp = RomPtr_93(projectile_spritemap_pointers[slot]);
+  float heading_x, heading_y;
+  int16 left, top, right, bottom;
+  int oam_start = oam_next_ptr >> 2;
+  bool rotate = Projectile_GetAnalogHeadingForVisual(slot, &heading_x, &heading_y) &&
+                ProjectileSpritemapBounds(pp, x_r20, y_r18, &left, &top, &right, &bottom);
+  DrawGrappleOrProjectileSpritemap(pp, x_r20, y_r18);
+  if (rotate) {
+    float heading_angle = atan2f(heading_y, heading_x);
+    float base_angle = ProjectileVisualBaseAngle(projectile_dir[slot]);
+    RegisterProjectileSpriteTransform(oam_start, oam_next_ptr >> 2, x_r20, y_r18,
+                                      heading_angle - base_angle);
+  }
 }
 
 void DrawGrappleOrProjectileSpritemap(const uint8 *pp, uint16 x_r20, uint16 y_r18) {  // 0x818A5F

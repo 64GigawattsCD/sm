@@ -31,6 +31,8 @@ enum {
   kKeys_WindowSmaller,
   kKeys_DisplayPerf,
   kKeys_ToggleRenderer,
+  kKeys_ToggleModernLayerRenderer,
+  kKeys_ToggleModernLayerDebug,
   kKeys_VolumeUp,
   kKeys_VolumeDown,
   kKeys_Total,
@@ -60,6 +62,7 @@ typedef struct Config {
   uint8 extended_aspect_ratio;
   bool extend_y;
   bool no_sprite_limits;
+  bool modern_layer_renderer;
   bool display_perf_title;
   uint8 enable_msu;
   bool resume_msu;

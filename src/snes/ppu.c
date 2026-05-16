@@ -17,13 +17,24 @@ typedef int16_t int16;
 typedef uint8_t uint8;
 
 extern bool g_new_ppu;
+bool g_modern_layer_renderer;
+bool g_modern_layer_debug;
 extern bool g_samus_sprite_transform_enabled;
 extern int g_samus_sprite_transform_rotation;
 extern int g_samus_sprite_transform_oam_start;
 extern int g_samus_sprite_transform_oam_end;
 extern int g_samus_sprite_transform_center_x2;
 extern int g_samus_sprite_transform_center_y2;
+extern int g_projectile_sprite_transform_count;
+extern int g_projectile_sprite_transform_oam_start[10];
+extern int g_projectile_sprite_transform_oam_end[10];
+extern int g_projectile_sprite_transform_center_x2[10];
+extern int g_projectile_sprite_transform_center_y2[10];
+extern int g_projectile_sprite_transform_cos[10];
+extern int g_projectile_sprite_transform_sin[10];
 static void PpuDrawWholeLine(Ppu *ppu, uint y);
+static void PpuDrawWholeLineModernLayered(Ppu *ppu, uint y);
+extern void RtlRenderModernCustomLayer(int custom_slot, int y, uint32 *pixels, int width, int height);
 
 // array for layer definitions per mode:
 //   0-7: mode 0-7; 8: mode 1 + l3prio; 9: mode 7 + extbg
@@ -279,7 +290,9 @@ void ppu_runLine(Ppu* ppu, int line) {
     ClearBackdrop(&ppu->objBuffer);
     ppu->lineHasSprites = !ppu->forcedBlank && ppu_evaluateSprites(ppu, line - 1);
 
-    if (g_new_ppu) {
+    if (g_modern_layer_renderer) {
+      PpuDrawWholeLineModernLayered(ppu, line);
+    } else if (g_new_ppu) {
       PpuDrawWholeLine(ppu, line);
     } else {
       // actual line
@@ -703,6 +716,322 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
   }
 }
 
+typedef struct ModernRenderLayerLine {
+  // 0xAARRGGBB. Alpha 0 means transparent; SNES pixels are emitted opaque.
+  uint32 pixels[kPpuXPixels];
+  uint8 palette[kPpuXPixels];
+  uint8 math_layer[kPpuXPixels];
+} ModernRenderLayerLine;
+
+typedef struct ModernRenderLine {
+  ModernRenderLayerLine custom[kModernCustomLayerCount];
+  ModernRenderLayerLine snes[kModernSnesLayerCount];
+  ModernRenderLayerLine subscreen[kModernSnesLayerCount];
+} ModernRenderLine;
+
+static ModernRenderLine g_modern_render_line;
+
+static int PpuModernSnesSlotForPriority(int priority_nibble) {
+  return priority_nibble >= 0 && priority_nibble < kModernSnesLayerCount ? priority_nibble : -1;
+}
+
+static int PpuModernBgPriorityNibble(Ppu *ppu, int layer, bool priority) {
+  if (ppu->mode == 1) {
+    if (layer == 0)
+      return priority ? 12 : 8;
+    if (layer == 1)
+      return priority ? 11 : 7;
+    if (layer == 2)
+      return priority ? (ppu->bg3priority ? 15 : 3) : 1;
+  } else if (ppu->mode == 7) {
+    return layer == 1 ? (priority ? 7 : 1) : 5;
+  }
+  return -1;
+}
+
+static uint32 PpuModernRgbFromCgram(Ppu *ppu, uint16 color) {
+  uint32 r = color & 0x1f;
+  uint32 g = (color >> 5) & 0x1f;
+  uint32 b = (color >> 10) & 0x1f;
+  return ppu->brightnessMult[b] |
+         ppu->brightnessMult[g] << 8 |
+         ppu->brightnessMult[r] << 16;
+}
+
+static void PpuModernClearLine(ModernRenderLine *line) {
+  memset(line, 0, sizeof(*line));
+}
+
+static void PpuModernRenderCustomLayer(Ppu *ppu, int custom_slot, uint y, ModernRenderLayerLine *dst) {
+  (void)ppu;
+  if (custom_slot != kModernFrontCustomLayer)
+    RtlRenderModernCustomLayer(custom_slot, y, dst->pixels, kPpuXPixels, 240);
+  if (g_modern_layer_debug) {
+    static const uint32 kDebugColors[kModernCustomLayerCount] = {
+      0x704e79a8, 0x70d85c5c, 0x70d8895c, 0x70d8c15c,
+      0x709ad85c, 0x705cd879, 0x705cd8c1, 0x705c9ad8,
+      0x70795cd8, 0x70c15cd8, 0x70d85ca6, 0x70d85c72,
+      0x70a6d85c, 0x705cd8a6, 0x705ca6d8, 0x70a65cd8,
+      0x70ffffff,
+    };
+    int stripe_x = custom_slot * 15 + ((int)y / 16) % 12;
+    if (stripe_x >= 0 && stripe_x < kPpuXPixels)
+      dst->pixels[stripe_x] = kDebugColors[custom_slot];
+    if (custom_slot == kModernFrontCustomLayer && y < 17) {
+      int x0 = custom_slot * 14;
+      for (int x = x0; x < x0 + 10 && x < kPpuXPixels; x++)
+        dst->pixels[x] = kDebugColors[custom_slot];
+    }
+  }
+  // Native PC effects hook. Slots are:
+  //   0: behind every SNES layer
+  //   1..15: between each adjacent SNES priority band
+  //   16: above every SNES layer
+}
+
+static bool PpuModernLayerActive(Ppu *ppu, bool sub, int layer, int x) {
+  if (!sub) {
+    return ppu->layer[layer].mainScreenEnabled &&
+           (!ppu->layer[layer].mainScreenWindowed || !ppu_getWindowState(ppu, layer, x));
+  }
+  return ppu->layer[layer].subScreenEnabled &&
+         (!ppu->layer[layer].subScreenWindowed || !ppu_getWindowState(ppu, layer, x));
+}
+
+static int PpuModernGetBgPixel(Ppu *ppu, int x, int y, bool sub, int layer, bool priority) {
+  if (!PpuModernLayerActive(ppu, sub, layer, x))
+    return 0;
+
+  int lx = x;
+  int ly = y;
+  if (ppu->bgLayer[layer].mosaicEnabled && ppu->mosaicSize > 1) {
+    lx -= lx % ppu->mosaicSize;
+    ly -= (ly - ppu->mosaicStartLine) % ppu->mosaicSize;
+  }
+
+  if (ppu->mode == 7)
+    return ppu_getPixelForMode7(ppu, lx, layer, priority);
+
+  lx += ppu->bgLayer[layer].hScroll;
+  if (ppu->mode == 5 || ppu->mode == 6) {
+    lx *= 2;
+    lx += (sub || ppu->bgLayer[layer].mosaicEnabled) ? 0 : 1;
+    if (ppu->interlace) {
+      ly *= 2;
+      ly += (ppu->evenFrame || ppu->bgLayer[layer].mosaicEnabled) ? 0 : 1;
+    }
+  }
+  ly += ppu->bgLayer[layer].vScroll;
+  if (ppu->mode == 2 || ppu->mode == 4 || ppu->mode == 6)
+    ppu_handleOPT(ppu, layer, &lx, &ly);
+
+  return ppu_getPixelForBgLayer(ppu, lx & 0x3ff, ly & 0x3ff, layer, priority);
+}
+
+static void PpuModernEmitBackdrop(Ppu *ppu, ModernRenderLayerLine *dst) {
+  uint32 color = 0xff000000 | PpuModernRgbFromCgram(ppu, ppu->cgram[0]);
+  for (int x = 0; x < kPpuXPixels; x++) {
+    dst->pixels[x] = color;
+    dst->palette[x] = 0;
+    dst->math_layer[x] = 5;
+  }
+}
+
+static void PpuModernEmitBgLayer(Ppu *ppu, uint y, bool sub, int layer, bool priority, ModernRenderLayerLine *dst) {
+  int slot = PpuModernSnesSlotForPriority(PpuModernBgPriorityNibble(ppu, layer, priority));
+  if (slot < 0)
+    return;
+
+  for (int x = 0; x < kPpuXPixels; x++) {
+    int pixel = PpuModernGetBgPixel(ppu, x, y, sub, layer, priority);
+    if (pixel != 0) {
+      dst[slot].pixels[x] = 0xff000000 | PpuModernRgbFromCgram(ppu, ppu->cgram[pixel & 0xff]);
+      dst[slot].palette[x] = pixel & 0xff;
+      dst[slot].math_layer[x] = layer;
+    }
+  }
+}
+
+static void PpuModernEmitSpriteLayer(Ppu *ppu, bool sub, int sprite_priority, ModernRenderLayerLine *dst) {
+  int slot = PpuModernSnesSlotForPriority(SPRITE_PRIO_TO_PRIO_HI(sprite_priority));
+  if (slot < 0 || !IS_SCREEN_ENABLED(ppu, sub, 4))
+    return;
+
+  for (int x = 0; x < kPpuXPixels; x++) {
+    if (IS_SCREEN_WINDOWED(ppu, sub, 4) && ppu_getWindowState(ppu, 4, x))
+      continue;
+    PpuZbufType pixel = ppu->objBuffer.data[x + kPpuExtraLeftRight];
+    if ((pixel >> 12) == SPRITE_PRIO_TO_PRIO_HI(sprite_priority)) {
+      dst[slot].pixels[x] = 0xff000000 | PpuModernRgbFromCgram(ppu, ppu->cgram[pixel & 0xff]);
+      dst[slot].palette[x] = pixel & 0xff;
+      dst[slot].math_layer[x] = (pixel >> 8) & 0xf;
+    }
+  }
+}
+
+static void PpuModernEmitSnesLayers(Ppu *ppu, uint y, bool sub, ModernRenderLayerLine *dst) {
+  int actMode = ppu->mode == 1 && ppu->bg3priority ? 8 : ppu->mode;
+  actMode = ppu->mode == 7 && ppu->m7extBg ? 9 : actMode;
+
+  PpuModernEmitBackdrop(ppu, &dst[0]);
+
+  if (ppu->mode == 7)
+    ppu_calculateMode7Starts(ppu, y);
+
+  for (int i = layerCountPerMode[actMode] - 1; i >= 0; i--) {
+    int layer = layersPerMode[actMode][i];
+    int priority = prioritysPerMode[actMode][i];
+    if (layer < 4)
+      PpuModernEmitBgLayer(ppu, y, sub, layer, priority, dst);
+    else if (layer == 4)
+      PpuModernEmitSpriteLayer(ppu, sub, priority, dst);
+  }
+}
+
+static uint32 PpuModernBlendOver(uint32 dst, uint32 src) {
+  uint32 src_a = src >> 24;
+  if (src_a == 0)
+    return dst;
+  if (src_a == 255)
+    return src;
+
+  uint32 inv_a = 255 - src_a;
+  uint32 rb = ((src & 0xff00ff) * src_a + (dst & 0xff00ff) * inv_a) >> 8;
+  uint32 g = ((src & 0x00ff00) * src_a + (dst & 0x00ff00) * inv_a) >> 8;
+  return 0xff000000 | (rb & 0xff00ff) | (g & 0x00ff00);
+}
+
+static int PpuModernFindTopSnesSlot(ModernRenderLayerLine *layers, int x) {
+  for (int slot = kModernSnesLayerCount - 1; slot >= 0; slot--) {
+    if (layers[slot].pixels[x] != 0)
+      return slot;
+  }
+  return 0;
+}
+
+static uint32 PpuModernApplyColorMath(Ppu *ppu, uint32 math_enabled_cur,
+                                      ModernRenderLayerLine *main_layer,
+                                      ModernRenderLayerLine *sub_layer,
+                                      int x, uint32 clip_color_mask) {
+  uint16 color = ppu->cgram[main_layer->palette[x]];
+  uint32 r = color & clip_color_mask;
+  uint32 g = (color >> 5) & clip_color_mask;
+  uint32 b = (color >> 10) & clip_color_mask;
+  uint8 *color_map = ppu->brightnessMult;
+
+  if (math_enabled_cur & (1 << main_layer->math_layer[x])) {
+    uint16 color2;
+    if (math_enabled_cur & 0x100) {
+      if (sub_layer->pixels[x] != 0)
+        color2 = ppu->cgram[sub_layer->palette[x]], color_map = ppu->halfColor ? ppu->brightnessMultHalf : ppu->brightnessMult;
+      else
+        color2 = ppu->fixedColorR | ppu->fixedColorG << 5 | ppu->fixedColorB << 10;
+    } else {
+      color2 = ppu->fixedColorR | ppu->fixedColorG << 5 | ppu->fixedColorB << 10;
+      color_map = ppu->halfColor ? ppu->brightnessMultHalf : ppu->brightnessMult;
+    }
+
+    uint32 r2 = color2 & 0x1f;
+    uint32 g2 = (color2 >> 5) & 0x1f;
+    uint32 b2 = (color2 >> 10) & 0x1f;
+    if (math_enabled_cur & 0x200) {
+      r = r >= r2 ? r - r2 : 0;
+      g = g >= g2 ? g - g2 : 0;
+      b = b >= b2 ? b - b2 : 0;
+    } else {
+      r += r2;
+      g += g2;
+      b += b2;
+    }
+  }
+
+  return 0xff000000 | color_map[b] | color_map[g] << 8 | color_map[r] << 16;
+}
+
+static void PpuModernCompositeLine(Ppu *ppu, uint y, ModernRenderLine *line) {
+  uint8 *dst = &ppu->renderBuffer[(y - 1) * ppu->renderPitch];
+  uint32 math_enabled = 0;
+  for (int i = 0; i < 6; i++)
+    math_enabled |= ppu->mathEnabled[i] << i;
+
+  PpuWindows cwin;
+  PpuWindows_Calc(&cwin, ppu, 5);
+  static const uint8 kCwBitsMod[8] = {
+    0x00, 0xff, 0xff, 0x00,
+    0xff, 0x00, 0xff, 0x00,
+  };
+  uint32 cw_clip_math = ((cwin.bits & kCwBitsMod[ppu->clipMode]) ^ kCwBitsMod[ppu->clipMode + 4]) |
+    ((cwin.bits & kCwBitsMod[ppu->preventMathMode]) ^ kCwBitsMod[ppu->preventMathMode + 4]) << 8;
+
+  for (uint32 windex = 0; windex < cwin.nr; windex++, cw_clip_math >>= 1) {
+    uint32 left = cwin.edges[windex] + kPpuExtraLeftRight;
+    uint32 right = cwin.edges[windex + 1] + kPpuExtraLeftRight;
+    uint32 clip_color_mask = (cw_clip_math & 1) ? 0x1f : 0;
+    uint32 math_enabled_cur = (cw_clip_math & 0x100) ? math_enabled : 0;
+    math_enabled_cur |= ppu->addSubscreen << 8 | ppu->subtractColor << 9;
+
+    for (uint32 x = left; x < right; x++) {
+      int top_main_slot = PpuModernFindTopSnesSlot(line->snes, x);
+      int top_sub_slot = PpuModernFindTopSnesSlot(line->subscreen, x);
+      uint32 snes_color = PpuModernApplyColorMath(ppu, math_enabled_cur,
+                                                  &line->snes[top_main_slot],
+                                                  &line->subscreen[top_sub_slot],
+                                                  x, clip_color_mask);
+      uint32 color = 0xff000000;
+      for (int slot = 0; slot < kModernSnesLayerCount; slot++) {
+        color = PpuModernBlendOver(color, line->custom[slot].pixels[x]);
+        if (slot == top_main_slot)
+          color = PpuModernBlendOver(color, snes_color);
+        else
+          color = PpuModernBlendOver(color, line->snes[slot].pixels[x]);
+      }
+
+      dst[x * 4 + 0] = color & 0xff;
+      dst[x * 4 + 1] = (color >> 8) & 0xff;
+      dst[x * 4 + 2] = (color >> 16) & 0xff;
+      dst[x * 4 + 3] = 0;
+    }
+  }
+
+  // The front custom layer is a true native overlay: it should not be affected by
+  // SNES color windows, subscreen math, or fixed-color blends.
+  for (int x = 0; x < kPpuXPixels; x++) {
+    uint32 overlay = line->custom[kModernFrontCustomLayer].pixels[x];
+    if ((overlay >> 24) == 0)
+      continue;
+    uint32 base = 0xff000000 | dst[x * 4 + 0] | dst[x * 4 + 1] << 8 | dst[x * 4 + 2] << 16;
+    uint32 color = PpuModernBlendOver(base, overlay);
+    dst[x * 4 + 0] = color & 0xff;
+    dst[x * 4 + 1] = (color >> 8) & 0xff;
+    dst[x * 4 + 2] = (color >> 16) & 0xff;
+  }
+}
+
+static void PpuDrawWholeLineModernLayered(Ppu *ppu, uint y) {
+  if (ppu->forcedBlank) {
+    uint8 *dst = &ppu->renderBuffer[(y - 1) * ppu->renderPitch];
+    memset(dst, 0, sizeof(uint32) * kPpuXPixels);
+    return;
+  }
+
+  if (ppu->brightness != ppu->lastBrightnessMult) {
+    uint8_t ppu_brightness = ppu->brightness;
+    ppu->lastBrightnessMult = ppu_brightness;
+    for (int i = 0; i < 32; i++)
+      ppu->brightnessMultHalf[i * 2] = ppu->brightnessMultHalf[i * 2 + 1] = ppu->brightnessMult[i] =
+      ((i << 3) | (i >> 2)) * ppu_brightness / 15;
+    memset(&ppu->brightnessMult[32], ppu->brightnessMult[31], 31);
+  }
+
+  PpuModernClearLine(&g_modern_render_line);
+  for (int custom_slot = 0; custom_slot < kModernCustomLayerCount; custom_slot++)
+    PpuModernRenderCustomLayer(ppu, custom_slot, y, &g_modern_render_line.custom[custom_slot]);
+  PpuModernEmitSnesLayers(ppu, y, false, g_modern_render_line.snes);
+  if (ppu->screenEnabled[1] != 0)
+    PpuModernEmitSnesLayers(ppu, y, true, g_modern_render_line.subscreen);
+  PpuModernCompositeLine(ppu, y, &g_modern_render_line);
+}
+
 static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   if (ppu->forcedBlank) {
     uint8 *dst = &ppu->renderBuffer[(y - 1) * ppu->renderPitch];
@@ -1116,6 +1445,15 @@ static bool PpuIsSamusTransformedSprite(int index) {
          index < g_samus_sprite_transform_oam_end;
 }
 
+static int PpuFindProjectileTransformedSprite(int index) {
+  for (int i = 0; i < g_projectile_sprite_transform_count; i++) {
+    if (index >= g_projectile_sprite_transform_oam_start[i] &&
+        index < g_projectile_sprite_transform_oam_end[i])
+      return i;
+  }
+  return -1;
+}
+
 static int PpuRotateX2(int x2, int y2, int center_x2, int center_y2, int rotation_degrees) {
   if (rotation_degrees == 90)
     return center_x2 - y2 + center_y2;
@@ -1148,17 +1486,51 @@ static int PpuFloorDiv2(int value) {
   return value >= 0 ? value / 2 : -((-value + 1) / 2);
 }
 
-static bool ppu_evaluateTransformedSprite(Ppu* ppu, int line, int x, int y, int spriteSize, int oam1, int *tilesFound) {
+static int PpuRotateFixedX2(int x2, int y2, int center_x2, int center_y2, int cos_fixed, int sin_fixed) {
+  int dx = x2 - center_x2;
+  int dy = y2 - center_y2;
+  return center_x2 + ((dx * cos_fixed - dy * sin_fixed) >> 12);
+}
+
+static int PpuRotateFixedY2(int x2, int y2, int center_x2, int center_y2, int cos_fixed, int sin_fixed) {
+  int dx = x2 - center_x2;
+  int dy = y2 - center_y2;
+  return center_y2 + ((dx * sin_fixed + dy * cos_fixed) >> 12);
+}
+
+static int PpuInverseRotateFixedX2(int x2, int y2, int center_x2, int center_y2, int cos_fixed, int sin_fixed) {
+  int dx = x2 - center_x2;
+  int dy = y2 - center_y2;
+  return center_x2 + ((dx * cos_fixed + dy * sin_fixed) >> 12);
+}
+
+static int PpuInverseRotateFixedY2(int x2, int y2, int center_x2, int center_y2, int cos_fixed, int sin_fixed) {
+  int dx = x2 - center_x2;
+  int dy = y2 - center_y2;
+  return center_y2 + ((-dx * sin_fixed + dy * cos_fixed) >> 12);
+}
+
+static void PpuFixedTrigFromDegrees(int rotation_degrees, int *cos_fixed, int *sin_fixed) {
+  if (rotation_degrees == 90) {
+    *cos_fixed = 0, *sin_fixed = 4096;
+  } else if (rotation_degrees == -90) {
+    *cos_fixed = 0, *sin_fixed = -4096;
+  } else if (rotation_degrees == 180 || rotation_degrees == -180) {
+    *cos_fixed = -4096, *sin_fixed = 0;
+  } else {
+    *cos_fixed = 4096, *sin_fixed = 0;
+  }
+}
+
+static bool ppu_evaluateTransformedSprite(Ppu* ppu, int line, int x, int y, int spriteSize,
+                                          int oam1, int *tilesFound, int center_x2,
+                                          int center_y2, int cos_fixed, int sin_fixed) {
   int sprite_center_x2 = 2 * x + spriteSize;
   int sprite_center_y2 = 2 * y + spriteSize;
-  int rotated_center_x2 = PpuRotateX2(sprite_center_x2, sprite_center_y2,
-                                      g_samus_sprite_transform_center_x2,
-                                      g_samus_sprite_transform_center_y2,
-                                      g_samus_sprite_transform_rotation);
-  int rotated_center_y2 = PpuRotateY2(sprite_center_x2, sprite_center_y2,
-                                      g_samus_sprite_transform_center_x2,
-                                      g_samus_sprite_transform_center_y2,
-                                      g_samus_sprite_transform_rotation);
+  int rotated_center_x2 = PpuRotateFixedX2(sprite_center_x2, sprite_center_y2,
+                                           center_x2, center_y2, cos_fixed, sin_fixed);
+  int rotated_center_y2 = PpuRotateFixedY2(sprite_center_x2, sprite_center_y2,
+                                           center_x2, center_y2, cos_fixed, sin_fixed);
   int dst_left = PpuFloorDiv2(rotated_center_x2 - spriteSize);
   int dst_top = PpuFloorDiv2(rotated_center_y2 - spriteSize);
   if (line < dst_top || line >= dst_top + spriteSize)
@@ -1186,14 +1558,10 @@ static bool ppu_evaluateTransformedSprite(Ppu* ppu, int line, int x, int y, int 
     int dst_x = dst_left + px;
     int dst_x2 = 2 * dst_x + 1;
     int dst_y2 = 2 * line + 1;
-    int src_x2 = PpuInverseRotateX2(dst_x2, dst_y2,
-                                    g_samus_sprite_transform_center_x2,
-                                    g_samus_sprite_transform_center_y2,
-                                    g_samus_sprite_transform_rotation);
-    int src_y2 = PpuInverseRotateY2(dst_x2, dst_y2,
-                                    g_samus_sprite_transform_center_x2,
-                                    g_samus_sprite_transform_center_y2,
-                                    g_samus_sprite_transform_rotation);
+    int src_x2 = PpuInverseRotateFixedX2(dst_x2, dst_y2,
+                                         center_x2, center_y2, cos_fixed, sin_fixed);
+    int src_y2 = PpuInverseRotateFixedY2(dst_x2, dst_y2,
+                                         center_x2, center_y2, cos_fixed, sin_fixed);
     int src_x = PpuFloorDiv2(src_x2);
     int src_y = PpuFloorDiv2(src_y2);
     if (src_x < x || src_x >= x + spriteSize || src_y < y || src_y >= y + spriteSize)
@@ -1240,7 +1608,33 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
       int sprite_y = y;
       if (sprite_y > 239)
         sprite_y -= 256;
-      if (ppu_evaluateTransformedSprite(ppu, line, x, sprite_y, spriteSize, oam1, &tilesFound)) {
+      int cos_fixed, sin_fixed;
+      PpuFixedTrigFromDegrees(g_samus_sprite_transform_rotation, &cos_fixed, &sin_fixed);
+      if (ppu_evaluateTransformedSprite(ppu, line, x, sprite_y, spriteSize, oam1, &tilesFound,
+                                        g_samus_sprite_transform_center_x2,
+                                        g_samus_sprite_transform_center_y2,
+                                        cos_fixed, sin_fixed)) {
+        spritesFound++;
+        if(spritesFound > 32) {
+          ppu->rangeOver = true;
+          break;
+        }
+      }
+      if(tilesFound > 34)
+        break;
+      index += 2;
+      continue;
+    }
+    int projectile_transform = PpuFindProjectileTransformedSprite(index >> 1);
+    if (projectile_transform >= 0) {
+      int sprite_y = y;
+      if (sprite_y > 239)
+        sprite_y -= 256;
+      if (ppu_evaluateTransformedSprite(ppu, line, x, sprite_y, spriteSize, oam1, &tilesFound,
+                                        g_projectile_sprite_transform_center_x2[projectile_transform],
+                                        g_projectile_sprite_transform_center_y2[projectile_transform],
+                                        g_projectile_sprite_transform_cos[projectile_transform],
+                                        g_projectile_sprite_transform_sin[projectile_transform])) {
         spritesFound++;
         if(spritesFound > 32) {
           ppu->rangeOver = true;

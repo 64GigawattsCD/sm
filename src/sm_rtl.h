@@ -26,6 +26,13 @@ extern int g_samus_sprite_transform_oam_start;
 extern int g_samus_sprite_transform_oam_end;
 extern int g_samus_sprite_transform_center_x2;
 extern int g_samus_sprite_transform_center_y2;
+extern int g_projectile_sprite_transform_count;
+extern int g_projectile_sprite_transform_oam_start[10];
+extern int g_projectile_sprite_transform_oam_end[10];
+extern int g_projectile_sprite_transform_center_x2[10];
+extern int g_projectile_sprite_transform_center_y2[10];
+extern int g_projectile_sprite_transform_cos[10];
+extern int g_projectile_sprite_transform_sin[10];
 
 typedef void HandlerFunc(void);
 typedef uint8 Func_V_A(void);
