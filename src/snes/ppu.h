@@ -11,6 +11,15 @@ typedef struct Ppu Ppu;
 
 #include "snes.h"
 
+extern bool g_modern_layer_renderer;
+extern bool g_modern_layer_debug;
+
+enum {
+  kModernSnesLayerCount = 16,
+  kModernCustomLayerCount = kModernSnesLayerCount + 1,
+  kModernFrontCustomLayer = kModernCustomLayerCount - 1,
+};
+
 typedef struct BgLayer {
   uint16_t hScroll;
   uint16_t vScroll;
@@ -42,6 +51,8 @@ enum {
   kPpuRenderFlags_Height240 = 4,
   // Disable sprite render limits
   kPpuRenderFlags_NoSpriteLimits = 8,
+  // Emit the SNES priority bands into an intermediate modern layer stack.
+  kPpuRenderFlags_ModernLayerRenderer = 16,
 };
 
 

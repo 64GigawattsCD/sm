@@ -50,6 +50,8 @@ static int NormalizeGamepadButtonsForMenus(int inputs);
 static void UpdateOpeningIntroSkipState(uint16 inputs);
 static void RenderOpeningIntroSkipPrompt(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void RenderAnalogDebugOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height);
+static void RenderModernFrontCustomLayer(uint32 *pixels, int width, int height);
+static void CompositeModernFrontCustomLayer(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void SaveDebugScreenshot(uint8 *pixel_buffer, size_t pitch, int width, int height);
 void OpenGLRenderer_Create(struct RendererFuncs *funcs);
 
@@ -65,6 +67,8 @@ static uint32_t button_state;
 
 static uint8_t g_pixels[256 * 4 * 240];
 static uint8_t g_my_pixels[256 * 4 * 240];
+static uint32 *g_modern_front_custom_layer;
+static size_t g_modern_front_custom_layer_size;
 static bool g_shinespark_screenshot_requested;
 static int g_shinespark_screenshot_counter;
 
@@ -228,8 +232,12 @@ static void DrawPpuFrameWithPerf(void) {
   if (g_display_perf)
     RenderNumber(pixel_buffer + pitch * render_scale, pitch, g_curr_fps, render_scale == 4);
 
-  RenderAnalogDebugOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
-  RenderOpeningIntroSkipPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+  if (!g_modern_layer_renderer) {
+    RenderAnalogDebugOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+    RenderOpeningIntroSkipPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+  } else {
+    CompositeModernFrontCustomLayer(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+  }
   if (g_shinespark_screenshot_requested) {
     g_shinespark_screenshot_requested = false;
     SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
@@ -441,7 +449,9 @@ int main(int argc, char** argv) {
   g_ppu_render_flags = g_config.new_renderer * kPpuRenderFlags_NewRenderer |
     g_config.enhanced_mode7 * kPpuRenderFlags_4x4Mode7 |
     g_config.extend_y * kPpuRenderFlags_Height240 |
-    g_config.no_sprite_limits * kPpuRenderFlags_NoSpriteLimits;
+    g_config.no_sprite_limits * kPpuRenderFlags_NoSpriteLimits |
+    g_config.modern_layer_renderer * kPpuRenderFlags_ModernLayerRenderer;
+  g_modern_layer_renderer = (g_ppu_render_flags & kPpuRenderFlags_ModernLayerRenderer) != 0;
 
   if (g_config.fullscreen == 1)
     g_win_flags ^= SDL_WINDOW_FULLSCREEN_DESKTOP;
@@ -909,6 +919,63 @@ static void RenderAnalogDebugOverlay(uint8 *pixel_buffer, size_t pitch, int widt
   }
 }
 
+static void RenderModernFrontCustomLayer(uint32 *pixels, int width, int height) {
+  memset(pixels, 0, sizeof(uint32) * width * height);
+  RenderOpeningIntroSkipPrompt((uint8 *)pixels, width * sizeof(uint32), width, height);
+  RenderAnalogDebugOverlay((uint8 *)pixels, width * sizeof(uint32), width, height);
+  for (int i = 0; i < width * height; i++) {
+    if (pixels[i] != 0)
+      pixels[i] |= 0xff000000;
+  }
+}
+
+void RtlRenderModernCustomLayer(int custom_slot, int y, uint32 *pixels, int width, int height) {
+  if (custom_slot != kModernFrontCustomLayer || width != 256 || height != 240)
+    return;
+  if (g_modern_front_custom_layer_size < (size_t)width * height) {
+    g_modern_front_custom_layer_size = (size_t)width * height;
+    g_modern_front_custom_layer = (uint32 *)realloc(g_modern_front_custom_layer,
+                                                    g_modern_front_custom_layer_size * sizeof(uint32));
+    if (!g_modern_front_custom_layer)
+      Die("Unable to allocate modern front layer");
+  }
+  if (y <= 1)
+    RenderModernFrontCustomLayer(g_modern_front_custom_layer, width, height);
+  memcpy(pixels, &g_modern_front_custom_layer[(y - 1) * width], sizeof(uint32) * width);
+}
+
+static uint32 BlendArgbOverBgr(uint32 dst_bgr, uint32 src_argb) {
+  uint32 src_a = src_argb >> 24;
+  if (src_a == 0)
+    return dst_bgr;
+  uint32 src_bgr = src_argb & 0xffffff;
+  if (src_a == 255)
+    return src_bgr;
+  uint32 inv_a = 255 - src_a;
+  uint32 rb = ((src_bgr & 0xff00ff) * src_a + (dst_bgr & 0xff00ff) * inv_a) >> 8;
+  uint32 g = ((src_bgr & 0x00ff00) * src_a + (dst_bgr & 0x00ff00) * inv_a) >> 8;
+  return (rb & 0xff00ff) | (g & 0x00ff00);
+}
+
+static void CompositeModernFrontCustomLayer(uint8 *pixel_buffer, size_t pitch, int width, int height) {
+  if (g_modern_front_custom_layer_size < (size_t)width * height) {
+    g_modern_front_custom_layer_size = (size_t)width * height;
+    g_modern_front_custom_layer = (uint32 *)realloc(g_modern_front_custom_layer,
+                                                    g_modern_front_custom_layer_size * sizeof(uint32));
+    if (!g_modern_front_custom_layer)
+      Die("Unable to allocate modern front layer");
+  }
+  RenderModernFrontCustomLayer(g_modern_front_custom_layer, width, height);
+  for (int y = 0; y < height; y++) {
+    uint32 *dst = (uint32 *)(pixel_buffer + y * pitch);
+    uint32 *src = &g_modern_front_custom_layer[y * width];
+    for (int x = 0; x < width; x++) {
+      if (src[x] != 0)
+        dst[x] = BlendArgbOverBgr(dst[x] & 0xffffff, src[x]);
+    }
+  }
+}
+
 static uint16 GetInputBitForControlCommand(uint32 j) {
   static const uint8 kKbdRemap[] = { 0, 4, 5, 6, 7, 2, 3, 8, 0, 9, 1, 10, 11 };
   return (j >= kKeys_Controls && j <= kKeys_Controls_Last) ? (1 << kKbdRemap[j]) : 0;
@@ -1006,6 +1073,15 @@ static void HandleCommand(uint32 j, bool pressed) {
     case kKeys_ToggleRenderer:
       g_ppu_render_flags ^= kPpuRenderFlags_NewRenderer;
       g_new_ppu = (g_ppu_render_flags & kPpuRenderFlags_NewRenderer) != 0;
+      break;
+    case kKeys_ToggleModernLayerRenderer:
+      g_ppu_render_flags ^= kPpuRenderFlags_ModernLayerRenderer;
+      g_modern_layer_renderer = (g_ppu_render_flags & kPpuRenderFlags_ModernLayerRenderer) != 0;
+      printf("[Modern layer renderer]=%s\n", g_modern_layer_renderer ? "on" : "off");
+      break;
+    case kKeys_ToggleModernLayerDebug:
+      g_modern_layer_debug = !g_modern_layer_debug;
+      printf("[Modern layer debug]=%s\n", g_modern_layer_debug ? "on" : "off");
       break;
     case kKeys_VolumeUp:
     case kKeys_VolumeDown: HandleVolumeAdjustment(j == kKeys_VolumeUp ? 1 : -1); break;

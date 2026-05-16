@@ -262,6 +262,14 @@ static void SetProjectileHeadingFromAim(int slot) {
   g_projectile_heading_y[slot] = aim_y;
 }
 
+bool Projectile_GetAnalogHeadingForVisual(int slot, float *out_x, float *out_y) {
+  if (slot < 0 || slot >= 10 || !g_projectile_has_heading[slot])
+    return false;
+  *out_x = g_projectile_heading_x[slot];
+  *out_y = g_projectile_heading_y[slot];
+  return true;
+}
+
 static void AddProjectileHeadingAcceleration(int slot, float amount) {
   if (!g_projectile_has_heading[slot])
     return;

@@ -411,6 +411,7 @@ void ClearUnusedOam(void) {
 
 void ClearOamExt(void) {  // 0x808B1A
   memset(oam_ext, 0, sizeof(oam_ext[0]) * 16);
+  ResetProjectileSpriteTransforms();
 }
 
 void QueueMode7Transfers(uint8 db, uint16 k) {  // 0x808B4F

@@ -190,6 +190,8 @@ void DrawFileSelectionHealth(uint16 a, uint16 k);
 void DrawFileSelectionTime(uint16 a, uint16 k);
 void DrawMenuSpritemap(uint16 a, uint16 k, uint16 j, uint16 chr_r3);
 void DrawProjectileSpritemap(uint16 k, uint16 x_r20, uint16 y_r18);
+bool Projectile_GetAnalogHeadingForVisual(int slot, float *out_x, float *out_y);
+void ResetProjectileSpriteTransforms(void);
 void DrawSamusSpritemap(uint16 a, uint16 k, uint16 j);
 bool GetSamusSpritemapBounds(uint16 a, uint16 j, int16 *out_top, int16 *out_bottom);
 bool GetSamusSpritemapBounds2D(uint16 a, uint16 k, uint16 j, int16 *out_left, int16 *out_top, int16 *out_right, int16 *out_bottom);
