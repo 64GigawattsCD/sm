@@ -33,13 +33,21 @@
 
 static const uint16 kFileSelectMap_AreaIndexes[6] = { 0, 3, 5, 1, 4, 2 };
 
+bool g_samus_sprite_transform_enabled;
+int g_samus_sprite_transform_rotation;
+int g_samus_sprite_transform_oam_start;
+int g_samus_sprite_transform_oam_end;
+int g_samus_sprite_transform_center_x2;
+int g_samus_sprite_transform_center_y2;
+
 static void GrantSkipMenuLoadout(void) {
   const uint16 kAllEquipment = 0xF337;
   const uint16 kAllBeams = 0x100F;
+  const uint16 kSpazerBeam = 0x0004;
 
   equipped_items |= kAllEquipment;
   collected_items |= kAllEquipment;
-  equipped_beams |= kAllBeams;
+  equipped_beams = (equipped_beams | kAllBeams) & ~kSpazerBeam;
   collected_beams |= kAllBeams;
 
   if ((int16)(samus_max_health - 700) < 0)
@@ -272,6 +280,196 @@ void DrawSamusSpritemap(uint16 a, uint16 x_pos, uint16 y_pos) {  // 0x8189AE
     *(uint16 *)&v9->charnum = GET_WORD(pp + 3);
     pp += 5;
     idx = (idx + 4) & 0x1FF;
+  }
+  oam_next_ptr = idx;
+}
+
+static uint8 SamusSpritemapEntryHeight(const uint8 *entry) {
+  return (*(const int16 *)entry < 0) ? 16 : 8;
+}
+
+static uint8 SamusSpritemapEntryWidth(const uint8 *entry) {
+  return SamusSpritemapEntryHeight(entry);
+}
+
+static int16 SamusSpritemapEntryX(uint16 x_pos, const uint8 *entry) {
+  return (int16)x_pos + (int8)entry[0];
+}
+
+static int16 SamusSpritemapEntryY(uint16 y_pos, const uint8 *entry) {
+  return (int16)y_pos + (int8)entry[2];
+}
+
+static uint16 SamusSpritemapSubtile(uint16 tile, int sub_x, int sub_y) {
+  uint16 tile_base = tile & 0xFF00;
+  uint8 tile_num = tile;
+  uint8 tile_x = (tile_num + sub_x) & 0x0F;
+  uint8 tile_y = (tile_num & 0xF0) + (uint8)(16 * sub_y);
+  return tile_base | tile_y | tile_x;
+}
+
+static uint16 SamusSpritemapRotateX2(int16 x2, int16 y2, int16 center_x2, int16 center_y2, int rotation_degrees) {
+  if (rotation_degrees == 90)
+    return center_x2 - y2 + center_y2;
+  if (rotation_degrees == -90)
+    return center_x2 + y2 - center_y2;
+  if (rotation_degrees == 180 || rotation_degrees == -180)
+    return center_x2 - x2 + center_x2;
+  return x2;
+}
+
+static uint16 SamusSpritemapRotateY2(int16 x2, int16 y2, int16 center_x2, int16 center_y2, int rotation_degrees) {
+  if (rotation_degrees == 90)
+    return center_y2 + x2 - center_x2;
+  if (rotation_degrees == -90)
+    return center_y2 - x2 + center_x2;
+  if (rotation_degrees == 180 || rotation_degrees == -180)
+    return center_y2 - y2 + center_y2;
+  return y2;
+}
+
+static void DrawSamusTransformedOamEntry(int *idx, uint16 x, int16 y, uint16 tile, bool large) {
+  OamEnt *oam = gOamEnt(*idx);
+  oam->xcoord = x;
+  oam_ext[*idx >> 5] |= (((x & 0x100) >> 8) | large * 2) << (2 * ((*idx >> 2) & 7));
+  oam->ycoord = y;
+  *(uint16 *)&oam->charnum = tile;
+  *idx = (*idx + 4) & 0x1FF;
+}
+
+bool GetSamusSpritemapBounds(uint16 a, uint16 y_pos, int16 *out_top, int16 *out_bottom) {
+  if (kSamusSpritemapTable[a] == 0)
+    return false;
+  const uint8 *pp = RomPtr_92(kSamusSpritemapTable[a]);
+  int n = GET_WORD(pp);
+  pp += 2;
+  if (n == 0)
+    return false;
+  int16 min_y = 32767;
+  int16 max_y = -32768;
+  for (int i = 0; i < n; i++) {
+    const uint8 *entry = pp + i * 5;
+    int16 entry_y = SamusSpritemapEntryY(y_pos, entry);
+    int16 entry_bottom = entry_y + SamusSpritemapEntryHeight(entry);
+    if (entry_y < min_y)
+      min_y = entry_y;
+    if (entry_bottom > max_y)
+      max_y = entry_bottom;
+  }
+  *out_top = min_y;
+  *out_bottom = max_y;
+  return true;
+}
+
+bool GetSamusSpritemapBounds2D(uint16 a, uint16 x_pos, uint16 y_pos,
+                               int16 *out_left, int16 *out_top, int16 *out_right, int16 *out_bottom) {
+  if (kSamusSpritemapTable[a] == 0)
+    return false;
+  const uint8 *pp = RomPtr_92(kSamusSpritemapTable[a]);
+  int n = GET_WORD(pp);
+  pp += 2;
+  if (n == 0)
+    return false;
+  int16 min_x = 32767;
+  int16 min_y = 32767;
+  int16 max_x = -32768;
+  int16 max_y = -32768;
+  for (int i = 0; i < n; i++) {
+    const uint8 *entry = pp + i * 5;
+    int16 entry_x = SamusSpritemapEntryX(x_pos, entry);
+    int16 entry_y = SamusSpritemapEntryY(y_pos, entry);
+    int16 entry_right = entry_x + SamusSpritemapEntryWidth(entry);
+    int16 entry_bottom = entry_y + SamusSpritemapEntryHeight(entry);
+    if (entry_x < min_x)
+      min_x = entry_x;
+    if (entry_y < min_y)
+      min_y = entry_y;
+    if (entry_right > max_x)
+      max_x = entry_right;
+    if (entry_bottom > max_y)
+      max_y = entry_bottom;
+  }
+  *out_left = min_x;
+  *out_top = min_y;
+  *out_right = max_x;
+  *out_bottom = max_y;
+  return true;
+}
+
+void DrawSamusSpritemapVerticallyFlippedWithBounds(uint16 a, uint16 x_pos, uint16 y_pos, int16 mirror_top, int16 mirror_bottom) {
+  if (kSamusSpritemapTable[a] == 0)
+    return;
+  const uint8 *pp = RomPtr_92(kSamusSpritemapTable[a]);
+  int n = GET_WORD(pp);
+  pp += 2;
+  int idx = oam_next_ptr;
+  for (; n != 0; n--) {
+    uint16 x = x_pos + GET_WORD(pp);
+    uint8 entry_height = SamusSpritemapEntryHeight(pp);
+    int16 original_y = SamusSpritemapEntryY(y_pos, pp);
+    int16 flipped_y = mirror_top + mirror_bottom - original_y - entry_height;
+    OamEnt *v9 = gOamEnt(idx);
+    v9->xcoord = x;
+    oam_ext[idx >> 5] |= (((x & 0x100) >> 8) | (*(int16 *)pp < 0) * 2) << (2 * ((idx >> 2) & 7));
+    v9->ycoord = flipped_y;
+    *(uint16 *)&v9->charnum = GET_WORD(pp + 3) ^ 0x8000;
+    pp += 5;
+    idx = (idx + 4) & 0x1FF;
+  }
+  oam_next_ptr = idx;
+}
+
+void DrawSamusSpritemapVerticallyFlipped(uint16 a, uint16 x_pos, uint16 y_pos) {
+  int16 mirror_top, mirror_bottom;
+  if (GetSamusSpritemapBounds(a, y_pos, &mirror_top, &mirror_bottom))
+    DrawSamusSpritemapVerticallyFlippedWithBounds(a, x_pos, y_pos, mirror_top, mirror_bottom);
+}
+
+void DrawSamusSpritemapRotatedWithBounds(uint16 a, uint16 x_pos, uint16 y_pos,
+                                         int rotation_degrees,
+                                         int16 left, int16 top, int16 right, int16 bottom) {
+  if (kSamusSpritemapTable[a] == 0)
+    return;
+  const uint8 *pp = RomPtr_92(kSamusSpritemapTable[a]);
+  int n = GET_WORD(pp);
+  pp += 2;
+  int idx = oam_next_ptr;
+  int16 center_x2 = left + right;
+  int16 center_y2 = top + bottom;
+  for (; n != 0; n--) {
+    uint8 entry_width = SamusSpritemapEntryWidth(pp);
+    uint8 entry_height = SamusSpritemapEntryHeight(pp);
+    int16 original_x = SamusSpritemapEntryX(x_pos, pp);
+    int16 original_y = SamusSpritemapEntryY(y_pos, pp);
+    int16 entry_center_x2 = 2 * original_x + entry_width;
+    int16 entry_center_y2 = 2 * original_y + entry_height;
+    uint16 tile = GET_WORD(pp + 3);
+    if ((rotation_degrees == 90 || rotation_degrees == -90) && entry_width == 16) {
+      for (int sub_y = 0; sub_y < 2; sub_y++) {
+        for (int sub_x = 0; sub_x < 2; sub_x++) {
+          int16 subtile_center_x2 = 2 * original_x + 8 + 16 * sub_x;
+          int16 subtile_center_y2 = 2 * original_y + 8 + 16 * sub_y;
+          int16 rotated_center_x2 = SamusSpritemapRotateX2(subtile_center_x2, subtile_center_y2,
+                                                           center_x2, center_y2, rotation_degrees);
+          int16 rotated_center_y2 = SamusSpritemapRotateY2(subtile_center_x2, subtile_center_y2,
+                                                           center_x2, center_y2, rotation_degrees);
+          uint16 x = (uint16)((rotated_center_x2 - 8) / 2);
+          int16 y = (rotated_center_y2 - 8) / 2;
+          DrawSamusTransformedOamEntry(&idx, x, y, SamusSpritemapSubtile(tile, sub_x, sub_y), false);
+        }
+      }
+    } else {
+      int16 rotated_center_x2 = SamusSpritemapRotateX2(entry_center_x2, entry_center_y2,
+                                                       center_x2, center_y2, rotation_degrees);
+      int16 rotated_center_y2 = SamusSpritemapRotateY2(entry_center_x2, entry_center_y2,
+                                                       center_x2, center_y2, rotation_degrees);
+      if (rotation_degrees == 180 || rotation_degrees == -180)
+        tile ^= 0xC000;
+      uint16 x = (uint16)((rotated_center_x2 - entry_width) / 2);
+      int16 y = (rotated_center_y2 - entry_height) / 2;
+      DrawSamusTransformedOamEntry(&idx, x, y, tile, entry_width == 16);
+    }
+    pp += 5;
   }
   oam_next_ptr = idx;
 }

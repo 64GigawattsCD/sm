@@ -12,7 +12,7 @@ This file is for future coding agents working in this repository.
 - Analog movement support is in progress.
 - Left stick movement should feel smooth and intentional, with eased-in walking and full-tilt top speed.
 - The physical d-pad should remain available for menus, but not drive Samus movement during active gameplay.
-- Analog stick values are being exposed through an on-screen debug overlay (`LX`, `LY`) plus an aim-direction arrow for tuning.
+- The on-screen analog debug overlay should be low-noise: keep the aim-direction arrow in the bottom-right and avoid showing raw left-stick numeric values unless specifically requested.
 - Right-stick aiming and left-stick movement are intended to be decoupled; left stick only supplies fallback aim when the right stick is idle.
 - `Samus_IsAiming()` should represent active right-stick aiming; left stick fallback aim should not block grounded walking transitions.
 - Landing into a run and mid-run direction flips should stay responsive even while right-stick aim is active.
@@ -31,6 +31,21 @@ This file is for future coding agents working in this repository.
 - Projectile heading/inherited-velocity physics looked good in the latest user test; keep tuning focused on movement and pose interaction unless new projectile issues appear.
 - Reference-behavior mismatch checking has been intentionally disabled while analog movement work is underway.
 - When `g_skip_menu` is enabled, slot 1 loads directly and receives the all-items debug loadout if anything is missing.
+- Debug skip-menu loadout should equip everything except Spazer, which should remain turned off even if other beams/items are granted.
+- Missiles are intended to be a direct-fire right-bumper action, not part of the HUD item carousel; right bumper should fire missiles normally and power bombs while morphed.
+- Analog-heading wave/plasma beams must still run off-screen cleanup so projectile slots are released instead of blocking future shots.
+- Shinespark direction should resolve from analog input at the end of windup: right stick when actively aiming, otherwise left stick movement, with no input defaulting to vertical.
+- Downward shinesparks reuse the vertical/diagonal-up shinespark poses with a runtime vertical spritemap flip and inverted Y movement rather than adding new pose IDs or art.
+- Downward shinespark sprite transforms should mirror/rotate Samus top and bottom spritemaps against one shared signed bounding box and use each OAM entry's actual 8/16px dimensions; flipping each half independently or treating offsets as unsigned garbles downward diagonals.
+- Straight-down shinesparks use the fixed vertical flip path; downward diagonals should use the up-diagonal poses with rotated spritemap composition, clockwise for down-right and counterclockwise for down-left.
+- 90-degree Samus spritemap rotation must split 16x16 OAM entries into four 8x8 entries and rotate the subtile positions too; otherwise downward diagonal shinesparks appear as misplaced 2x2 chunks.
+- Downward diagonal shinespark launches currently request a one-frame BMP screenshot in `debug_screenshots/` to help diagnose the remaining rotated spritemap composition issue.
+- Current PPU rotation attempt: downward diagonal shinesparks emit the original up-diagonal Samus OAM range, then the software PPU inverse-maps those sprite pixels around a shared Samus transform center so 8x8 tile pixels rotate instead of only tile boxes.
+- Right-stick aim must not keep Samus in a running pose after left-stick movement is released; while aiming, running/moonwalking aim poses should fall back to standing aim poses when there is no horizontal movement input.
+- Shinespark windup should last 60 frames by default; releasing jump during windup should launch immediately.
+- Shinespark launch direction should be cached during windup from the latest meaningful right-stick aim input, or left-stick fallback input if the right stick is idle; if input returns to neutral before launch, use the last cached direction rather than falling back to facing direction.
+- During shinespark windup, keep the normal Samus input handler disabled so analog/directional input updates the cached launch vector without triggering the vanilla windup pose transition table early.
+- With shine charge stored, pressing jump while airborne in non-spinning jump/fall states should enter shinespark windup even if Samus is not aiming upward; this path must assign the windup pose immediately rather than only queuing `samus_new_pose`, but must not call `SamusFunc_F433()` on the windup pose because the shinespark movement-type hook only has handlers for launched spark poses.
 
 ## Update Guidance
 

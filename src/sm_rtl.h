@@ -18,6 +18,15 @@ extern float g_left_stick_y;
 extern float g_right_stick_x;
 extern float g_right_stick_y;
 
+void DebugRequestShinesparkScreenshot(void);
+
+extern bool g_samus_sprite_transform_enabled;
+extern int g_samus_sprite_transform_rotation;
+extern int g_samus_sprite_transform_oam_start;
+extern int g_samus_sprite_transform_oam_end;
+extern int g_samus_sprite_transform_center_x2;
+extern int g_samus_sprite_transform_center_y2;
+
 typedef void HandlerFunc(void);
 typedef uint8 Func_V_A(void);
 typedef void Func_V(void);

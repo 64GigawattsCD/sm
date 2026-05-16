@@ -49,6 +49,7 @@ typedef struct AnalogAimPoseCandidate {
 
 Pair_R18_R20 TranslateCustomControllerBindingsToDefault(void);
 static void Samus_ApplyAnalogAimPose(void);
+static bool Samus_TryStartAirShinesparkWindup(void);
 
 
 static Func_V *const kSamusInputHandlers[28] = {
@@ -95,6 +96,8 @@ void Samus_Input_01_Running(void) {  // 0x918066
 }
 
 void Samus_Input_02_NormalJumping(void) {  // 0x91806E
+  if (Samus_TryStartAirShinesparkWindup())
+    return;
   Samus_LookupTransitionTable();
 }
 
@@ -123,6 +126,8 @@ void Samus_Input_05_Crouching(void) {  // 0x918087
 }
 
 void Samus_Input_06_Falling(void) {  // 0x9180B6
+  if (Samus_TryStartAirShinesparkWindup())
+    return;
   Samus_LookupTransitionTable();
 }
 
@@ -210,10 +215,14 @@ void Samus_Input_16_Grappling(void) {  // 0x918181
 }
 
 void Samus_Input_17_TurningAroundJumping(void) {  // 0x918189
+  if (Samus_TryStartAirShinesparkWindup())
+    return;
   Samus_LookupTransitionTable();
 }
 
 void Samus_Input_18_TurningAroundFalling(void) {  // 0x91818D
+  if (Samus_TryStartAirShinesparkWindup())
+    return;
   Samus_LookupTransitionTable();
 }
 
@@ -278,6 +287,22 @@ Pair_R18_R20 TranslateCustomControllerBindingsToDefault(void) {  // 0x9181F4
   if ((button_config_itemcancel_y & v1) != 0)
     r20 |= kButton_Y;
   return (Pair_R18_R20) { ~r18, ~r20 };
+}
+
+static bool Samus_TryStartAirShinesparkWindup(void) {
+  if (!samus_shine_timer || (button_config_jump_a & joypad1_newkeys) == 0)
+    return false;
+  samus_pose = samus_pose_x_dir == 4 ? kPose_C8_FaceL_ShinesparkWindup_Vert : kPose_C7_FaceR_ShinesparkWindup_Vert;
+  Projectile_Func7_Shinespark();
+  *(uint16 *)&samus_pose_x_dir = *(uint16 *)(&kPoseParams[0].pose_x_dir + (8 * samus_pose));
+  Samus_SetAnimationFrameIfPoseChanged();
+  samus_new_pose = -1;
+  samus_new_pose_interrupted = -1;
+  samus_new_pose_transitional = -1;
+  if (samus_prev_movement_type2 == kMovementType_02_NormalJumping)
+    samus_prev_y_pos = --samus_y_pos;
+  bomb_jump_dir = 0;
+  return true;
 }
 
 static uint16 Samus_SelectBestAnalogAimPose(const AnalogAimPoseCandidate *candidates, int count,
@@ -434,6 +459,11 @@ static void Samus_ApplyAnalogAimPose(void) {
   if (samus_new_pose != 0 && samus_new_pose != 0xFFFF)
     movement_type = kPoseParams[samus_new_pose].movement_type;
   int move_sign = Samus_GetMovementDirectionSign();
+  if ((movement_type == kMovementType_01_Running || movement_type == kMovementType_10_Moonwalking) &&
+      !Samus_HasHorizontalMovementInput()) {
+    movement_type = kMovementType_00_Standing;
+    moonwalk_flag = 0;
+  }
   bool can_moonwalk = movement_type == kMovementType_01_Running ||
                       movement_type == kMovementType_0E_TurningAroundOnGround ||
                       movement_type == kMovementType_10_Moonwalking;

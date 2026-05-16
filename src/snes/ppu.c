@@ -17,6 +17,12 @@ typedef int16_t int16;
 typedef uint8_t uint8;
 
 extern bool g_new_ppu;
+extern bool g_samus_sprite_transform_enabled;
+extern int g_samus_sprite_transform_rotation;
+extern int g_samus_sprite_transform_oam_start;
+extern int g_samus_sprite_transform_oam_end;
+extern int g_samus_sprite_transform_center_x2;
+extern int g_samus_sprite_transform_center_y2;
 static void PpuDrawWholeLine(Ppu *ppu, uint y);
 
 // array for layer definitions per mode:
@@ -1104,6 +1110,115 @@ static bool ppu_getWindowState(Ppu* ppu, int layer, int x) {
   return false;
 }
 
+static bool PpuIsSamusTransformedSprite(int index) {
+  return g_samus_sprite_transform_enabled &&
+         index >= g_samus_sprite_transform_oam_start &&
+         index < g_samus_sprite_transform_oam_end;
+}
+
+static int PpuRotateX2(int x2, int y2, int center_x2, int center_y2, int rotation_degrees) {
+  if (rotation_degrees == 90)
+    return center_x2 - y2 + center_y2;
+  if (rotation_degrees == -90)
+    return center_x2 + y2 - center_y2;
+  if (rotation_degrees == 180 || rotation_degrees == -180)
+    return center_x2 - x2 + center_x2;
+  return x2;
+}
+
+static int PpuRotateY2(int x2, int y2, int center_x2, int center_y2, int rotation_degrees) {
+  if (rotation_degrees == 90)
+    return center_y2 + x2 - center_x2;
+  if (rotation_degrees == -90)
+    return center_y2 - x2 + center_x2;
+  if (rotation_degrees == 180 || rotation_degrees == -180)
+    return center_y2 - y2 + center_y2;
+  return y2;
+}
+
+static int PpuInverseRotateX2(int x2, int y2, int center_x2, int center_y2, int rotation_degrees) {
+  return PpuRotateX2(x2, y2, center_x2, center_y2, -rotation_degrees);
+}
+
+static int PpuInverseRotateY2(int x2, int y2, int center_x2, int center_y2, int rotation_degrees) {
+  return PpuRotateY2(x2, y2, center_x2, center_y2, -rotation_degrees);
+}
+
+static int PpuFloorDiv2(int value) {
+  return value >= 0 ? value / 2 : -((-value + 1) / 2);
+}
+
+static bool ppu_evaluateTransformedSprite(Ppu* ppu, int line, int x, int y, int spriteSize, int oam1, int *tilesFound) {
+  int sprite_center_x2 = 2 * x + spriteSize;
+  int sprite_center_y2 = 2 * y + spriteSize;
+  int rotated_center_x2 = PpuRotateX2(sprite_center_x2, sprite_center_y2,
+                                      g_samus_sprite_transform_center_x2,
+                                      g_samus_sprite_transform_center_y2,
+                                      g_samus_sprite_transform_rotation);
+  int rotated_center_y2 = PpuRotateY2(sprite_center_x2, sprite_center_y2,
+                                      g_samus_sprite_transform_center_x2,
+                                      g_samus_sprite_transform_center_y2,
+                                      g_samus_sprite_transform_rotation);
+  int dst_left = PpuFloorDiv2(rotated_center_x2 - spriteSize);
+  int dst_top = PpuFloorDiv2(rotated_center_y2 - spriteSize);
+  if (line < dst_top || line >= dst_top + spriteSize)
+    return false;
+  if (dst_left <= -spriteSize || dst_left >= 256)
+    return false;
+
+  int px_left = IntMax(-dst_left, 0);
+  int px_right = IntMin(256 - dst_left, spriteSize);
+  *tilesFound += (px_right - px_left + 7) >> 3;
+  if (*tilesFound > 34) {
+    ppu->timeOver = true;
+    return true;
+  }
+
+  int tile = oam1 & 0xff;
+  int objAdr = (oam1 & 0x100) ? ppu->objTileAdr2 : ppu->objTileAdr1;
+  bool hFlipped = oam1 & 0x4000;
+  bool vFlipped = oam1 & 0x8000;
+  int paletteBase = 0x80 + 16 * ((oam1 & 0xe00) >> 9);
+  int prio = SPRITE_PRIO_TO_PRIO((oam1 & 0x3000) >> 12, (oam1 & 0x800) == 0);
+  PpuZbufType z = paletteBase + (prio << 8);
+
+  for (int px = px_left; px < px_right; px++) {
+    int dst_x = dst_left + px;
+    int dst_x2 = 2 * dst_x + 1;
+    int dst_y2 = 2 * line + 1;
+    int src_x2 = PpuInverseRotateX2(dst_x2, dst_y2,
+                                    g_samus_sprite_transform_center_x2,
+                                    g_samus_sprite_transform_center_y2,
+                                    g_samus_sprite_transform_rotation);
+    int src_y2 = PpuInverseRotateY2(dst_x2, dst_y2,
+                                    g_samus_sprite_transform_center_x2,
+                                    g_samus_sprite_transform_center_y2,
+                                    g_samus_sprite_transform_rotation);
+    int src_x = PpuFloorDiv2(src_x2);
+    int src_y = PpuFloorDiv2(src_y2);
+    if (src_x < x || src_x >= x + spriteSize || src_y < y || src_y >= y + spriteSize)
+      continue;
+
+    int local_x = src_x - x;
+    int row = src_y - y;
+    if (vFlipped)
+      row = spriteSize - 1 - row;
+    int tile_col_origin = local_x & ~7;
+    int usedCol = hFlipped ? spriteSize - 1 - tile_col_origin : tile_col_origin;
+    int usedTile = (((tile >> 4) + (row >> 3)) << 4) | (((tile & 0xf) + (usedCol >> 3)) & 0xf);
+    uint16 *addr = &ppu->vram[(objAdr + usedTile * 16 + (row & 0x7)) & 0x7fff];
+    uint32 plane = addr[0] | addr[8] << 16;
+    int shift = hFlipped ? (local_x & 7) : 7 - (local_x & 7);
+    uint32 bits = plane >> shift;
+    int pixel = (bits >> 0) & 1 | (bits >> 7) & 2 | (bits >> 14) & 4 | (bits >> 21) & 8;
+    PpuZbufType *dst = ppu->objBuffer.data + dst_x + kPpuExtraLeftRight;
+    if (pixel != 0 && (dst[0] & 0xff) == 0)
+      dst[0] = z + pixel;
+  }
+
+  return true;
+}
+
 static bool ppu_evaluateSprites(Ppu* ppu, int line) {
   // TODO: iterate over oam normally to determine in-range sprites,
   //   then iterate those in-range sprites in reverse for tile-fetching
@@ -1117,11 +1232,28 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
     uint8_t row = line - y;
     int spriteSize = spriteSizes[ppu->objSize][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
     int spriteHeight = ppu->objInterlace ? spriteSize / 2 : spriteSize;
+    int x = ppu->oam[index] & 0xff;
+    x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
+    if(x > 255) x -= 512;
+    int oam1 = ppu->oam[index + 1];
+    if (PpuIsSamusTransformedSprite(index >> 1)) {
+      int sprite_y = y;
+      if (sprite_y > 239)
+        sprite_y -= 256;
+      if (ppu_evaluateTransformedSprite(ppu, line, x, sprite_y, spriteSize, oam1, &tilesFound)) {
+        spritesFound++;
+        if(spritesFound > 32) {
+          ppu->rangeOver = true;
+          break;
+        }
+      }
+      if(tilesFound > 34)
+        break;
+      index += 2;
+      continue;
+    }
     if(row < spriteHeight) {
       // in y-range, get the x location, using the high bit as well
-      int x = ppu->oam[index] & 0xff;
-      x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
-      if(x > 255) x -= 512;
       // if in x-range
       if(x > -spriteSize) {
         // break if we found 32 sprites already
@@ -1133,7 +1265,6 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
         // update row according to obj-interlace
         if(ppu->objInterlace) row = row * 2 + (ppu->evenFrame ? 0 : 1);
         // get some data for the sprite and y-flip row if needed
-        int oam1 = ppu->oam[index + 1];
         int tile = oam1 & 0xff;
         int objAdr = (oam1 & 0x100) ? ppu->objTileAdr2 : ppu->objTileAdr1;
         int palette = (oam1 & 0xe00) >> 9;

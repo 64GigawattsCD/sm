@@ -49,6 +49,7 @@ static bool IsGameplayMovementState(void);
 static void UpdateOpeningIntroSkipState(uint16 inputs);
 static void RenderOpeningIntroSkipPrompt(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void RenderAnalogDebugOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height);
+static void SaveDebugScreenshot(uint8 *pixel_buffer, size_t pitch, int width, int height);
 void OpenGLRenderer_Create(struct RendererFuncs *funcs);
 
 bool g_debug_flag;
@@ -63,6 +64,8 @@ static uint32_t button_state;
 
 static uint8_t g_pixels[256 * 4 * 240];
 static uint8_t g_my_pixels[256 * 4 * 240];
+static bool g_shinespark_screenshot_requested;
+static int g_shinespark_screenshot_counter;
 
 int g_got_mismatch_count;
 
@@ -189,6 +192,10 @@ void RtlDrawPpuFrame(uint8 *pixel_buffer, size_t pitch, uint32 render_flags) {
     memcpy((uint8_t *)pixel_buffer + y * pitch, ppu_pixels + y * 256 * 4, 256 * 4);
 }
 
+void DebugRequestShinesparkScreenshot(void) {
+  g_shinespark_screenshot_requested = true;
+}
+
 static void DrawPpuFrameWithPerf(void) {
   int render_scale = PpuGetCurrentRenderScale(g_snes->ppu, g_ppu_render_flags);
   uint8 *pixel_buffer = 0;
@@ -216,8 +223,79 @@ static void DrawPpuFrameWithPerf(void) {
 
   RenderAnalogDebugOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
   RenderOpeningIntroSkipPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+  if (g_shinespark_screenshot_requested) {
+    g_shinespark_screenshot_requested = false;
+    SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+  }
 
   g_renderer_funcs.EndDraw();
+}
+
+static void WriteLe16(FILE *f, uint16_t value) {
+  fputc(value & 0xff, f);
+  fputc((value >> 8) & 0xff, f);
+}
+
+static void WriteLe32(FILE *f, uint32_t value) {
+  fputc(value & 0xff, f);
+  fputc((value >> 8) & 0xff, f);
+  fputc((value >> 16) & 0xff, f);
+  fputc((value >> 24) & 0xff, f);
+}
+
+static void SaveDebugScreenshot(uint8 *pixel_buffer, size_t pitch, int width, int height) {
+#ifdef _WIN32
+  _mkdir("debug_screenshots");
+#else
+  mkdir("debug_screenshots", 0755);
+#endif
+
+  char filename[160];
+  snprintf(filename, sizeof(filename), "debug_screenshots/shinespark_down_diag_%04d.bmp", ++g_shinespark_screenshot_counter);
+  FILE *f = fopen(filename, "wb");
+  if (!f) {
+    printf("Failed to save shinespark screenshot: %s\n", filename);
+    return;
+  }
+
+  int row_bytes = width * 3;
+  int padded_row_bytes = (row_bytes + 3) & ~3;
+  uint32_t image_size = (uint32_t)(padded_row_bytes * height);
+  uint32_t file_size = 14 + 40 + image_size;
+
+  fputc('B', f);
+  fputc('M', f);
+  WriteLe32(f, file_size);
+  WriteLe16(f, 0);
+  WriteLe16(f, 0);
+  WriteLe32(f, 14 + 40);
+
+  WriteLe32(f, 40);
+  WriteLe32(f, (uint32_t)width);
+  WriteLe32(f, (uint32_t)height);
+  WriteLe16(f, 1);
+  WriteLe16(f, 24);
+  WriteLe32(f, 0);
+  WriteLe32(f, image_size);
+  WriteLe32(f, 2835);
+  WriteLe32(f, 2835);
+  WriteLe32(f, 0);
+  WriteLe32(f, 0);
+
+  uint8 padding[3] = { 0, 0, 0 };
+  for (int y = height - 1; y >= 0; y--) {
+    const uint32_t *src = (const uint32_t *)(pixel_buffer + (size_t)y * pitch);
+    for (int x = 0; x < width; x++) {
+      uint32_t color = src[x];
+      fputc(color & 0xff, f);
+      fputc((color >> 8) & 0xff, f);
+      fputc((color >> 16) & 0xff, f);
+    }
+    fwrite(padding, 1, padded_row_bytes - row_bytes, f);
+  }
+
+  fclose(f);
+  printf("Saved shinespark screenshot: %s\n", filename);
 }
 
 static SDL_mutex *g_audio_mutex;
@@ -756,15 +834,6 @@ static void DrawLine(uint8 *pixel_buffer, size_t pitch, int width, int height, i
   }
 }
 
-static void FormatAnalogValue(char *dst, size_t dst_size, float value) {
-  float clamped = value;
-  if (clamped > 1.0f)
-    clamped = 1.0f;
-  else if (clamped < -1.0f)
-    clamped = -1.0f;
-  snprintf(dst, dst_size, "%+.2f", clamped);
-}
-
 static void DrawCircleProgress(uint8 *pixel_buffer, size_t pitch, int width, int height, int cx, int cy, int radius, int thickness, float progress) {
   const int segments = 64;
   const int active_segments = (int)(progress * segments + 0.5f);
@@ -803,20 +872,11 @@ static void RenderOpeningIntroSkipPrompt(uint8 *pixel_buffer, size_t pitch, int 
 }
 
 static void RenderAnalogDebugOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height) {
-  char line[48], lx[8], ly[8];
   int scale = IntMax(1, height / 240);
-  int x = 4 * scale;
-  int y = 4 * scale;
   int arrow_box = 18 * scale;
-  int arrow_cx = width - 18 * scale;
-  int arrow_cy = 14 * scale;
+  int arrow_cx = width - 14 * scale;
+  int arrow_cy = height - 14 * scale;
   float aim_x, aim_y;
-
-  FormatAnalogValue(lx, sizeof(lx), g_left_stick_x);
-  FormatAnalogValue(ly, sizeof(ly), g_left_stick_y);
-  snprintf(line, sizeof(line), "LX:%s LY:%s", lx, ly);
-  DrawText5x7(pixel_buffer, pitch, width, height, x + scale, y + scale, line, scale, 0x000000);
-  DrawText5x7(pixel_buffer, pitch, width, height, x, y, line, scale, 0xFFFFFF);
 
   Samus_GetNormalizedAimDirection(&aim_x, &aim_y);
   DrawRectOutline(pixel_buffer, pitch, width, height,
