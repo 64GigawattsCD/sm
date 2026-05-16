@@ -2359,6 +2359,53 @@ void Samus_Movement_01_Running(void) {  // 0x90A3E5
   }
 }
 
+static bool Samus_IsMovingForMoonwalkFootDust(void) {
+  return (uint32)__PAIR32__(samus_total_x_speed, samus_total_x_subspeed) >= 0x1000;
+}
+
+static void Samus_SpawnFootstepGraphicsWithoutSpeedBoostGate(void) {
+  uint16 saved_speed_boost_counter = speed_boost_counter;
+  speed_boost_counter = (speed_boost_counter & 0xff) | 0x400;
+  Samus_FootstepGraphics();
+  speed_boost_counter = saved_speed_boost_counter;
+}
+
+static void Samus_HandleMoonwalkFootDust(void) {
+  static uint8 moonwalk_waiting_dust_timer;
+  static uint8 moonwalk_cycle_started;
+  static uint16 last_moonwalk_pose;
+
+  if (!Samus_IsMovingForMoonwalkFootDust()) {
+    moonwalk_waiting_dust_timer = 0;
+    moonwalk_cycle_started = 0;
+    last_moonwalk_pose = samus_pose;
+    return;
+  }
+
+  if (last_moonwalk_pose != samus_pose) {
+    last_moonwalk_pose = samus_pose;
+    moonwalk_cycle_started = 0;
+    moonwalk_waiting_dust_timer = 0;
+  }
+
+  if (samus_anim_frame_timer == 1) {
+    moonwalk_cycle_started = 1;
+    moonwalk_waiting_dust_timer = 0;
+    return;
+  }
+
+  if (moonwalk_cycle_started)
+    return;
+
+  if (moonwalk_waiting_dust_timer) {
+    moonwalk_waiting_dust_timer--;
+    return;
+  }
+
+  Samus_SpawnFootstepGraphicsWithoutSpeedBoostGate();
+  moonwalk_waiting_dust_timer = 8;
+}
+
 void Samus_Movement_02_NormalJumping(void) {  // 0x90A42E
   Samus_JumpingMovement();
 }
@@ -2522,6 +2569,7 @@ void Samus_Movement_10_Moonwalking(void) {  // 0x90A694
   samus_x_extra_run_subspeed = 0;
   Samus_HandleMovement_X();
   Samus_Move_NoSpeedCalc_Y();
+  Samus_HandleMoonwalkFootDust();
 }
 
 void Samus_Movement_11_SpringBallOnGround(void) {  // 0x90A69F

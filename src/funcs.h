@@ -299,6 +299,8 @@ void sub_819591(void);
 void sub_81A3D1(uint16 k);
 void sub_81AEC8(void);
 void SoftReset(void);
+void StartDebugScenarioFromMainMenu(void);
+void RequestNativeMainMenuFromFileSelect(void);
 
 // Bank 82
 uint16 CalculateNthTransitionColorComponentFromXtoY(uint16 a, uint16 k, uint16 j);

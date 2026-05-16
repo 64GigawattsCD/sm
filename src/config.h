@@ -33,6 +33,7 @@ enum {
   kKeys_ToggleRenderer,
   kKeys_ToggleModernLayerRenderer,
   kKeys_ToggleModernLayerDebug,
+  kKeys_Screenshot,
   kKeys_VolumeUp,
   kKeys_VolumeDown,
   kKeys_Total,

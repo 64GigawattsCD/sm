@@ -25,6 +25,7 @@ This file is for future coding agents working in this repository.
 - Moonwalk's actual horizontal speed cap is being raised to 1.0, while animation cadence still uses the vanilla moonwalk reference speed so full-speed moonwalk animates about twice as fast.
 - Walking/running/moonwalking animation cadence should be governed by Samus's horizontal speed divided by the relevant state reference speed, not directly by stick magnitude. Running/walking should not scale above vanilla full-speed cadence because vanilla already has extra run/speed-booster animation handling; moonwalk may scale up to 2x.
 - Compatible run/aim-run pose changes and compatible moonwalk/aim-moonwalk pose changes should preserve the current animation frame to avoid gait resets while aiming.
+- Moonwalk should show supplemental foot dust while Samus is moving even if compatible pose-frame preservation delays the next normal footstep frame.
 - Analog moonwalk forcing should only apply on ground running/moonwalk/turn-around states; airborne opposed-stick aiming should use normal jump/fall aim poses.
 - Jumping from moonwalk should enter the non-spinning jump transition poses rather than spin jump or turn-jump.
 - Right-stick analog pose selection should include the vanilla straight-down jump/fall aim poses, preserve facing for pure vertical aim, and break spin jump into normal jump aim poses when active.
@@ -32,6 +33,7 @@ This file is for future coding agents working in this repository.
 - Reference-behavior mismatch checking has been intentionally disabled while analog movement work is underway.
 - When `g_skip_menu` is enabled, slot 1 loads directly and receives the all-items debug loadout if anything is missing.
 - Debug skip-menu loadout should equip everything except Spazer, which should remain turned off even if other beams/items are granted.
+- The PC-native main menu should appear as an overlay on the baby Metroid capsule/title scene, not after changing to file select. `Play` proceeds to the save-slot screen, vanilla file-select Exit returns to the native main menu, `Options` enters the existing options menu, `Test` currently launches the old skip-menu debug loadout until a proper debug scenario is specified, and `Exit` gracefully closes the app.
 - Missiles are intended to be a direct-fire right-bumper action, not part of the HUD item carousel; right bumper should fire missiles normally and power bombs while morphed.
 - Analog-heading wave/plasma beams must still run off-screen cleanup so projectile slots are released instead of blocking future shots.
 - Shinespark direction should resolve from analog input at the end of windup: right stick when actively aiming, otherwise left stick movement, with no input defaulting to vertical.
@@ -52,6 +54,8 @@ This file is for future coding agents working in this repository.
 - Keep the legacy flattened renderer available as a fallback while the modern layer path gains parity; color math/subscreen behavior is especially sensitive and should be validated carefully as the layer compositor matures.
 - Modern layer controls: `Shift+M` toggles the modern layer renderer at runtime and `Ctrl+M` toggles custom-layer debug stripes. The aim indicator/opening-skip prompt should be rendered through the front custom layer when the modern layer renderer is active, not painted directly over the final framebuffer.
 - Analog projectile visuals are being rotated in the software PPU by registering each projectile's OAM range with its own per-frame transform. The rotation should be the delta between the projectile's true analog heading and the nearest vanilla 8-way projectile art direction.
+- Desktop launches should default to borderless fullscreen with `Widescreen16x9` enabled, rendering the widened 426x240 PPU output instead of centering a 256-wide SNES frame.
+- `Screenshot = F12` captures the current presented framebuffer to `debug_screenshots/manual_####.bmp` for renderer debugging.
 
 ## Update Guidance
 

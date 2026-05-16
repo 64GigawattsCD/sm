@@ -32,8 +32,8 @@ typedef struct BgLayer {
 } BgLayer;
 
 enum {
-  kPpuXPixels = 256,
-  kPpuExtraLeftRight = 0,
+  kPpuExtraLeftRight = 85,
+  kPpuXPixels = 256 + 2 * kPpuExtraLeftRight,
 };
 
 typedef uint16_t PpuZbufType;

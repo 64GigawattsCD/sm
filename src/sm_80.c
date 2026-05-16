@@ -13,6 +13,40 @@
 #define kLoadStationLists ((uint16*)RomFixedPtr(0x80c4b5))
 #define off_80CD46 ((uint16*)RomFixedPtr(0x80cd46))
 
+enum {
+  kVanillaRoomLoadBlockColumns = 17,
+  kVanillaScrollLeadBlockColumns = 16,
+  // The widened renderer shows 85 extra pixels on each horizontal side.
+  // Round that up to 16x16 room blocks so the SNES tilemap streamer keeps
+  // the side gutters populated instead of exposing recycled tilemap columns.
+  kWidescreenTileMarginBlocks = 6,
+};
+
+static uint16 GetLevelOrBackgroundRoomBlockForStreaming(uint16 update_offset, int x_block, int y_block) {
+  if (x_block < 0 || y_block < 0 ||
+      x_block >= room_width_in_blocks || y_block >= room_height_in_blocks) {
+    return 0;
+  }
+
+  uint32 offset = 2 * ((uint32)y_block * room_width_in_blocks + (uint32)x_block) + 2;
+  if (update_offset)
+    offset += 0x9600;
+  return *(uint16 *)(g_ram + 0x10000 + offset);
+}
+
+static void UploadLevelOrBackgroundDataColumnAt(uint16 update_offset, int source_x_block,
+                                                int source_y_block, int vram_x_block,
+                                                int vram_y_block) {
+  blocks_to_update_x_block = (uint16)source_x_block;
+  blocks_to_update_y_block = (uint16)source_y_block;
+  vram_blocks_to_update_x_block = (uint16)vram_x_block;
+  vram_blocks_to_update_y_block = (uint16)vram_y_block;
+  if (update_offset)
+    UploadBackgroundDataColumn();
+  else
+    UploadLevelDataColumn();
+}
+
 void APU_UploadBank(uint32 addr) {  // 0x808028
   if (!g_use_my_apu_code)
     return;
@@ -1661,28 +1695,32 @@ void DisplayViewablePartOfRoom(void) {  // 0x80A176
   v1 = (reg_BG1SC - reg_BG2SC) << 8;
   size_of_bg2 = v1 & 0xF800;
   CalculateBgScrollAndLayerPositionBlocks();
-  v2 = 0;
+  uint16 base_layer1_x_block = layer1_x_block;
+  uint16 base_layer2_x_block = layer2_x_block;
+  uint16 base_bg1_x_block = bg1_x_block;
+  uint16 base_bg2_x_block = bg2_x_block;
+  v2 = -kWidescreenTileMarginBlocks;
   do {
     v3 = v2;
-    blocks_to_update_x_block = layer1_x_block;
-    blocks_to_update_y_block = layer1_y_block;
-    vram_blocks_to_update_x_block = bg1_x_block;
-    vram_blocks_to_update_y_block = bg1_y_block;
-    UploadLevelDataColumn();
+    UploadLevelOrBackgroundDataColumnAt(0,
+                                        (int)(int16)base_layer1_x_block + v2,
+                                        (int)(int16)layer1_y_block,
+                                        (int)(int16)base_bg1_x_block + v2,
+                                        (int)(int16)bg1_y_block);
     if (!(layer2_scroll_x & 1)) {
-      blocks_to_update_x_block = layer2_x_block;
-      blocks_to_update_y_block = layer2_y_block;
-      vram_blocks_to_update_x_block = bg2_x_block;
-      vram_blocks_to_update_y_block = bg2_y_block;
-      UploadBackgroundDataColumn();
+      UploadLevelOrBackgroundDataColumnAt(0x1c,
+                                          (int)(int16)base_layer2_x_block + v2,
+                                          (int)(int16)layer2_y_block,
+                                          (int)(int16)base_bg2_x_block + v2,
+                                          (int)(int16)bg2_y_block);
     }
     NMI_ProcessVramWriteQueue();
-    ++layer1_x_block;
-    ++bg1_x_block;
-    ++layer2_x_block;
-    ++bg2_x_block;
     ++v2;
-  } while (v3 != 16);
+  } while (v3 != kVanillaRoomLoadBlockColumns + kWidescreenTileMarginBlocks - 1);
+  layer1_x_block = base_layer1_x_block + kVanillaRoomLoadBlockColumns;
+  bg1_x_block = base_bg1_x_block + kVanillaRoomLoadBlockColumns;
+  layer2_x_block = base_layer2_x_block + kVanillaRoomLoadBlockColumns;
+  bg2_x_block = base_bg2_x_block + kVanillaRoomLoadBlockColumns;
 }
 
 void QueueClearingOfFxTilemap(void) {  // 0x80A211
@@ -1790,12 +1828,14 @@ void UpdateBgGraphicsWhenScrolling(void) {  // 0x80A3DF
   if (layer1_x_block != previous_layer1_x_block) {
     previous_layer1_x_block = layer1_x_block;
     if (!v1)
-      v0 = 16;
-    blocks_to_update_x_block = layer1_x_block + v0;
-    vram_blocks_to_update_x_block = bg1_x_block + v0;
-    blocks_to_update_y_block = layer1_y_block;
-    vram_blocks_to_update_y_block = bg1_y_block;
-    UploadLevelDataColumn();
+      v0 = kVanillaScrollLeadBlockColumns + kWidescreenTileMarginBlocks;
+    else
+      v0 = -kWidescreenTileMarginBlocks;
+    UploadLevelOrBackgroundDataColumnAt(0,
+                                        (int)(int16)layer1_x_block + v0,
+                                        (int)(int16)layer1_y_block,
+                                        (int)(int16)bg1_x_block + v0,
+                                        (int)(int16)bg1_y_block);
   }
   if (!(layer2_scroll_x & 1)) {
     int v2 = 0;
@@ -1803,12 +1843,14 @@ void UpdateBgGraphicsWhenScrolling(void) {  // 0x80A3DF
     if (layer2_x_block != previous_layer2_x_block) {
       previous_layer2_x_block = layer2_x_block;
       if (!v3)
-        v2 = 16;
-      blocks_to_update_x_block = layer2_x_block + v2;
-      vram_blocks_to_update_x_block = bg2_x_block + v2;
-      blocks_to_update_y_block = layer2_y_block;
-      vram_blocks_to_update_y_block = bg2_y_block;
-      UploadBackgroundDataColumn();
+        v2 = kVanillaScrollLeadBlockColumns + kWidescreenTileMarginBlocks;
+      else
+        v2 = -kWidescreenTileMarginBlocks;
+      UploadLevelOrBackgroundDataColumnAt(0x1c,
+                                          (int)(int16)layer2_x_block + v2,
+                                          (int)(int16)layer2_y_block,
+                                          (int)(int16)bg2_x_block + v2,
+                                          (int)(int16)bg2_y_block);
     }
   }
   int v4 = 1;
@@ -2093,12 +2135,7 @@ void UpdateLevelOrBackgroundDataColumn(uint16 k) {  // 0x80A9DE
   if (irq_enable_mode7)
     return;
 
-  uint16 prod = Mult8x8(blocks_to_update_y_block, room_width_in_blocks);
-  uint16 v1 = blocks_to_update_x_block;
-  uint16 v2 = 2 * (prod + v1) + 2;
-  if (k)
-    v2 += 0x9600;
-  const uint16 *r54 = (const uint16 * )(g_ram + 0x10000 + v2);
+  uint16 prod;
   uint16 v3 = (4 * vram_blocks_to_update_y_block) & 0x3C;
   *(uint16 *)((uint8 *)&bg1_update_col_wrapped_size + k) = v3;
   *(uint16 *)((uint8 *)&bg1_update_col_unwrapped_size + k) = (v3 ^ 0x3F) + 1;
@@ -2127,8 +2164,10 @@ void UpdateLevelOrBackgroundDataColumn(uint16 k) {  // 0x80A9DE
   uint16 t2 = k;
   uint16 v9 = 0;
   uint16 var939 = 16;
+  int source_x_block = (int16)blocks_to_update_x_block;
+  int source_y_block = (int16)blocks_to_update_y_block;
   do {
-    uint16 var93B = r54[v9 >> 1];
+    uint16 var93B = GetLevelOrBackgroundRoomBlockForStreaming(k, source_x_block, source_y_block++);
     uint16 v10 = var93B & 0x3FF;
     uint16 v17 = v9;
     uint16 v11 = var937;
@@ -2181,12 +2220,7 @@ void UpdateLevelDataRow(void) {  // 0x80AB75
 void UpdateLevelOrBackgroundDataRow(uint16 v0) {  // 0x80AB78
   if (irq_enable_mode7)
     return;
-  uint16 prod = Mult8x8(blocks_to_update_y_block, room_width_in_blocks);
-  uint16 v1 = blocks_to_update_x_block;
-  uint16 v2 = 2 * (prod + v1) + 2;
-  if (v0)
-    v2 -= 27136;
-  const uint16 *r54 = (const uint16 *)(g_ram + 0x10000 + v2);
+  uint16 prod;
   uint16 var933 = vram_blocks_to_update_x_block & 0xF;
   *(uint16 *)((uint8 *)&bg1_update_row_unwrapped_size + v0) = 4 * (16 - var933);
   *(uint16 *)((uint8 *)&bg1_update_row_wrapped_size + v0) = 4 * (var933 + 1);
@@ -2220,8 +2254,10 @@ void UpdateLevelOrBackgroundDataRow(uint16 v0) {  // 0x80AB78
   uint16 t2 = v0;
   uint16 v9 = 0;
   uint16 var939 = 17;
+  int source_x_block = (int16)blocks_to_update_x_block;
+  int source_y_block = (int16)blocks_to_update_y_block;
   do {
-    uint16 var93B = r54[v9 >> 1];
+    uint16 var93B = GetLevelOrBackgroundRoomBlockForStreaming(v0, source_x_block++, source_y_block);
     uint16 v10 = var93B & 0x3FF;
     uint16 v17 = v9;
     uint16 v11 = var937;

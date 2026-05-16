@@ -28,6 +28,9 @@ typedef unsigned int uint;
 typedef uint16 VoidP;
 
 #define arraysize(x) sizeof(x)/sizeof(x[0])
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 #define sign8(x) ((x) & 0x80)
 #define sign16(x) ((x) & 0x8000)
 #define sign32(x) ((x) & 0x80000000)

@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdarg.h>
 #include <math.h>
 #include <SDL.h>
 #ifdef _WIN32
@@ -48,11 +49,20 @@ static bool IsDirectionalControlCommand(uint16 cmd);
 static bool IsGameplayMovementState(void);
 static int NormalizeGamepadButtonsForMenus(int inputs);
 static void UpdateOpeningIntroSkipState(uint16 inputs);
+static void MaybeActivateNativeMainMenu(void);
+static void UpdateNativeMainMenu(uint16 inputs);
+static uint16 MaskNativeMainMenuInputs(uint16 inputs);
+static void RenderNativeMainMenu(uint8 *pixel_buffer, size_t pitch, int width, int height);
+static void ShowExitToMainMenuPrompt(void);
+static void UpdateExitToMainMenuPrompt(uint16 inputs);
+static uint16 MaskExitToMainMenuPromptInputs(uint16 inputs);
+static void RenderExitToMainMenuPrompt(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void RenderOpeningIntroSkipPrompt(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void RenderAnalogDebugOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void RenderModernFrontCustomLayer(uint32 *pixels, int width, int height);
 static void CompositeModernFrontCustomLayer(uint8 *pixel_buffer, size_t pitch, int width, int height);
-static void SaveDebugScreenshot(uint8 *pixel_buffer, size_t pitch, int width, int height);
+static void SaveDebugScreenshot(uint8 *pixel_buffer, size_t pitch, int width, int height, const char *prefix, int *counter);
+static void WidescreenDebugLog(const char *fmt, ...);
 void OpenGLRenderer_Create(struct RendererFuncs *funcs);
 
 bool g_debug_flag;
@@ -65,12 +75,26 @@ bool g_other_image;
 struct SpcPlayer *g_spc_player;
 static uint32_t button_state;
 
-static uint8_t g_pixels[256 * 4 * 240];
-static uint8_t g_my_pixels[256 * 4 * 240];
+static uint8_t g_pixels[kPpuXPixels * 4 * 240];
+static uint8_t g_my_pixels[kPpuXPixels * 4 * 240];
 static uint32 *g_modern_front_custom_layer;
 static size_t g_modern_front_custom_layer_size;
 static bool g_shinespark_screenshot_requested;
+static bool g_manual_screenshot_requested;
 static int g_shinespark_screenshot_counter;
+static int g_manual_screenshot_counter;
+static int g_startup_screenshot_counter;
+static int g_startup_screenshot_remaining = 24;
+static int g_startup_screenshot_timer = 1;
+static bool g_native_main_menu_active;
+static bool g_native_main_menu_dismissed;
+static bool g_native_main_menu_return_from_options;
+static int g_native_main_menu_selection;
+static uint16 g_native_main_menu_prev_inputs;
+static bool g_native_main_menu_quit_requested;
+static bool g_exit_to_main_menu_prompt_active;
+static bool g_exit_to_main_menu_prompt_selection_yes;
+static uint16 g_exit_to_main_menu_prompt_prev_inputs;
 
 int g_got_mismatch_count;
 
@@ -81,6 +105,8 @@ enum {
   kDefaultFreq = 44100,
   kDefaultChannels = 2,
   kDefaultSamples = 2048,
+  kSnesNativeWidth = 256,
+  kSnesNativeHeight = 240,
 };
 
 static const char kWindowTitle[] = "SuperMet";
@@ -113,11 +139,28 @@ enum {
   kInputBit_Y = 1 << 1,
   kInputBit_Select = 1 << 2,
   kInputBit_Start = 1 << 3,
+  kInputBit_Up = 1 << 4,
+  kInputBit_Down = 1 << 5,
+  kInputBit_Left = 1 << 6,
+  kInputBit_Right = 1 << 7,
   kInputBit_A = 1 << 8,
   kInputBit_X = 1 << 9,
 };
 
+static void WidescreenDebugLog(const char *fmt, ...) {
+  FILE *f = fopen("debug_widescreen.log", "ab");
+  if (!f)
+    return;
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(f, fmt, ap);
+  va_end(ap);
+  fputc('\n', f);
+  fclose(f);
+}
+
 void NORETURN Die(const char *error) {
+  WidescreenDebugLog("DIE: %s", error);
   SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, kWindowTitle, error, NULL);
   fprintf(stderr, "Error: %s\n", error);
   exit(1);
@@ -198,9 +241,22 @@ static SDL_HitTestResult HitTestCallback(SDL_Window *win, const SDL_Point *pt, v
 }
 
 void RtlDrawPpuFrame(uint8 *pixel_buffer, size_t pitch, uint32 render_flags) {
+  static int draw_log_budget = 16;
   uint8 *ppu_pixels = g_other_image ? g_my_pixels : g_pixels;
-  for (size_t y = 0; y < 240; y++)
-    memcpy((uint8_t *)pixel_buffer + y * pitch, ppu_pixels + y * 256 * 4, 256 * 4);
+  int src_x = IntMax((kPpuXPixels - g_snes_width) / 2, 0);
+  int copy_width = IntMin(g_snes_width, kPpuXPixels);
+  if (draw_log_budget-- > 0) {
+    WidescreenDebugLog("RtlDrawPpuFrame: frame=%u dst_width=%d height=%d pitch=%zu ppu_width=%d src_x=%d copy_width=%d other=%d modern=%d",
+                       (unsigned)snes_frame_counter, g_snes_width, g_snes_height, pitch,
+                       kPpuXPixels, src_x, copy_width, g_other_image ? 1 : 0,
+                       g_modern_layer_renderer ? 1 : 0);
+  }
+  for (size_t y = 0; y < kSnesNativeHeight; y++) {
+    uint8_t *dst = (uint8_t *)pixel_buffer + y * pitch;
+    if (copy_width != g_snes_width)
+      memset(dst, 0, g_snes_width * 4);
+    memcpy(dst, ppu_pixels + (y * kPpuXPixels + src_x) * 4, copy_width * 4);
+  }
 }
 
 void DebugRequestShinesparkScreenshot(void) {
@@ -235,12 +291,26 @@ static void DrawPpuFrameWithPerf(void) {
   if (!g_modern_layer_renderer) {
     RenderAnalogDebugOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
     RenderOpeningIntroSkipPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+    RenderNativeMainMenu(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+    RenderExitToMainMenuPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
   } else {
     CompositeModernFrontCustomLayer(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
   }
   if (g_shinespark_screenshot_requested) {
     g_shinespark_screenshot_requested = false;
-    SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+    SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
+                        "shinespark_down_diag", &g_shinespark_screenshot_counter);
+  }
+  if (g_manual_screenshot_requested) {
+    g_manual_screenshot_requested = false;
+    SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
+                        "manual", &g_manual_screenshot_counter);
+  }
+  if (g_startup_screenshot_remaining > 0 && --g_startup_screenshot_timer <= 0) {
+    g_startup_screenshot_timer = 15;
+    g_startup_screenshot_remaining--;
+    SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
+                        "startup", &g_startup_screenshot_counter);
   }
 
   g_renderer_funcs.EndDraw();
@@ -258,7 +328,7 @@ static void WriteLe32(FILE *f, uint32_t value) {
   fputc((value >> 24) & 0xff, f);
 }
 
-static void SaveDebugScreenshot(uint8 *pixel_buffer, size_t pitch, int width, int height) {
+static void SaveDebugScreenshot(uint8 *pixel_buffer, size_t pitch, int width, int height, const char *prefix, int *counter) {
 #ifdef _WIN32
   _mkdir("debug_screenshots");
 #else
@@ -266,7 +336,7 @@ static void SaveDebugScreenshot(uint8 *pixel_buffer, size_t pitch, int width, in
 #endif
 
   char filename[160];
-  snprintf(filename, sizeof(filename), "debug_screenshots/shinespark_down_diag_%04d.bmp", ++g_shinespark_screenshot_counter);
+  snprintf(filename, sizeof(filename), "debug_screenshots/%s_%04d.bmp", prefix, ++*counter);
   FILE *f = fopen(filename, "wb");
   if (!f) {
     printf("Failed to save shinespark screenshot: %s\n", filename);
@@ -310,7 +380,7 @@ static void SaveDebugScreenshot(uint8 *pixel_buffer, size_t pitch, int width, in
   }
 
   fclose(f);
-  printf("Saved shinespark screenshot: %s\n", filename);
+  printf("Saved debug screenshot: %s\n", filename);
 }
 
 static SDL_mutex *g_audio_mutex;
@@ -381,7 +451,9 @@ static bool SdlRenderer_Init(SDL_Window *window) {
   if (g_config.linear_filtering)
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "best");
 
-  int tex_mult = (g_ppu_render_flags & kPpuRenderFlags_4x4Mode7) ? 4 : 1;
+  int tex_mult = PpuGetCurrentRenderScale(g_snes->ppu, g_ppu_render_flags);
+  WidescreenDebugLog("SDL texture create: base=%dx%d tex_mult=%d texture=%dx%d",
+                     g_snes_width, g_snes_height, tex_mult, g_snes_width * tex_mult, g_snes_height * tex_mult);
   g_texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
                                 g_snes_width * tex_mult, g_snes_height * tex_mult);
   if (g_texture == NULL) {
@@ -406,6 +478,10 @@ static void SdlRenderer_BeginDraw(int width, int height, uint8 **pixels, int *pi
 }
 
 static void SdlRenderer_EndDraw(void) {
+  static int sdl_end_log_budget = 12;
+  bool should_log = sdl_end_log_budget-- > 0;
+  if (should_log)
+    WidescreenDebugLog("SdlRenderer_EndDraw begin: rect=%dx%d pitch_texture_copy", g_sdl_renderer_rect.w, g_sdl_renderer_rect.h);
   //  uint64 before = SDL_GetPerformanceCounter();
   SDL_UnlockTexture(g_texture);
   //  uint64 after = SDL_GetPerformanceCounter();
@@ -414,6 +490,8 @@ static void SdlRenderer_EndDraw(void) {
   SDL_RenderClear(g_renderer);
   SDL_RenderCopy(g_renderer, g_texture, &g_sdl_renderer_rect, NULL);
   SDL_RenderPresent(g_renderer); // vsyncs to 60 FPS?
+  if (should_log)
+    WidescreenDebugLog("SdlRenderer_EndDraw end");
 }
 
 static const struct RendererFuncs kSdlRendererFuncs = {
@@ -427,6 +505,8 @@ static const struct RendererFuncs kSdlRendererFuncs = {
 
 #undef main
 int main(int argc, char** argv) {
+  remove("debug_widescreen.log");
+  WidescreenDebugLog("startup: argc=%d ppu_width=%d extra=%d", argc, kPpuXPixels, kPpuExtraLeftRight);
 #ifdef __SWITCH__
   SwitchImpl_Init();
 #endif
@@ -438,20 +518,24 @@ int main(int argc, char** argv) {
   } else {
     SwitchDirectory();
   }
+  WidescreenDebugLog("working-directory-ready: config_file=%s", config_file ? config_file : "(default)");
   if (argc >= 1 && strcmp(argv[0], "--debug") == 0) {
     g_debug_flag = true;
     argc -= 1, argv += 1;
   }
   ParseConfigFile(config_file);
 
-  g_snes_width = (g_config.extended_aspect_ratio * 2 + 256);
-  g_snes_height = 240;// (g_config.extend_y ? 240 : 224);
+  g_snes_width = (g_config.extended_aspect_ratio * 2 + kSnesNativeWidth);
+  g_snes_height = kSnesNativeHeight;// (g_config.extend_y ? 240 : 224);
   g_ppu_render_flags = g_config.new_renderer * kPpuRenderFlags_NewRenderer |
     g_config.enhanced_mode7 * kPpuRenderFlags_4x4Mode7 |
     g_config.extend_y * kPpuRenderFlags_Height240 |
-    g_config.no_sprite_limits * kPpuRenderFlags_NoSpriteLimits |
+  g_config.no_sprite_limits * kPpuRenderFlags_NoSpriteLimits |
     g_config.modern_layer_renderer * kPpuRenderFlags_ModernLayerRenderer;
   g_modern_layer_renderer = (g_ppu_render_flags & kPpuRenderFlags_ModernLayerRenderer) != 0;
+  WidescreenDebugLog("config: fullscreen=%d extended=%u snes=%dx%d flags=0x%x modern=%d",
+                     g_config.fullscreen, g_config.extended_aspect_ratio, g_snes_width, g_snes_height,
+                     g_ppu_render_flags, g_modern_layer_renderer ? 1 : 0);
 
   if (g_config.fullscreen == 1)
     g_win_flags ^= SDL_WINDOW_FULLSCREEN_DESKTOP;
@@ -478,10 +562,13 @@ int main(int argc, char** argv) {
     printf("Failed to init SDL: %s\n", SDL_GetError());
     return 1;
   }
+  WidescreenDebugLog("SDL initialized");
 
   bool custom_size = g_config.window_width != 0 && g_config.window_height != 0;
   int window_width = custom_size ? g_config.window_width : g_current_window_scale * g_snes_width;
   int window_height = custom_size ? g_config.window_height : g_current_window_scale * g_snes_height;
+  WidescreenDebugLog("window-request: %dx%d scale=%u custom=%d flags=0x%x",
+                     window_width, window_height, g_current_window_scale, custom_size ? 1 : 0, g_win_flags);
 
   if (g_config.output_method == kOutputMethod_OpenGL) {
     g_win_flags |= SDL_WINDOW_OPENGL;
@@ -493,6 +580,7 @@ int main(int argc, char** argv) {
   // init snes, load rom
   const char* filename = argv[0] ? argv[0] : "sm.smc";
   Snes *snes = SnesInit(filename);
+  WidescreenDebugLog("SnesInit: filename=%s snes=%p", filename, (void *)snes);
 
   if(snes == NULL) {
   #ifdef __SWITCH__
@@ -512,9 +600,11 @@ int main(int argc, char** argv) {
   }
   g_window = window;
   SDL_SetWindowHitTest(window, HitTestCallback, NULL);
+  WidescreenDebugLog("SDL window created: window=%p", (void *)window);
 
   if (!g_renderer_funcs.Initialize(window))
     return 1;
+  WidescreenDebugLog("renderer initialized");
 
   g_audio_mutex = SDL_CreateMutex();
   if (!g_audio_mutex) Die("No mutex");
@@ -540,8 +630,9 @@ int main(int argc, char** argv) {
     g_audiobuffer = (uint8 *)malloc(g_frames_per_block * have.channels * sizeof(int16));
   }
 
-  PpuBeginDrawing(snes->snes_ppu, g_pixels, 256 * 4, 0);
-  PpuBeginDrawing(snes->my_ppu, g_my_pixels, 256 * 4, 0);
+  PpuBeginDrawing(snes->snes_ppu, g_pixels, kPpuXPixels * 4, 0);
+  PpuBeginDrawing(snes->my_ppu, g_my_pixels, kPpuXPixels * 4, 0);
+  WidescreenDebugLog("PpuBeginDrawing done: pitch=%d buffer_bytes=%zu", kPpuXPixels * 4, sizeof(g_pixels));
 
 #if defined(_WIN32)
   _mkdir("saves");
@@ -562,8 +653,13 @@ int main(int argc, char** argv) {
   uint32 curTick = 0;
   uint32 frameCtr = 0;
   uint8 audiopaused = true;
+  int main_loop_log_budget = 32;
 
   while (running) {
+    bool log_loop = main_loop_log_budget-- > 0;
+    if (log_loop)
+      WidescreenDebugLog("main-loop begin: frameCtr=%u snes_frame=%u game_state=%u cinematic=%04x",
+                         frameCtr, (unsigned)snes_frame_counter, game_state, cinematic_function);
     SDL_Event event;
 
     while (SDL_PollEvent(&event)) {
@@ -624,15 +720,50 @@ int main(int argc, char** argv) {
     inputs |= analog_buttons;
     if (!IsGameplayMovementState())
       inputs |= g_gamepad_dpad_buttons;
-    UpdateOpeningIntroSkipState(inputs);
 
-    uint8 is_replay = RtlRunFrame(inputs);
+    MaybeActivateNativeMainMenu();
+    uint8 is_replay = 0;
+    if (g_exit_to_main_menu_prompt_active) {
+      uint16 game_inputs = MaskExitToMainMenuPromptInputs((uint16)inputs);
+      UpdateExitToMainMenuPrompt((uint16)inputs);
+      is_replay = RtlRunFrame(game_inputs);
+      g_snes->disableRender = (g_turbo ^ (is_replay & g_replay_turbo)) && (frameCtr & (g_turbo ? 0xf : 0x7f)) != 0;
+    } else if (g_native_main_menu_active) {
+      uint16 game_inputs = MaskNativeMainMenuInputs((uint16)inputs);
+      UpdateNativeMainMenu((uint16)inputs);
+      if (g_native_main_menu_quit_requested) {
+        running = false;
+        continue;
+      }
+      if (log_loop)
+        WidescreenDebugLog("main-loop RtlRunFrame menu: inputs=0x%x game_inputs=0x%x", inputs, game_inputs);
+      is_replay = RtlRunFrame(game_inputs);
+      if (log_loop)
+        WidescreenDebugLog("main-loop RtlRunFrame menu done: replay=%u game_state=%u cinematic=%04x",
+                           is_replay, game_state, cinematic_function);
+      if (g_native_main_menu_active && game_state == kGameState_1_OpeningCinematic)
+        demo_timer = 900;
+      g_snes->disableRender = (g_turbo ^ (is_replay & g_replay_turbo)) && (frameCtr & (g_turbo ? 0xf : 0x7f)) != 0;
+    } else {
+      UpdateOpeningIntroSkipState(inputs);
+      if (log_loop)
+        WidescreenDebugLog("main-loop RtlRunFrame gameplay: inputs=0x%x", inputs);
+      is_replay = RtlRunFrame(inputs);
+      if (log_loop)
+        WidescreenDebugLog("main-loop RtlRunFrame gameplay done: replay=%u game_state=%u cinematic=%04x",
+                           is_replay, game_state, cinematic_function);
+      g_snes->disableRender = (g_turbo ^ (is_replay & g_replay_turbo)) && (frameCtr & (g_turbo ? 0xf : 0x7f)) != 0;
+    }
 
     frameCtr++;
-    g_snes->disableRender = (g_turbo ^ (is_replay & g_replay_turbo)) && (frameCtr & (g_turbo ? 0xf : 0x7f)) != 0;
 
-    if (!g_snes->disableRender)
+    if (!g_snes->disableRender) {
+      if (log_loop)
+        WidescreenDebugLog("main-loop DrawPpuFrameWithPerf begin");
       DrawPpuFrameWithPerf();
+      if (log_loop)
+        WidescreenDebugLog("main-loop DrawPpuFrameWithPerf end");
+    }
 
     // if vsync isn't working, delay manually
     curTick = SDL_GetTicks();
@@ -649,10 +780,14 @@ int main(int argc, char** argv) {
         }
         //        printf("Sleeping %d\n", delta);
         SDL_Delay(delta);
+        if (log_loop)
+          WidescreenDebugLog("main-loop delay: %u", delta);
       } else if (curTick - lastTick > 500) {
         lastTick = curTick;
       }
     }
+    if (log_loop)
+      WidescreenDebugLog("main-loop end");
   }
 
   if (g_config.autosave)
@@ -764,6 +899,23 @@ static void FillRect(uint8 *pixel_buffer, size_t pitch, int width, int height, i
   }
 }
 
+static uint32 BlendColorOverBgr(uint32 dst_bgr, uint32 src_bgr, uint8 alpha) {
+  uint32 inv_a = 255 - alpha;
+  uint32 rb = ((src_bgr & 0xff00ff) * alpha + (dst_bgr & 0xff00ff) * inv_a) >> 8;
+  uint32 g = ((src_bgr & 0x00ff00) * alpha + (dst_bgr & 0x00ff00) * inv_a) >> 8;
+  return (rb & 0xff00ff) | (g & 0x00ff00);
+}
+
+static void FillRectAlpha(uint8 *pixel_buffer, size_t pitch, int width, int height, int x, int y, int w, int h, uint32 color, uint8 alpha) {
+  int x0 = IntMax(x, 0), y0 = IntMax(y, 0);
+  int x1 = IntMin(x + w, width), y1 = IntMin(y + h, height);
+  for (int py = y0; py < y1; py++) {
+    uint32 *dst = (uint32 *)(pixel_buffer + py * pitch);
+    for (int px = x0; px < x1; px++)
+      dst[px] = BlendColorOverBgr(dst[px] & 0xffffff, color, alpha);
+  }
+}
+
 static void DrawRectOutline(uint8 *pixel_buffer, size_t pitch, int width, int height, int x, int y, int w, int h, int thickness, uint32 color) {
   FillRect(pixel_buffer, pitch, width, height, x, y, w, thickness, color);
   FillRect(pixel_buffer, pitch, width, height, x, y + h - thickness, w, thickness, color);
@@ -791,15 +943,25 @@ static void DrawGlyph5x7(uint8 *pixel_buffer, size_t pitch, int width, int heigh
     { '8', { 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E } },
     { '9', { 0x0E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x0E } },
     { ':', { 0x00, 0x06, 0x06, 0x00, 0x06, 0x06, 0x00 } },
+    { '>', { 0x01, 0x02, 0x04, 0x08, 0x04, 0x02, 0x01 } },
     { 'A', { 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 } },
+    { 'B', { 0x0F, 0x11, 0x11, 0x0F, 0x11, 0x11, 0x0F } },
+    { 'C', { 0x0E, 0x11, 0x01, 0x01, 0x01, 0x11, 0x0E } },
     { 'D', { 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E } },
+    { 'E', { 0x1F, 0x01, 0x01, 0x0F, 0x01, 0x01, 0x1F } },
+    { 'F', { 0x1F, 0x01, 0x01, 0x0F, 0x01, 0x01, 0x01 } },
+    { 'G', { 0x0E, 0x11, 0x01, 0x1D, 0x11, 0x11, 0x1E } },
     { 'H', { 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 } },
+    { 'I', { 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E } },
+    { 'M', { 0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11 } },
+    { 'N', { 0x11, 0x13, 0x15, 0x19, 0x11, 0x11, 0x11 } },
     { 'L', { 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x1F } },
     { 'O', { 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E } },
     { 'P', { 0x0F, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x01 } },
     { 'R', { 0x1E, 0x11, 0x11, 0x1E, 0x09, 0x11, 0x11 } },
     { 'S', { 0x1E, 0x01, 0x01, 0x0E, 0x10, 0x10, 0x0F } },
     { 'T', { 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 } },
+    { 'U', { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E } },
     { 'X', { 0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11 } },
     { 'Y', { 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04 } },
   };
@@ -815,7 +977,7 @@ static void DrawGlyph5x7(uint8 *pixel_buffer, size_t pitch, int width, int heigh
 
   for (int gy = 0; gy < 7; gy++) {
     for (int gx = 0; gx < 5; gx++) {
-      if ((rows[gy] & (1 << (4 - gx))) == 0)
+      if ((rows[gy] & (1 << gx)) == 0)
         continue;
       FillRect(pixel_buffer, pitch, width, height, x + gx * scale, y + gy * scale, scale, scale, color);
     }
@@ -825,6 +987,219 @@ static void DrawGlyph5x7(uint8 *pixel_buffer, size_t pitch, int width, int heigh
 static void DrawText5x7(uint8 *pixel_buffer, size_t pitch, int width, int height, int x, int y, const char *text, int scale, uint32 color) {
   for (int i = 0; text[i]; i++)
     DrawGlyph5x7(pixel_buffer, pitch, width, height, x + i * scale * 6, y, text[i], scale, color);
+}
+
+static bool NativeMainMenuCanOpenOnTitleScene(void) {
+  return game_state == kGameState_1_OpeningCinematic &&
+         cinematic_function == FUNC16(CinematicFunc_Func1) &&
+         cinematic_var18 == 0;
+}
+
+static void ClearTransientMenuInputs(void) {
+  g_gamepad_analog_buttons = 0;
+  g_gamepad_dpad_buttons = 0;
+  g_gamepad_modifiers &= ~((1u << kGamepadBtn_DpadUp) | (1u << kGamepadBtn_DpadDown) |
+                           (1u << kGamepadBtn_DpadLeft) | (1u << kGamepadBtn_DpadRight));
+  for (int button = kGamepadBtn_DpadUp; button <= kGamepadBtn_DpadRight; button++)
+    g_gamepad_last_cmd[button] = 0;
+  g_native_main_menu_prev_inputs = 0;
+  g_exit_to_main_menu_prompt_prev_inputs = 0;
+}
+
+static void OpenNativeMainMenuScene(void) {
+  game_state = kGameState_1_OpeningCinematic;
+  cinematic_function = FUNC16(CinematicFunctionOpening);
+  screen_fade_delay = 0;
+  screen_fade_counter = 0;
+  demo_timer = 900;
+  g_skip_menu = false;
+  g_native_main_menu_active = false;
+  g_native_main_menu_dismissed = false;
+  g_native_main_menu_return_from_options = false;
+  g_exit_to_main_menu_prompt_active = false;
+  ClearTransientMenuInputs();
+}
+
+static void MaybeActivateNativeMainMenu(void) {
+  if (g_native_main_menu_return_from_options) {
+    if (game_state == kGameState_4_FileSelectMenus) {
+      OpenNativeMainMenuScene();
+      g_native_main_menu_return_from_options = false;
+      return;
+    }
+    if (game_state != kGameState_2_GameOptionsMenu) {
+      g_native_main_menu_return_from_options = false;
+      g_native_main_menu_dismissed = true;
+    }
+  }
+
+  if (!g_native_main_menu_dismissed && !g_native_main_menu_active &&
+      NativeMainMenuCanOpenOnTitleScene()) {
+    g_native_main_menu_active = true;
+    g_native_main_menu_return_from_options = false;
+    ClearTransientMenuInputs();
+    demo_timer = 900;
+  }
+}
+
+void RequestNativeMainMenuFromFileSelect(void) {
+  OpenNativeMainMenuScene();
+}
+
+static void UpdateNativeMainMenu(uint16 inputs) {
+  enum { kNativeMainMenuItemCount = 4 };
+  const uint16 confirm_inputs = kInputBit_A | kInputBit_Start;
+  uint16 new_inputs = inputs & ~g_native_main_menu_prev_inputs;
+  g_native_main_menu_prev_inputs = inputs;
+
+  if (new_inputs & kInputBit_Up) {
+    g_native_main_menu_selection = (g_native_main_menu_selection + kNativeMainMenuItemCount - 1) % kNativeMainMenuItemCount;
+    return;
+  }
+  if (new_inputs & kInputBit_Down) {
+    g_native_main_menu_selection = (g_native_main_menu_selection + 1) % kNativeMainMenuItemCount;
+    return;
+  }
+  if ((new_inputs & confirm_inputs) == 0)
+    return;
+
+  g_native_main_menu_active = false;
+  g_native_main_menu_prev_inputs = 0;
+  g_skip_menu = false;
+  if (g_native_main_menu_selection == 0) {
+    g_native_main_menu_dismissed = true;
+    cinematic_function = FUNC16(CinematicFunc_Func10);
+    screen_fade_delay = 2;
+    screen_fade_counter = 2;
+  } else if (g_native_main_menu_selection == 1) {
+    g_native_main_menu_return_from_options = true;
+    game_state = kGameState_2_GameOptionsMenu;
+    game_options_screen_index = 0;
+    menu_index = 0;
+    screen_fade_delay = 0;
+    screen_fade_counter = 0;
+  } else {
+    if (g_native_main_menu_selection == 3) {
+      g_native_main_menu_quit_requested = true;
+      return;
+    }
+    g_native_main_menu_dismissed = true;
+    StartDebugScenarioFromMainMenu();
+  }
+}
+
+static uint16 MaskNativeMainMenuInputs(uint16 inputs) {
+  return inputs & ~(uint16)(kInputBit_Up | kInputBit_Down | kInputBit_Left | kInputBit_Right |
+                            kInputBit_A | kInputBit_B | kInputBit_Start);
+}
+
+static void ShowExitToMainMenuPrompt(void) {
+  if (g_native_main_menu_active || g_exit_to_main_menu_prompt_active)
+    return;
+  g_exit_to_main_menu_prompt_active = true;
+  g_exit_to_main_menu_prompt_selection_yes = false;
+  g_exit_to_main_menu_prompt_prev_inputs = 0;
+  g_gamepad_analog_buttons = 0;
+  g_gamepad_dpad_buttons = 0;
+}
+
+static void UpdateExitToMainMenuPrompt(uint16 inputs) {
+  uint16 new_inputs = inputs & ~g_exit_to_main_menu_prompt_prev_inputs;
+  g_exit_to_main_menu_prompt_prev_inputs = inputs;
+
+  if (new_inputs & (kInputBit_Left | kInputBit_Right | kInputBit_Up | kInputBit_Down))
+    g_exit_to_main_menu_prompt_selection_yes = !g_exit_to_main_menu_prompt_selection_yes;
+
+  if (new_inputs & (kInputBit_B | kInputBit_Select)) {
+    g_exit_to_main_menu_prompt_active = false;
+    g_exit_to_main_menu_prompt_prev_inputs = 0;
+    return;
+  }
+
+  if (new_inputs & (kInputBit_A | kInputBit_Start)) {
+    if (g_exit_to_main_menu_prompt_selection_yes)
+      OpenNativeMainMenuScene();
+    else {
+      g_exit_to_main_menu_prompt_active = false;
+      g_exit_to_main_menu_prompt_prev_inputs = 0;
+    }
+  }
+}
+
+static uint16 MaskExitToMainMenuPromptInputs(uint16 inputs) {
+  return inputs & ~(uint16)(kInputBit_Up | kInputBit_Down | kInputBit_Left | kInputBit_Right |
+                            kInputBit_A | kInputBit_B | kInputBit_Start | kInputBit_Select);
+}
+
+static void RenderExitToMainMenuPrompt(uint8 *pixel_buffer, size_t pitch, int width, int height) {
+  if (!g_exit_to_main_menu_prompt_active)
+    return;
+
+  const int scale = IntMax(1, height / 240);
+  const int panel_w = 150 * scale;
+  const int panel_h = 58 * scale;
+  const int panel_x = (width - panel_w) / 2;
+  const int panel_y = (height - panel_h) / 2;
+  uint32 yes_color = g_exit_to_main_menu_prompt_selection_yes ? 0x8FEA7D : 0xC5D0D8;
+  uint32 no_color = !g_exit_to_main_menu_prompt_selection_yes ? 0x8FEA7D : 0xC5D0D8;
+
+  if (g_modern_layer_renderer)
+    FillRect(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, 0xb0101722);
+  else
+    FillRectAlpha(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, 0x101722, 176);
+  DrawRectOutline(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, IntMax(1, scale), 0x8FEA7D);
+  DrawText5x7(pixel_buffer, pitch, width, height, panel_x + 17 * scale, panel_y + 12 * scale,
+              "EXIT TO MENU", scale, 0xFFFFFF);
+  DrawText5x7(pixel_buffer, pitch, width, height, panel_x + 35 * scale, panel_y + 34 * scale,
+              g_exit_to_main_menu_prompt_selection_yes ? "> YES" : "  YES", scale, yes_color);
+  DrawText5x7(pixel_buffer, pitch, width, height, panel_x + 91 * scale, panel_y + 34 * scale,
+              !g_exit_to_main_menu_prompt_selection_yes ? "> NO" : "  NO", scale, no_color);
+}
+
+static void RenderNativeMainMenu(uint8 *pixel_buffer, size_t pitch, int width, int height) {
+  static const char *const kMenuItems[4] = { "PLAY", "OPTIONS", "TEST", "EXIT" };
+  if (!g_native_main_menu_active)
+    return;
+
+  const int scale = IntMax(1, height / 240);
+  const int panel_w = 108 * scale;
+  const int panel_h = 108 * scale;
+  const int panel_x = (width - panel_w) / 2;
+  const int panel_y = (height - panel_h) / 2 + 28 * scale;
+  const int title_x = panel_x + 18 * scale;
+  const int title_y = panel_y + 11 * scale;
+  const int item_x = panel_x + 31 * scale;
+  const int first_item_y = panel_y + 32 * scale;
+  const int item_gap = 16 * scale;
+  uint8 border_flicker = (uint8)(190 + ((nmi_frame_counter_word * 17 + (nmi_frame_counter_word >> 2) * 53) & 63));
+  uint32 border_color = BlendColorOverBgr(0x1C3A2B, 0x8FEA7D, border_flicker);
+
+  if (g_modern_layer_renderer)
+    FillRect(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, 0x9c101722);
+  else
+    FillRectAlpha(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, 0x101722, 156);
+  for (int y = panel_y + 4 * scale + (nmi_frame_counter_word & 3) * scale; y < panel_y + panel_h - 4 * scale; y += 4 * scale) {
+    if (g_modern_layer_renderer)
+      FillRect(pixel_buffer, pitch, width, height, panel_x + 3 * scale, y, panel_w - 6 * scale, IntMax(1, scale), 0x352D6F58);
+    else
+      FillRectAlpha(pixel_buffer, pitch, width, height, panel_x + 3 * scale, y, panel_w - 6 * scale, IntMax(1, scale), 0x2D6F58, 53);
+  }
+  DrawRectOutline(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, IntMax(1, scale), border_color);
+  DrawText5x7(pixel_buffer, pitch, width, height, title_x, title_y, "MAIN MENU", scale, 0xFFFFFF);
+
+  for (int i = 0; i < 4; i++) {
+    int y = first_item_y + i * item_gap;
+    uint32 text_color = i == g_native_main_menu_selection ? 0x8FEA7D : 0xC5D0D8;
+    if (i == g_native_main_menu_selection) {
+      DrawText5x7(pixel_buffer, pitch, width, height, item_x - 16 * scale, y, ">", scale, 0x8FEA7D);
+      if (g_modern_layer_renderer)
+        FillRect(pixel_buffer, pitch, width, height, item_x - 5 * scale, y + 9 * scale, 55 * scale, IntMax(1, scale), 0x8c2E6F58);
+      else
+        FillRectAlpha(pixel_buffer, pitch, width, height, item_x - 5 * scale, y + 9 * scale, 55 * scale, IntMax(1, scale), 0x2E6F58, 140);
+    }
+    DrawText5x7(pixel_buffer, pitch, width, height, item_x, y, kMenuItems[i], scale, text_color);
+  }
+
 }
 
 static void DrawPoint(uint8 *pixel_buffer, size_t pitch, int width, int height, int x, int y, int size, uint32 color) {
@@ -920,18 +1295,30 @@ static void RenderAnalogDebugOverlay(uint8 *pixel_buffer, size_t pitch, int widt
 }
 
 static void RenderModernFrontCustomLayer(uint32 *pixels, int width, int height) {
+  static int render_front_log_budget = 12;
+  if (render_front_log_budget-- > 0)
+    WidescreenDebugLog("RenderModernFrontCustomLayer begin: width=%d height=%d active_menu=%d intro_hold=%u",
+                       width, height, g_native_main_menu_active ? 1 : 0, g_intro_skip_hold_frames);
   memset(pixels, 0, sizeof(uint32) * width * height);
   RenderOpeningIntroSkipPrompt((uint8 *)pixels, width * sizeof(uint32), width, height);
   RenderAnalogDebugOverlay((uint8 *)pixels, width * sizeof(uint32), width, height);
+  RenderNativeMainMenu((uint8 *)pixels, width * sizeof(uint32), width, height);
+  RenderExitToMainMenuPrompt((uint8 *)pixels, width * sizeof(uint32), width, height);
   for (int i = 0; i < width * height; i++) {
-    if (pixels[i] != 0)
+    if ((pixels[i] & 0xffffff) != 0 && (pixels[i] & 0xff000000) == 0)
       pixels[i] |= 0xff000000;
   }
+  if (render_front_log_budget >= 0)
+    WidescreenDebugLog("RenderModernFrontCustomLayer end: width=%d height=%d", width, height);
 }
 
 void RtlRenderModernCustomLayer(int custom_slot, int y, uint32 *pixels, int width, int height) {
-  if (custom_slot != kModernFrontCustomLayer || width != 256 || height != 240)
+  if (custom_slot != kModernFrontCustomLayer || width != kSnesNativeWidth || height != kSnesNativeHeight)
     return;
+  if (g_snes_width != kSnesNativeWidth) {
+    memset(pixels, 0, sizeof(uint32) * width);
+    return;
+  }
   if (g_modern_front_custom_layer_size < (size_t)width * height) {
     g_modern_front_custom_layer_size = (size_t)width * height;
     g_modern_front_custom_layer = (uint32 *)realloc(g_modern_front_custom_layer,
@@ -958,14 +1345,24 @@ static uint32 BlendArgbOverBgr(uint32 dst_bgr, uint32 src_argb) {
 }
 
 static void CompositeModernFrontCustomLayer(uint8 *pixel_buffer, size_t pitch, int width, int height) {
+  static int composite_front_log_budget = 12;
+  bool should_log = composite_front_log_budget-- > 0;
+  if (should_log)
+    WidescreenDebugLog("CompositeModernFrontCustomLayer begin: width=%d height=%d pitch=%zu size=%zu ptr=%p",
+                       width, height, pitch, g_modern_front_custom_layer_size, (void *)g_modern_front_custom_layer);
   if (g_modern_front_custom_layer_size < (size_t)width * height) {
     g_modern_front_custom_layer_size = (size_t)width * height;
     g_modern_front_custom_layer = (uint32 *)realloc(g_modern_front_custom_layer,
                                                     g_modern_front_custom_layer_size * sizeof(uint32));
     if (!g_modern_front_custom_layer)
       Die("Unable to allocate modern front layer");
+    if (should_log)
+      WidescreenDebugLog("CompositeModernFrontCustomLayer allocated: size=%zu ptr=%p",
+                         g_modern_front_custom_layer_size, (void *)g_modern_front_custom_layer);
   }
   RenderModernFrontCustomLayer(g_modern_front_custom_layer, width, height);
+  if (should_log)
+    WidescreenDebugLog("CompositeModernFrontCustomLayer rendered overlay");
   for (int y = 0; y < height; y++) {
     uint32 *dst = (uint32 *)(pixel_buffer + y * pitch);
     uint32 *src = &g_modern_front_custom_layer[y * width];
@@ -974,6 +1371,8 @@ static void CompositeModernFrontCustomLayer(uint8 *pixel_buffer, size_t pitch, i
         dst[x] = BlendArgbOverBgr(dst[x] & 0xffffff, src[x]);
     }
   }
+  if (should_log)
+    WidescreenDebugLog("CompositeModernFrontCustomLayer end");
 }
 
 static uint16 GetInputBitForControlCommand(uint32 j) {
@@ -996,9 +1395,9 @@ static int NormalizeGamepadButtonsForMenus(int inputs) {
   // Gameplay remaps move jump/fire off face buttons. Menus should still use
   // physical A/B as yes/no, and physical X/Y should not inherit gameplay actions.
   inputs &= ~(kInputBit_A | kInputBit_B | kInputBit_X | kInputBit_Y);
-  if (g_gamepad_modifiers & (1 << kGamepadBtn_B))
-    inputs |= kInputBit_A;
   if (g_gamepad_modifiers & (1 << kGamepadBtn_A))
+    inputs |= kInputBit_A;
+  if (g_gamepad_modifiers & (1 << kGamepadBtn_B))
     inputs |= kInputBit_B;
   if (g_gamepad_modifiers & (1 << kGamepadBtn_Start))
     inputs |= kInputBit_Start;
@@ -1083,6 +1482,10 @@ static void HandleCommand(uint32 j, bool pressed) {
       g_modern_layer_debug = !g_modern_layer_debug;
       printf("[Modern layer debug]=%s\n", g_modern_layer_debug ? "on" : "off");
       break;
+    case kKeys_Screenshot:
+      g_manual_screenshot_requested = true;
+      printf("[Debug screenshot queued]\n");
+      break;
     case kKeys_VolumeUp:
     case kKeys_VolumeDown: HandleVolumeAdjustment(j == kKeys_VolumeUp ? 1 : -1); break;
     default: assert(0);
@@ -1091,6 +1494,15 @@ static void HandleCommand(uint32 j, bool pressed) {
 }
 
 static void HandleInput(int keyCode, int keyMod, bool pressed) {
+  if (pressed && keyCode == SDLK_ESCAPE) {
+    if (g_exit_to_main_menu_prompt_active) {
+      g_exit_to_main_menu_prompt_active = false;
+      g_exit_to_main_menu_prompt_prev_inputs = 0;
+    } else {
+      ShowExitToMainMenuPrompt();
+    }
+    return;
+  }
   int j = FindCmdForSdlKey(keyCode, (SDL_Keymod)keyMod);
   if (j != 0)
     HandleCommand(j, pressed);

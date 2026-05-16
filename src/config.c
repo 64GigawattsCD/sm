@@ -37,8 +37,8 @@ static const uint16 kDefaultKbdControls[kKeys_Total] = {
   C(SDLK_1), C(SDLK_2), C(SDLK_3), C(SDLK_4), C(SDLK_5), C(SDLK_6), C(SDLK_7), C(SDLK_8), C(SDLK_9), C(SDLK_0), C(SDLK_MINUS), C(SDLK_EQUALS), C(SDLK_BACKSPACE), N, N, N, N, N, N, N,
   // CheatLife, CheatJump, ToggleWhichFrame,
   _(SDLK_w), _(SDLK_q), S(SDLK_r),
-  // ClearKeyLog, StopReplay, Fullscreen, Reset, Pause, PauseDimmed, Turbo, ReplayTurbo, WindowBigger, WindowSmaller, DisplayPerf, ToggleRenderer, ToggleModernLayerRenderer, ToggleModernLayerDebug
-  _(SDLK_k), _(SDLK_l), A(SDLK_RETURN), C(SDLK_r), S(SDLK_p), _(SDLK_p), _(SDLK_TAB), _(SDLK_t), N, N, _(SDLK_f), _(SDLK_r), S(SDLK_m), C(SDLK_m),
+  // ClearKeyLog, StopReplay, Fullscreen, Reset, Pause, PauseDimmed, Turbo, ReplayTurbo, WindowBigger, WindowSmaller, DisplayPerf, ToggleRenderer, ToggleModernLayerRenderer, ToggleModernLayerDebug, Screenshot
+  _(SDLK_k), _(SDLK_l), A(SDLK_RETURN), C(SDLK_r), S(SDLK_p), _(SDLK_p), _(SDLK_TAB), _(SDLK_t), N, N, _(SDLK_f), _(SDLK_r), S(SDLK_m), C(SDLK_m), _(SDLK_F12),
   // VolumeUp VolumeDown
   0, 0,
 };
@@ -60,7 +60,7 @@ static const KeyNameId kKeyNameId[] = {
   M(Controls), M(Load), M(Save), M(Replay), M(LoadRef), M(ReplayRef),
   S(CheatLife), S(CheatJump), S(ToggleWhichFrame),
   S(ClearKeyLog), S(StopReplay), S(Fullscreen), S(Reset),
-  S(Pause), S(PauseDimmed), S(Turbo), S(ReplayTurbo), S(WindowBigger), S(WindowSmaller), S(VolumeUp), S(VolumeDown), S(DisplayPerf), S(ToggleRenderer), S(ToggleModernLayerRenderer), S(ToggleModernLayerDebug),
+  S(Pause), S(PauseDimmed), S(Turbo), S(ReplayTurbo), S(WindowBigger), S(WindowSmaller), S(VolumeUp), S(VolumeDown), S(DisplayPerf), S(ToggleRenderer), S(ToggleModernLayerRenderer), S(ToggleModernLayerDebug), S(Screenshot),
 };
 #undef S
 #undef M
@@ -352,6 +352,15 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
       return ParseBool(value, &g_config.new_renderer);
     } else if (StringEqualsNoCase(key, "IgnoreAspectRatio")) {
       return ParseBool(value, &g_config.ignore_aspect_ratio);
+    } else if (StringEqualsNoCase(key, "Widescreen16x9")) {
+      bool enabled;
+      if (!ParseBool(value, &enabled))
+        return false;
+      g_config.extended_aspect_ratio = enabled ? 85 : 0;
+      return true;
+    } else if (StringEqualsNoCase(key, "ExtendedAspectRatio")) {
+      g_config.extended_aspect_ratio = (uint8)strtol(value, (char**)NULL, 10);
+      return true;
     } else if (StringEqualsNoCase(key, "Fullscreen")) {
       g_config.fullscreen = (uint8)strtol(value, (char**)NULL, 10);
       return true;
@@ -458,6 +467,8 @@ static bool ParseOneConfigFile(const char *filename, int depth) {
 
 void ParseConfigFile(const char *filename) {
   g_config.msuvolume = 100;  // default msu volume, 100%
+  g_config.fullscreen = 1;    // borderless desktop fullscreen
+  g_config.extended_aspect_ratio = 85;  // 426x240, close to 16:9, using the widened PPU output
 
   if (filename != NULL || !ParseOneConfigFile("sm.user.ini", 0)) {
     if (filename == NULL)

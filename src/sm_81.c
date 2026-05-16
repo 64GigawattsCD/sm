@@ -82,9 +82,7 @@ static void GrantSkipMenuLoadout(void) {
   samus_power_bombs = samus_max_power_bombs;
 }
 
-static void TrySkipFileSelectMenu(void) {
-  if (!g_skip_menu)
-    return;
+void StartDebugScenarioFromMainMenu(void) {
   g_skip_menu = false;
   selected_save_slot = 0;
   *(uint16 *)&g_sram[0x1FEC] = selected_save_slot;
@@ -104,6 +102,12 @@ static void TrySkipFileSelectMenu(void) {
     LoadMirrorOfExploredMapTiles();
     game_state = kGameState_6_LoadingGameData;
   }
+}
+
+static void TrySkipFileSelectMenu(void) {
+  if (!g_skip_menu)
+    return;
+  StartDebugScenarioFromMainMenu();
 }
 
 void SoftReset(void) {
@@ -1031,7 +1035,7 @@ void FileSelectMenu_33_FadeOutToTitle(void) {  // 0x8194D5
   DrawFileSelectSamusHelmets();
   HandleFadeOut();
   if ((reg_INIDISP & 0xF) == 0)
-    SoftReset();
+    RequestNativeMainMenuFromFileSelect();
 }
 
 void FileSelectMenu_5_FadeOutFromMain(void) {  // 0x8194EE
