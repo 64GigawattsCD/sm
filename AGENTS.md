@@ -4,7 +4,7 @@ This file is for future coding agents working in this repository.
 
 ## Working Preferences
 
-- After a clean rebuild succeeds, launch `sm.exe` unless the user says otherwise.
+- Do not launch `sm.exe` without asking the user first. If they do want a launch, place the game on monitor 2 for now.
 - Prefer preserving the original game feel where possible, while allowing intentional behavior changes for PC-native features.
 
 ## Current High-Level Goals
@@ -58,7 +58,8 @@ This file is for future coding agents working in this repository.
 - 16:9 follow-up work remains on camera and special-object parity: room-edge camera clamping should stop early enough for the widened viewport, and gunship/other large enemy visibility should respect the widened horizontal view instead of culling against 256-wide assumptions.
 - `Screenshot = F12` captures the current presented framebuffer to `debug_screenshots/manual_####.bmp` for renderer debugging.
 - The vanilla options screen now has a native volume slider overlay on its main page; left/right adjusts the current runtime app volume in 5% steps.
-- BlockBox integration is starting on branch `BlockBoxIntegration`: add BlockBox as a submodule, branch the submodule to `SuperMetroid`, and migrate Super Metroid room/level parsing there in phases, beginning with read-only room/header/state/level-data parsing before runtime mutation helpers.
+- BlockBox integration is active on branch `BlockBoxIntegration`: the `BlockBox/` submodule is branched to `SuperMetroid`, read-only Super Metroid room/header/state/level-data extraction now works there, startup bootstrap now emits a compact runtime manifest plus room/tileset/art indexes, tileset preview images, and assembled Samus frame exports, and the next phase is teaching room/graphics loading paths to consume those exported assets directly while preserving enough metadata to support future replacement graphics packs keyed against the dumped tileset/art manifests.
+- The PC-native main menu now has a prototype `Level Editor` browser path: it is intended to browse imported Super Metroid tilesets, show their exported preview image on hover, and leave room for a future real editor workflow, but its fallback tileset/runtime-package loading path is still being stabilized.
 
 ## Update Guidance
 

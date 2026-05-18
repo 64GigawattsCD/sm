@@ -24,6 +24,9 @@
     <ClCompile Include="main.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="blocksbox_runtime.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="sm_cpu_infra.c">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -138,6 +141,9 @@
     <ClCompile Include="platform\win32\volume_control.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="platform\win32\blocksbox_bootstrap.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="snes\apu.c">
       <Filter>Snes</Filter>
     </ClCompile>
@@ -184,6 +190,9 @@
   <ItemGroup>
     <ClInclude Include="sm_cpu_infra.h">
       <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="blocksbox_runtime.h">
+      <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="types.h">
       <Filter>Source Files</Filter>
@@ -259,6 +268,9 @@
     </ClInclude>
     <ClInclude Include="glsl_shader.h">
       <Filter>Shader</Filter>
+    </ClInclude>
+    <ClInclude Include="platform\win32\blocksbox_bootstrap.h">
+      <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\third_party\gl_core\gl_core_3_1.h">
       <Filter>Shader</Filter>

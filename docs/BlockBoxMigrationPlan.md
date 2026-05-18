@@ -83,7 +83,26 @@ Current submodule target: `BlockBox/` in this repo, sourced from `64GigawattsCD/
 
 ## Immediate next steps on this branch
 
-1. Add the BlockBox submodule once the exact repository URL is confirmed.
-2. Create the `SuperMetroid` branch inside the submodule.
-3. Implement read-only room/header/state parsing plus decompression in BlockBox.
-4. Add a small comparison harness in `sm` that dumps or asserts parsed room slices for a curated test room list.
+1. Stabilize the native `Level Editor` browser path in `sm`.
+   The main menu entry exists, and the browser is intended to list imported Super Metroid tilesets with hover previews, but the fallback tileset/runtime-package path still needs hardening until launches from the built executable reliably enumerate previews without crashing.
+2. Promote the runtime import index from bootstrap metadata to a first-class bridge API.
+   `sm` already loads bootstrap/runtime manifests and can resolve room/state to exported metadata; the next step is making those paths authoritative and resilient enough that runtime callers can trust them outside the repo-root development environment.
+3. Start moving read-only room/graphics consumers onto imported assets.
+   The highest-value early target remains read-only consumers such as streaming/tile fetch helpers and x-ray/collision lookups, with the ROM loader still available for parity checks.
+4. Preserve replacement-pack seams as the runtime bridge grows.
+   Tileset-scoped art IDs, palette metadata, per-tileset art manifests, tileset preview sheets, and assembled Samus frame exports are now in place; future runtime/editor work should keep those identifiers stable so replacement packs can override graphics cleanly.
+
+## Progress snapshot
+
+- `BlockBox/` is now an active submodule sourced from `64GigawattsCD/BlocksBox`, on branch `SuperMetroid`.
+- BlockBox can parse Super Metroid room headers, room states, decompressed level data, BTS, custom backgrounds, scroll metadata, palettes, and tilesets into normalized export data.
+- Bootstrap export now emits:
+  - `blocksbox-index.json`
+  - per-room JSON level files
+  - per-tileset palette JSON
+  - raw indexed tile art payloads
+  - runtime manifests/index TSVs for levels and tilesets
+  - tileset preview BMP sheets
+  - assembled Samus frame PNG exports plus metadata
+- `sm` now has a bootstrap bridge layer that can locate a Super Metroid ROM, invoke BlockBox on first run, and load the exported runtime manifest/indexes.
+- The native main menu now includes a `Level Editor` entry with an in-progress tileset browser UI intended to show imported tilesets on the left and preview imagery on the right.

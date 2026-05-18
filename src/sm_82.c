@@ -3,6 +3,7 @@
 #include "ida_types.h"
 #include "variables.h"
 #include "funcs.h"
+#include "blocksbox_runtime.h"
 #include "enemy_types.h"
 
 #define kDemoRoomData ((uint16*)RomFixedPtr(0x82876c))
@@ -3642,6 +3643,7 @@ void LoadRoomHeader(void) {  // 0x82DE6F
   down_scroller = RoomDefHeader->down_scroller_;
   door_list_pointer = RoomDefHeader->ptr_to_doorout;
   HandleRoomDefStateSelect(room_ptr);
+  BlocksBoxRuntime_OnRoomStateLoaded(room_ptr, roomdefroomstate_ptr);
   uint16 prod = Mult8x8(room_width_in_blocks, room_height_in_blocks);
   room_size_in_blocks = 2 * prod;
 }
