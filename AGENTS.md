@@ -4,7 +4,7 @@ This file is for future coding agents working in this repository.
 
 ## Working Preferences
 
-- After a clean rebuild succeeds, launch `sm.exe` unless the user says otherwise.
+- Do not launch `sm.exe` without asking the user first. If they do want a launch, place the game on monitor 2 for now.
 - Prefer preserving the original game feel where possible, while allowing intentional behavior changes for PC-native features.
 
 ## Current High-Level Goals
@@ -58,6 +58,12 @@ This file is for future coding agents working in this repository.
 - 16:9 follow-up work remains on camera and special-object parity: room-edge camera clamping should stop early enough for the widened viewport, and gunship/other large enemy visibility should respect the widened horizontal view instead of culling against 256-wide assumptions.
 - `Screenshot = F12` captures the current presented framebuffer to `debug_screenshots/manual_####.bmp` for renderer debugging.
 - The vanilla options screen now has a native volume slider overlay on its main page; left/right adjusts the current runtime app volume in 5% steps.
+- The native options overlay is being reorganized into Controls, Video, and Audio zones. Master volume is the only wired audio slider for now; BGM/SFX sliders are visible placeholders, and the video zone has a functional 16:9/4:3 selector that updates runtime render dimensions.
+- Native options currently persist to `sm.user.ini` by writing `!include sm.ini` plus overrides for `Widescreen16x9` and `MSUVolume`; add future native option values there as they become real controls.
+- BlockBox integration is active on branch `BlockBoxIntegration`: the `BlockBox/` submodule is branched to `SuperMetroid`, read-only Super Metroid room/header/state/level-data extraction now works there, startup bootstrap now emits a compact runtime manifest plus room/tileset/art indexes, tileset preview images, and assembled Samus frame exports, and the next phase is teaching room/graphics loading paths to consume those exported assets directly while preserving enough metadata to support future replacement graphics packs keyed against the dumped tileset/art manifests.
+- The PC-native main menu now has a prototype `Level Editor` browser path: it opens a BlocksBox pack list, currently with `Super Metroid`, then a pack page with `Level List` and `Tile Sets`; `Tile Sets` browses imported Super Metroid tilesets and shows exported preview images on hover. The first crash on selection was caused by BOM-prefixed TSV headers being parsed as data; TSV readers should continue to tolerate BOM/comment/header rows and missing fields.
+- BlocksBox tileset previews should render each tile once into the smallest near-square power-of-two grid that fits, up to 64x64 cells, leaving unused cells black instead of repeating tiles.
+- BlocksBox now exports level preview BMPs for each Super Metroid room state by drawing the optional background tile layer first and the foreground tile layer on top, using the room dimensions in 16x16 blocks and the state's selected tileset. Future level preview work should add optional BTS/collision and scroll-screen overlays.
 
 ## Update Guidance
 

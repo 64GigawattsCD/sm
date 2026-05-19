@@ -7,6 +7,7 @@
 #include <math.h>
 #include <SDL.h>
 #ifdef _WIN32
+#include "platform/win32/blocksbox_bootstrap.h"
 #include "platform/win32/volume_control.h"
 #include <direct.h>
 #else
@@ -28,6 +29,7 @@
 #include "util.h"
 #include "spc_player.h"
 #include "enemy_types.h"
+#include "blocksbox_runtime.h"
 
 #ifdef __SWITCH__
 #include "switch_impl.h"
@@ -37,11 +39,16 @@ static void playAudio(Snes *snes, SDL_AudioDeviceID device, int16_t *audioBuffer
 static void renderScreen(Snes *snes, SDL_Renderer *renderer, SDL_Texture *texture);
 static void SDLCALL AudioCallback(void *userdata, Uint8 *stream, int len);
 static void SwitchDirectory();
+static bool EnsureBlocksBoxImport(const char *preferred_rom_path, char *resolved_rom_path, size_t resolved_rom_path_size);
+static bool ResolveBlocksBoxPath(const char *workspace_relative_path, const char *exe_relative_path, char *dst, size_t dst_size);
 static void RenderNumber(uint8 *dst, size_t pitch, int n, uint8 big);
 static void OpenOneGamepad(int i);
 static int GetCurrentVolumePercent(void);
 static void SetCurrentVolumePercent(int new_volume);
 static void HandleVolumeAdjustment(int volume_adjustment);
+static void HandleAspectRatioSelection(int direction);
+static void ApplyRuntimeAspectRatio(void);
+static void SaveNativeOptionsConfig(void);
 static void HandleGamepadAxisInput(int gamepad_id, int axis, int value);
 static int RemapSdlButton(int button);
 static void HandleGamepadInput(int button, bool pressed);
@@ -50,14 +57,39 @@ static void HandleCommand(uint32 j, bool pressed);
 static uint16 GetInputBitForControlCommand(uint32 j);
 static bool IsDirectionalControlCommand(uint16 cmd);
 static bool IsGameplayMovementState(void);
-static int NormalizeGamepadButtonsForMenus(int inputs);
+static uint16 GetNativeMenuInputs(void);
 static void UpdateOpeningIntroSkipState(uint16 inputs);
 static void MaybeActivateNativeMainMenu(void);
+static void OpenNativeLevelEditor(uint16 held_inputs);
+static void CloseNativeLevelEditor(void);
+static void UnloadNativeLevelEditorPreview(void);
+static bool LoadNativeLevelEditorPreviewFromPath(const char *preview_path, int loaded_key);
+static bool LoadNativeLevelEditorPreview(int tileset_index);
+static bool LoadNativeLevelEditorLevelPreview(int level_index);
+static void UnloadNativeLevelEditorTilesets(void);
+static bool LoadNativeLevelEditorTilesetsFromManifest(const char *bootstrap_manifest_path);
+static bool EnsureNativeLevelEditorTilesetsLoaded(void);
+static int GetNativeLevelEditorTilesetCount(void);
+static int GetNativeLevelEditorTilesetAreaIndex(int index);
+static int GetNativeLevelEditorTilesetGraphicsSet(int index);
+static const char *GetNativeLevelEditorTilesetPreviewPath(int index);
+static void GetDirectoryNameFromPath(const char *path, char *dst, size_t dst_size);
+static void JoinPath2(char *dst, size_t dst_size, const char *a, const char *b);
+static char *ResolveIndexRelativePath(const char *index_path, const char *value);
+static const char *NextTsvFieldOrEmpty(char **fields);
+static void DrawScaledPreviewImage(uint8 *pixel_buffer, size_t pitch, int width, int height,
+                                   int dst_x, int dst_y, int dst_w, int dst_h,
+                                   const uint32 *src_pixels, int src_w, int src_h);
 static void UpdateNativeMainMenu(uint16 inputs);
 static uint16 MaskNativeMainMenuInputs(uint16 inputs);
+static void UpdateNativeLevelEditor(uint16 inputs);
+static uint16 MaskNativeLevelEditorInputs(uint16 inputs);
 static uint16 GetMenuAnalogDirectionalInputs(void);
 static void RenderNativeMainMenu(uint8 *pixel_buffer, size_t pitch, int width, int height);
-static void RenderOptionsVolumeOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height);
+static void RenderNativeLevelEditor(uint8 *pixel_buffer, size_t pitch, int width, int height);
+static void RenderNativeOptionsOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height);
+static void DrawNativeOptionsSlider(uint8 *pixel_buffer, size_t pitch, int width, int height,
+                                    int x, int y, int w, int scale, int value, bool selected, bool enabled);
 static void RenderBuildTimestampOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void ShowExitToMainMenuPrompt(void);
 static void UpdateExitToMainMenuPrompt(uint16 inputs);
@@ -71,6 +103,26 @@ static void CompositeModernFrontCustomLayer(uint8 *pixel_buffer, size_t pitch, i
 static void SaveDebugScreenshot(uint8 *pixel_buffer, size_t pitch, int width, int height, const char *prefix, int *counter);
 static void WidescreenDebugLog(const char *fmt, ...);
 void OpenGLRenderer_Create(struct RendererFuncs *funcs);
+
+typedef struct NativeLevelEditorPreview {
+  uint32 *pixels;
+  int width;
+  int height;
+  int loaded_index;
+} NativeLevelEditorPreview;
+
+typedef struct {
+  int area_number;
+  int graphics_number;
+  char *preview_file_path;
+} NativeLevelEditorTilesetEntry;
+
+typedef enum NativeLevelEditorPage {
+  kNativeLevelEditorPage_PackList,
+  kNativeLevelEditorPage_PackHome,
+  kNativeLevelEditorPage_LevelList,
+  kNativeLevelEditorPage_TileSets,
+} NativeLevelEditorPage;
 
 bool g_debug_flag;
 bool g_is_turbo;
@@ -99,6 +151,19 @@ static bool g_native_main_menu_return_from_options;
 static int g_native_main_menu_selection;
 static uint16 g_native_main_menu_prev_inputs;
 static bool g_native_main_menu_quit_requested;
+static int g_native_options_selection;
+static bool g_native_level_editor_active;
+static NativeLevelEditorPage g_native_level_editor_page;
+static int g_native_level_editor_pack_selection;
+static int g_native_level_editor_pack_menu_selection;
+static int g_native_level_editor_level_selection;
+static int g_native_level_editor_level_scroll;
+static int g_native_level_editor_selection;
+static int g_native_level_editor_scroll;
+static uint16 g_native_level_editor_prev_inputs;
+static NativeLevelEditorPreview g_native_level_editor_preview = { NULL, 0, 0, -2 };
+static NativeLevelEditorTilesetEntry *g_native_level_editor_tilesets;
+static int g_native_level_editor_tilesets_count;
 static bool g_exit_to_main_menu_prompt_active;
 static bool g_exit_to_main_menu_prompt_selection_yes;
 static uint16 g_exit_to_main_menu_prompt_prev_inputs;
@@ -114,6 +179,7 @@ enum {
   kDefaultSamples = 2048,
   kSnesNativeWidth = 256,
   kSnesNativeHeight = 240,
+  kPathBufferSize = 1024,
 };
 
 static const char kWindowTitle[] = "SuperMet";
@@ -152,6 +218,8 @@ enum {
   kInputBit_Right = 1 << 7,
   kInputBit_A = 1 << 8,
   kInputBit_X = 1 << 9,
+  kInputBit_PageUp = 1 << 10,
+  kInputBit_PageDown = 1 << 11,
 };
 
 static const int kNativeSpriteSizes[8][2] = {
@@ -169,11 +237,20 @@ static bool MenuHasConfirmInput(uint16 new_inputs) {
 }
 
 static bool MenuHasCancelInput(uint16 new_inputs) {
-  return (new_inputs & kMenuCancelInputs) != 0;
+  return (new_inputs & kMenuCancelInputs) != 0 && !MenuHasConfirmInput(new_inputs);
 }
 
+enum {
+  kNativeOptionsRow_Controls = 0,
+  kNativeOptionsRow_Aspect,
+  kNativeOptionsRow_Master,
+  kNativeOptionsRow_Bgm,
+  kNativeOptionsRow_Sfx,
+  kNativeOptionsRow_Count,
+};
+
 static uint16 GetMenuAnalogDirectionalInputs(void) {
-  const float deadzone = 0.45f;
+  const float deadzone = 0.675f;
   float abs_x = fabsf(g_left_stick_x);
   float abs_y = fabsf(g_left_stick_y);
   if (abs_x < deadzone && abs_y < deadzone)
@@ -183,7 +260,7 @@ static uint16 GetMenuAnalogDirectionalInputs(void) {
   return g_left_stick_x < 0.0f ? kInputBit_Left : kInputBit_Right;
 }
 
-static bool IsOptionsVolumeSliderVisible(void) {
+static bool IsNativeOptionsOverlayVisible(void) {
   return game_state == kGameState_2_GameOptionsMenu &&
          game_options_screen_index == 3 &&
          g_native_main_menu_return_from_options;
@@ -191,7 +268,7 @@ static bool IsOptionsVolumeSliderVisible(void) {
 
 static void UpdateOptionsVolumeSlider(uint16 menu_inputs) {
   static uint16 prev_inputs;
-  if (!IsOptionsVolumeSliderVisible()) {
+  if (!IsNativeOptionsOverlayVisible()) {
     prev_inputs = 0;
     return;
   }
@@ -199,10 +276,316 @@ static void UpdateOptionsVolumeSlider(uint16 menu_inputs) {
   uint16 new_inputs = menu_inputs & ~prev_inputs;
   prev_inputs = menu_inputs;
 
-  if (new_inputs & kInputBit_Left)
+  if (new_inputs & kInputBit_Up)
+    g_native_options_selection = (g_native_options_selection + kNativeOptionsRow_Count - 1) % kNativeOptionsRow_Count;
+  if (new_inputs & kInputBit_Down)
+    g_native_options_selection = (g_native_options_selection + 1) % kNativeOptionsRow_Count;
+  if (g_native_options_selection == kNativeOptionsRow_Master && (new_inputs & kInputBit_Left))
     HandleVolumeAdjustment(-1);
-  if (new_inputs & kInputBit_Right)
+  if (g_native_options_selection == kNativeOptionsRow_Master && (new_inputs & kInputBit_Right))
     HandleVolumeAdjustment(1);
+  if (g_native_options_selection == kNativeOptionsRow_Aspect && (new_inputs & (kInputBit_Left | kInputBit_Right)))
+    HandleAspectRatioSelection((new_inputs & kInputBit_Right) ? 1 : -1);
+}
+
+static void CopyPath(char *dst, size_t dst_size, const char *src) {
+  if (!dst_size)
+    return;
+  snprintf(dst, dst_size, "%s", src ? src : "");
+}
+
+static bool FileExists(const char *path) {
+  FILE *f;
+  if (!path || !path[0])
+    return false;
+  f = fopen(path, "rb");
+  if (!f)
+    return false;
+  fclose(f);
+  return true;
+}
+
+static bool ResolveBlocksBoxPath(const char *workspace_relative_path, const char *exe_relative_path, char *dst, size_t dst_size) {
+  if (!dst || dst_size == 0)
+    return false;
+  dst[0] = 0;
+  if (workspace_relative_path && workspace_relative_path[0] && FileExists(workspace_relative_path)) {
+    if (!BlocksBoxBootstrap_GetAbsolutePath(workspace_relative_path, dst, dst_size))
+      CopyPath(dst, dst_size, workspace_relative_path);
+    return true;
+  }
+  if (exe_relative_path && exe_relative_path[0] &&
+      BlocksBoxBootstrap_GetExecutableRelativePath(exe_relative_path, dst, dst_size) &&
+      FileExists(dst)) {
+    return true;
+  }
+  if (workspace_relative_path && workspace_relative_path[0]) {
+    if (!BlocksBoxBootstrap_GetAbsolutePath(workspace_relative_path, dst, dst_size))
+      CopyPath(dst, dst_size, workspace_relative_path);
+    return true;
+  }
+  if (exe_relative_path && exe_relative_path[0] &&
+      BlocksBoxBootstrap_GetExecutableRelativePath(exe_relative_path, dst, dst_size)) {
+    return true;
+  }
+  return false;
+}
+
+static bool ReadBootstrapManifestValue(const char *manifest_path, const char *key, char *dst, size_t dst_size) {
+  FILE *f = fopen(manifest_path, "rb");
+  if (!f)
+    return false;
+  char line[2048];
+  size_t key_len = strlen(key);
+  bool found = false;
+  while (fgets(line, sizeof(line), f)) {
+    if (strncmp(line, key, key_len) == 0 && line[key_len] == '=') {
+      char *value = line + key_len + 1;
+      size_t len = strcspn(value, "\r\n");
+      value[len] = 0;
+      CopyPath(dst, dst_size, value);
+      found = true;
+      break;
+    }
+  }
+  fclose(f);
+  return found;
+}
+
+static void GetDirectoryNameFromPath(const char *path, char *dst, size_t dst_size) {
+  size_t len;
+  if (!dst || dst_size == 0)
+    return;
+  dst[0] = 0;
+  if (!path || !path[0])
+    return;
+  snprintf(dst, dst_size, "%s", path);
+  len = strlen(dst);
+  while (len > 0) {
+    char c = dst[len - 1];
+    if (c == '\\' || c == '/') {
+      dst[len - 1] = 0;
+      return;
+    }
+    len--;
+  }
+  snprintf(dst, dst_size, ".");
+}
+
+static void JoinPath2(char *dst, size_t dst_size, const char *a, const char *b) {
+  if (!dst || dst_size == 0)
+    return;
+  if (!a || !a[0]) {
+    CopyPath(dst, dst_size, b);
+    return;
+  }
+  if (!b || !b[0]) {
+    CopyPath(dst, dst_size, a);
+    return;
+  }
+#ifdef _WIN32
+  snprintf(dst, dst_size, "%s\\%s", a, b);
+#else
+  snprintf(dst, dst_size, "%s/%s", a, b);
+#endif
+}
+
+static char *ResolveIndexRelativePath(const char *index_path, const char *value) {
+  char runtime_dir[kPathBufferSize];
+  char output_root[kPathBufferSize];
+  char combined[kPathBufferSize];
+  if (!value || !value[0])
+    return strdup("");
+  if ((strlen(value) >= 2 && value[1] == ':') || value[0] == '\\' || value[0] == '/')
+    return strdup(value);
+  GetDirectoryNameFromPath(index_path, runtime_dir, sizeof(runtime_dir));
+  GetDirectoryNameFromPath(runtime_dir, output_root, sizeof(output_root));
+  JoinPath2(combined, sizeof(combined), output_root, value);
+  return strdup(combined);
+}
+
+static const char *NextTsvFieldOrEmpty(char **fields) {
+  char *value = NextDelim(fields, '\t');
+  return value ? value : "";
+}
+
+static bool EnsureBlocksBoxImport(const char *preferred_rom_path, char *resolved_rom_path, size_t resolved_rom_path_size) {
+  char manifest_path[kPathBufferSize];
+  char output_dir[kPathBufferSize];
+  char manifest_rom_path[kPathBufferSize];
+  char runtime_manifest_path[kPathBufferSize];
+  ResolveBlocksBoxPath("build\\blocksbox_import\\bootstrap.manifest",
+                       "..\\blocksbox_import\\bootstrap.manifest",
+                       manifest_path, sizeof(manifest_path));
+  if (FileExists("build\\blocksbox_import\\bootstrap.manifest")) {
+    if (!BlocksBoxBootstrap_GetAbsolutePath("build\\blocksbox_import", output_dir, sizeof(output_dir)))
+      CopyPath(output_dir, sizeof(output_dir), "build\\blocksbox_import");
+  } else if (!BlocksBoxBootstrap_GetExecutableRelativePath("..\\blocksbox_import", output_dir, sizeof(output_dir))) {
+    if (!BlocksBoxBootstrap_GetAbsolutePath("build\\blocksbox_import", output_dir, sizeof(output_dir)))
+      CopyPath(output_dir, sizeof(output_dir), "build\\blocksbox_import");
+  }
+  bool has_manifest_rom = ReadBootstrapManifestValue(manifest_path, "rom_path", manifest_rom_path, sizeof(manifest_rom_path)) &&
+                          FileExists(manifest_rom_path);
+  bool has_runtime_manifest = ReadBootstrapManifestValue(manifest_path, "runtime_manifest_path", runtime_manifest_path, sizeof(runtime_manifest_path)) &&
+                              FileExists(runtime_manifest_path);
+  if (has_manifest_rom && has_runtime_manifest) {
+    if (!BlocksBoxBootstrap_GetAbsolutePath(manifest_rom_path, resolved_rom_path, resolved_rom_path_size))
+      CopyPath(resolved_rom_path, resolved_rom_path_size, manifest_rom_path);
+    return true;
+  }
+
+  char rom_path[kPathBufferSize];
+  if (has_manifest_rom) {
+    CopyPath(rom_path, sizeof(rom_path), manifest_rom_path);
+  } else if (!BlocksBoxBootstrap_ResolveRomPath(preferred_rom_path, rom_path, sizeof(rom_path))) {
+    return false;
+  }
+
+  if (!BlocksBoxBootstrap_RunImporter(rom_path, output_dir)) {
+    WidescreenDebugLog("blocksbox-import: importer failed for %s", rom_path);
+    CopyPath(resolved_rom_path, resolved_rom_path_size, rom_path);
+    return true;
+  }
+  WidescreenDebugLog("blocksbox-import: importer succeeded for %s", rom_path);
+
+  if (ReadBootstrapManifestValue(manifest_path, "rom_path", manifest_rom_path, sizeof(manifest_rom_path)) &&
+      FileExists(manifest_rom_path)) {
+    if (!BlocksBoxBootstrap_GetAbsolutePath(manifest_rom_path, resolved_rom_path, resolved_rom_path_size))
+      CopyPath(resolved_rom_path, resolved_rom_path_size, manifest_rom_path);
+  } else {
+    CopyPath(resolved_rom_path, resolved_rom_path_size, rom_path);
+  }
+  return true;
+}
+
+static void UnloadNativeLevelEditorTilesets(void) {
+  for (int i = 0; i < g_native_level_editor_tilesets_count; i++)
+    free(g_native_level_editor_tilesets[i].preview_file_path);
+  free(g_native_level_editor_tilesets);
+  g_native_level_editor_tilesets = NULL;
+  g_native_level_editor_tilesets_count = 0;
+}
+
+static bool LoadNativeLevelEditorTilesetsFromManifest(const char *bootstrap_manifest_path) {
+  char runtime_manifest_path[kPathBufferSize];
+  char tilesets_index_path[kPathBufferSize];
+  FILE *f;
+  char line_storage[4096];
+
+  UnloadNativeLevelEditorTilesets();
+  WidescreenDebugLog("level-editor: loading fallback tilesets from %s", bootstrap_manifest_path ? bootstrap_manifest_path : "(null)");
+  if (!ReadBootstrapManifestValue(bootstrap_manifest_path, "runtime_manifest_path",
+                                  runtime_manifest_path, sizeof(runtime_manifest_path)))
+    return false;
+  if (!ReadBootstrapManifestValue(runtime_manifest_path, "tilesets_index",
+                                  tilesets_index_path, sizeof(tilesets_index_path)))
+    return false;
+
+  f = fopen(tilesets_index_path, "rb");
+  if (!f)
+    return false;
+  while (fgets(line_storage, sizeof(line_storage), f) != NULL) {
+    char *fields;
+    char *line;
+    NativeLevelEditorTilesetEntry *entry;
+    char *comment;
+
+    line = line_storage;
+    comment = strchr(line, '#');
+    if (comment)
+      *comment = 0;
+    {
+      size_t len = strcspn(line, "\r\n");
+      line[len] = 0;
+    }
+    while (*line == ' ' || *line == '\t')
+      line++;
+    if ((uint8)line[0] == 0xef && (uint8)line[1] == 0xbb && (uint8)line[2] == 0xbf)
+      line += 3;
+    while (*line == ' ' || *line == '\t')
+      line++;
+    if (line[0] == '#')
+      continue;
+    if (line[0] == 0)
+      continue;
+    fields = line;
+    (void)NextTsvFieldOrEmpty(&fields);
+    entry = (NativeLevelEditorTilesetEntry *)realloc(
+        g_native_level_editor_tilesets,
+        sizeof(NativeLevelEditorTilesetEntry) * (g_native_level_editor_tilesets_count + 1));
+    if (!entry) {
+      fclose(f);
+      UnloadNativeLevelEditorTilesets();
+      return false;
+    }
+    g_native_level_editor_tilesets = entry;
+    entry = &g_native_level_editor_tilesets[g_native_level_editor_tilesets_count];
+    memset(entry, 0, sizeof(*entry));
+    entry->area_number = (int)strtol(NextTsvFieldOrEmpty(&fields), NULL, 10);
+    entry->graphics_number = (int)strtol(NextTsvFieldOrEmpty(&fields), NULL, 10);
+    (void)NextTsvFieldOrEmpty(&fields);
+    (void)NextTsvFieldOrEmpty(&fields);
+    (void)NextTsvFieldOrEmpty(&fields);
+    entry->preview_file_path = ResolveIndexRelativePath(tilesets_index_path, NextTsvFieldOrEmpty(&fields));
+    if (!entry->preview_file_path) {
+      fclose(f);
+      UnloadNativeLevelEditorTilesets();
+      return false;
+    }
+    if (!entry->preview_file_path[0]) {
+      free(entry->preview_file_path);
+      entry->preview_file_path = NULL;
+      continue;
+    }
+    g_native_level_editor_tilesets_count++;
+  }
+  fclose(f);
+  WidescreenDebugLog("level-editor: fallback tilesets loaded=%d", g_native_level_editor_tilesets_count);
+  return g_native_level_editor_tilesets_count > 0;
+}
+
+static bool EnsureNativeLevelEditorTilesetsLoaded(void) {
+  char bootstrap_manifest_path[kPathBufferSize];
+  if (BlocksBoxRuntime_GetTilesetCount() > 0)
+    return true;
+  if (g_native_level_editor_tilesets_count > 0)
+    return true;
+  ResolveBlocksBoxPath("build\\blocksbox_import\\bootstrap.manifest",
+                       "..\\blocksbox_import\\bootstrap.manifest",
+                       bootstrap_manifest_path, sizeof(bootstrap_manifest_path));
+  {
+    bool loaded = LoadNativeLevelEditorTilesetsFromManifest(bootstrap_manifest_path);
+    WidescreenDebugLog("level-editor: ensure fallback loaded=%d count=%d", loaded ? 1 : 0, g_native_level_editor_tilesets_count);
+    return loaded;
+  }
+}
+
+static int GetNativeLevelEditorTilesetCount(void) {
+  return BlocksBoxRuntime_GetTilesetCount() > 0 ? BlocksBoxRuntime_GetTilesetCount() : g_native_level_editor_tilesets_count;
+}
+
+static int GetNativeLevelEditorTilesetAreaIndex(int index) {
+  if (BlocksBoxRuntime_GetTilesetCount() > 0)
+    return BlocksBoxRuntime_GetTilesetAreaIndexByIndex(index);
+  if (index < 0 || index >= g_native_level_editor_tilesets_count)
+    return -1;
+  return g_native_level_editor_tilesets[index].area_number;
+}
+
+static int GetNativeLevelEditorTilesetGraphicsSet(int index) {
+  if (BlocksBoxRuntime_GetTilesetCount() > 0)
+    return BlocksBoxRuntime_GetTilesetGraphicsSetByIndex(index);
+  if (index < 0 || index >= g_native_level_editor_tilesets_count)
+    return -1;
+  return g_native_level_editor_tilesets[index].graphics_number;
+}
+
+static const char *GetNativeLevelEditorTilesetPreviewPath(int index) {
+  if (BlocksBoxRuntime_GetTilesetCount() > 0)
+    return BlocksBoxRuntime_GetTilesetPreviewPathByIndex(index);
+  if (index < 0 || index >= g_native_level_editor_tilesets_count)
+    return NULL;
+  return g_native_level_editor_tilesets[index].preview_file_path;
 }
 
 static void WidescreenDebugLog(const char *fmt, ...) {
@@ -350,7 +733,8 @@ static void DrawPpuFrameWithPerf(void) {
     RenderAnalogDebugOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
     RenderOpeningIntroSkipPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
     RenderNativeMainMenu(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
-    RenderOptionsVolumeOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+    RenderNativeLevelEditor(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+    RenderNativeOptionsOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
     RenderExitToMainMenuPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
     RenderBuildTimestampOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
   } else {
@@ -525,7 +909,47 @@ static bool SdlRenderer_Init(SDL_Window *window) {
 
 static void SdlRenderer_Destroy(void) {
   SDL_DestroyTexture(g_texture);
+  g_texture = NULL;
   SDL_DestroyRenderer(g_renderer);
+  g_renderer = NULL;
+}
+
+static bool SdlRenderer_RecreateTexture(void) {
+  int tex_mult;
+  SDL_Texture *texture;
+  if (!g_renderer)
+    return true;
+  tex_mult = PpuGetCurrentRenderScale(g_snes->ppu, g_ppu_render_flags);
+  texture = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
+                              g_snes_width * tex_mult, g_snes_height * tex_mult);
+  if (!texture) {
+    WidescreenDebugLog("SDL texture recreate failed: %s", SDL_GetError());
+    return false;
+  }
+  SDL_DestroyTexture(g_texture);
+  g_texture = texture;
+  WidescreenDebugLog("SDL texture recreate: base=%dx%d tex_mult=%d texture=%dx%d",
+                     g_snes_width, g_snes_height, tex_mult, g_snes_width * tex_mult, g_snes_height * tex_mult);
+  return true;
+}
+
+static void ApplyRuntimeAspectRatio(void) {
+  int old_width = g_snes_width;
+  int old_height = g_snes_height;
+  g_snes_width = g_config.extended_aspect_ratio * 2 + kSnesNativeWidth;
+  g_snes_height = kSnesNativeHeight;
+
+  if (old_width == g_snes_width && old_height == g_snes_height)
+    return;
+
+  WidescreenDebugLog("aspect apply: extended=%u size=%dx%d old=%dx%d",
+                     g_config.extended_aspect_ratio, g_snes_width, g_snes_height, old_width, old_height);
+  if (g_renderer && !g_config.ignore_aspect_ratio)
+    SDL_RenderSetLogicalSize(g_renderer, g_snes_width, g_snes_height);
+  if (g_renderer)
+    SdlRenderer_RecreateTexture();
+  if (g_window && g_config.fullscreen == 0 && g_config.window_width == 0 && g_config.window_height == 0)
+    SDL_SetWindowSize(g_window, g_current_window_scale * g_snes_width, g_current_window_scale * g_snes_height);
 }
 
 static void SdlRenderer_BeginDraw(int width, int height, uint8 **pixels, int *pitch) {
@@ -583,10 +1007,22 @@ int main(int argc, char** argv) {
     g_debug_flag = true;
     argc -= 1, argv += 1;
   }
+  char bootstrap_rom_path[kPathBufferSize];
+  char bootstrap_manifest_path[kPathBufferSize];
+  bool have_bootstrap_rom = EnsureBlocksBoxImport(argc >= 1 ? argv[0] : NULL,
+                                                  bootstrap_rom_path, sizeof(bootstrap_rom_path));
+  ResolveBlocksBoxPath("build\\blocksbox_import\\bootstrap.manifest",
+                       "..\\blocksbox_import\\bootstrap.manifest",
+                       bootstrap_manifest_path, sizeof(bootstrap_manifest_path));
+  if (BlocksBoxRuntime_LoadFromBootstrapManifest(bootstrap_manifest_path)) {
+    WidescreenDebugLog("blocksbox-runtime: loaded levels=%d tilesets=%d",
+                       BlocksBoxRuntime_GetLevelCount(), BlocksBoxRuntime_GetTilesetCount());
+  } else {
+    WidescreenDebugLog("blocksbox-runtime: unavailable");
+  }
   ParseConfigFile(config_file);
 
-  g_snes_width = (g_config.extended_aspect_ratio * 2 + kSnesNativeWidth);
-  g_snes_height = kSnesNativeHeight;// (g_config.extend_y ? 240 : 224);
+  ApplyRuntimeAspectRatio();
   g_ppu_render_flags = g_config.new_renderer * kPpuRenderFlags_NewRenderer |
     g_config.enhanced_mode7 * kPpuRenderFlags_4x4Mode7 |
     g_config.extend_y * kPpuRenderFlags_Height240 |
@@ -638,7 +1074,7 @@ int main(int argc, char** argv) {
   }
 
   // init snes, load rom
-  const char* filename = argv[0] ? argv[0] : "sm.smc";
+  const char* filename = have_bootstrap_rom ? bootstrap_rom_path : (argv[0] ? argv[0] : "sm.smc");
   Snes *snes = SnesInit(filename);
   WidescreenDebugLog("SnesInit: filename=%s snes=%p", filename, (void *)snes);
 
@@ -772,10 +1208,10 @@ int main(int argc, char** argv) {
       continue;
     }
 
-    // Gameplay uses analog-derived directions. Native menus should only read
-    // digital d-pad plus the configured logical SNES button mappings.
-    int menu_inputs = g_input1_state | NormalizeGamepadButtonsForMenus(g_gamepad_button_inputs) |
-                      g_gamepad_dpad_buttons | GetMenuAnalogDirectionalInputs();
+    // Gameplay uses analog-derived directions. Native menus use one
+    // physical/menu-action input path so face buttons behave consistently
+    // across overlays regardless of gameplay remaps.
+    int menu_inputs = GetNativeMenuInputs();
     int inputs = menu_inputs;
     uint8 analog_buttons = g_gamepad_analog_buttons;
     if (g_input1_state & 0xf0)
@@ -789,6 +1225,13 @@ int main(int argc, char** argv) {
       uint16 game_inputs = MaskExitToMainMenuPromptInputs((uint16)menu_inputs);
       UpdateExitToMainMenuPrompt((uint16)menu_inputs);
       is_replay = RtlRunFrame(game_inputs);
+      g_snes->disableRender = (g_turbo ^ (is_replay & g_replay_turbo)) && (frameCtr & (g_turbo ? 0xf : 0x7f)) != 0;
+    } else if (g_native_level_editor_active) {
+      uint16 game_inputs = MaskNativeLevelEditorInputs((uint16)menu_inputs);
+      UpdateNativeLevelEditor((uint16)menu_inputs);
+      is_replay = RtlRunFrame(game_inputs);
+      if (g_native_level_editor_active && game_state == kGameState_1_OpeningCinematic)
+        demo_timer = 900;
       g_snes->disableRender = (g_turbo ^ (is_replay & g_replay_turbo)) && (frameCtr & (g_turbo ? 0xf : 0x7f)) != 0;
     } else if (g_native_main_menu_active) {
       uint16 game_inputs = MaskNativeMainMenuInputs((uint16)menu_inputs);
@@ -995,7 +1438,7 @@ static void DrawGlyph5x7(uint8 *pixel_buffer, size_t pitch, int width, int heigh
     { '-', { 0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00 } },
     { '.', { 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x06 } },
     { '0', { 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E } },
-    { '1', { 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E } },
+    { '1', { 0x04, 0x06, 0x04, 0x04, 0x04, 0x04, 0x0E } },
     { '2', { 0x0E, 0x11, 0x10, 0x08, 0x04, 0x02, 0x1F } },
     { '3', { 0x1E, 0x10, 0x10, 0x0C, 0x10, 0x10, 0x1E } },
     { '4', { 0x08, 0x0C, 0x0A, 0x09, 0x1F, 0x08, 0x08 } },
@@ -1005,25 +1448,29 @@ static void DrawGlyph5x7(uint8 *pixel_buffer, size_t pitch, int width, int heigh
     { '8', { 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E } },
     { '9', { 0x0E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x0E } },
     { ':', { 0x00, 0x06, 0x06, 0x00, 0x06, 0x06, 0x00 } },
+    { '<', { 0x10, 0x08, 0x04, 0x02, 0x04, 0x08, 0x10 } },
     { '>', { 0x01, 0x02, 0x04, 0x08, 0x04, 0x02, 0x01 } },
     { 'A', { 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 } },
     { 'B', { 0x0F, 0x11, 0x11, 0x0F, 0x11, 0x11, 0x0F } },
     { 'C', { 0x0E, 0x11, 0x01, 0x01, 0x01, 0x11, 0x0E } },
-    { 'D', { 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E } },
+    { 'D', { 0x0F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0F } },
     { 'E', { 0x1F, 0x01, 0x01, 0x0F, 0x01, 0x01, 0x1F } },
     { 'F', { 0x1F, 0x01, 0x01, 0x0F, 0x01, 0x01, 0x01 } },
     { 'G', { 0x0E, 0x11, 0x01, 0x1D, 0x11, 0x11, 0x1E } },
     { 'H', { 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 } },
     { 'I', { 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E } },
+    { 'K', { 0x11, 0x09, 0x05, 0x03, 0x05, 0x09, 0x11 } },
     { 'M', { 0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11 } },
     { 'N', { 0x11, 0x13, 0x15, 0x19, 0x11, 0x11, 0x11 } },
     { 'L', { 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x1F } },
     { 'O', { 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E } },
     { 'P', { 0x0F, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x01 } },
-    { 'R', { 0x1E, 0x11, 0x11, 0x1E, 0x09, 0x11, 0x11 } },
+    { 'R', { 0x0F, 0x11, 0x11, 0x0F, 0x05, 0x09, 0x11 } },
     { 'S', { 0x1E, 0x01, 0x01, 0x0E, 0x10, 0x10, 0x0F } },
     { 'T', { 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 } },
     { 'U', { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E } },
+    { 'V', { 0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04 } },
+    { 'W', { 0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A } },
     { 'X', { 0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11 } },
     { 'Y', { 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04 } },
   };
@@ -1083,7 +1530,17 @@ static void OpenNativeMainMenuScene(void) {
   g_native_main_menu_active = false;
   g_native_main_menu_dismissed = false;
   g_native_main_menu_return_from_options = false;
+  g_native_level_editor_active = false;
+  g_native_level_editor_page = kNativeLevelEditorPage_PackList;
+  g_native_level_editor_pack_selection = 0;
+  g_native_level_editor_pack_menu_selection = 0;
+  g_native_level_editor_level_selection = 0;
+  g_native_level_editor_level_scroll = 0;
+  g_native_level_editor_selection = 0;
+  g_native_level_editor_scroll = 0;
+  g_native_level_editor_prev_inputs = 0;
   g_exit_to_main_menu_prompt_active = false;
+  UnloadNativeLevelEditorPreview();
   ClearTransientMenuInputs();
 }
 
@@ -1100,7 +1557,7 @@ static void MaybeActivateNativeMainMenu(void) {
     }
   }
 
-  if (!g_native_main_menu_dismissed && !g_native_main_menu_active &&
+  if (!g_native_main_menu_dismissed && !g_native_main_menu_active && !g_native_level_editor_active &&
       NativeMainMenuCanOpenOnTitleScene()) {
     g_native_main_menu_active = true;
     g_native_main_menu_return_from_options = false;
@@ -1113,8 +1570,111 @@ void RequestNativeMainMenuFromFileSelect(void) {
   OpenNativeMainMenuScene();
 }
 
+static void UnloadNativeLevelEditorPreview(void) {
+  free(g_native_level_editor_preview.pixels);
+  g_native_level_editor_preview.pixels = NULL;
+  g_native_level_editor_preview.width = 0;
+  g_native_level_editor_preview.height = 0;
+  g_native_level_editor_preview.loaded_index = -2;
+}
+
+static bool LoadNativeLevelEditorPreviewFromPath(const char *preview_path, int loaded_key) {
+  SDL_Surface *loaded_surface = NULL;
+  SDL_Surface *surface = NULL;
+  uint32 *pixels = NULL;
+
+  if (g_native_level_editor_preview.loaded_index == loaded_key && g_native_level_editor_preview.pixels != NULL)
+    return true;
+
+  UnloadNativeLevelEditorPreview();
+  g_native_level_editor_preview.loaded_index = loaded_key;
+  WidescreenDebugLog("level-editor: preview request key=%d path=%s", loaded_key, preview_path ? preview_path : "(null)");
+  if (!preview_path || !preview_path[0])
+    return false;
+
+  loaded_surface = SDL_LoadBMP(preview_path);
+  if (!loaded_surface) {
+    WidescreenDebugLog("level-editor: SDL_LoadBMP failed for %s", preview_path);
+    return false;
+  }
+  surface = SDL_ConvertSurfaceFormat(loaded_surface, SDL_PIXELFORMAT_ARGB8888, 0);
+  SDL_FreeSurface(loaded_surface);
+  loaded_surface = NULL;
+  if (!surface)
+    return false;
+
+  pixels = (uint32 *)malloc(sizeof(uint32) * surface->w * surface->h);
+  if (!pixels) {
+    SDL_FreeSurface(surface);
+    return false;
+  }
+
+  for (int y = 0; y < surface->h; y++) {
+    const uint32 *src_row = (const uint32 *)((const uint8 *)surface->pixels + y * surface->pitch);
+    uint32 *dst_row = pixels + y * surface->w;
+    for (int x = 0; x < surface->w; x++) {
+      Uint8 r, g, b, a;
+      SDL_GetRGBA(src_row[x], surface->format, &r, &g, &b, &a);
+      dst_row[x] = ((uint32)a << 24) | ((uint32)r << 16) | ((uint32)g << 8) | b;
+    }
+  }
+
+  g_native_level_editor_preview.pixels = pixels;
+  g_native_level_editor_preview.width = surface->w;
+  g_native_level_editor_preview.height = surface->h;
+  SDL_FreeSurface(surface);
+  return true;
+}
+
+static bool LoadNativeLevelEditorPreview(int tileset_index) {
+  return LoadNativeLevelEditorPreviewFromPath(GetNativeLevelEditorTilesetPreviewPath(tileset_index), tileset_index);
+}
+
+static bool LoadNativeLevelEditorLevelPreview(int level_index) {
+  return LoadNativeLevelEditorPreviewFromPath(BlocksBoxRuntime_GetLevelPreviewPathByIndex(level_index), -3 - level_index);
+}
+
+static void OpenNativeLevelEditorTileSets(void) {
+  EnsureNativeLevelEditorTilesetsLoaded();
+  int tileset_count = GetNativeLevelEditorTilesetCount();
+  g_native_level_editor_page = kNativeLevelEditorPage_TileSets;
+  g_native_level_editor_selection = IntMin(IntMax(g_native_level_editor_selection, 0), IntMax(tileset_count - 1, 0));
+  g_native_level_editor_scroll = IntMin(g_native_level_editor_scroll, g_native_level_editor_selection);
+  UnloadNativeLevelEditorPreview();
+  if (tileset_count > 0)
+    LoadNativeLevelEditorPreview(g_native_level_editor_selection);
+}
+
+static void OpenNativeLevelEditor(uint16 held_inputs) {
+  EnsureNativeLevelEditorTilesetsLoaded();
+  int tileset_count = GetNativeLevelEditorTilesetCount();
+  WidescreenDebugLog("level-editor: open count=%d runtime_count=%d fallback_count=%d",
+                     tileset_count, BlocksBoxRuntime_GetTilesetCount(), g_native_level_editor_tilesets_count);
+  g_native_main_menu_active = false;
+  g_native_level_editor_active = true;
+  g_native_level_editor_page = kNativeLevelEditorPage_PackList;
+  g_native_level_editor_pack_selection = 0;
+  g_native_level_editor_pack_menu_selection = 0;
+  g_native_level_editor_level_selection = 0;
+  g_native_level_editor_level_scroll = 0;
+  g_native_level_editor_selection = IntMin(IntMax(g_native_level_editor_selection, 0), IntMax(tileset_count - 1, 0));
+  g_native_level_editor_scroll = IntMin(g_native_level_editor_scroll, g_native_level_editor_selection);
+  g_native_level_editor_prev_inputs = held_inputs;
+  UnloadNativeLevelEditorPreview();
+  demo_timer = 900;
+}
+
+static void CloseNativeLevelEditor(void) {
+  g_native_level_editor_active = false;
+  g_native_main_menu_active = true;
+  g_native_main_menu_prev_inputs = 0;
+  g_native_level_editor_prev_inputs = 0;
+  UnloadNativeLevelEditorPreview();
+  ClearTransientMenuInputs();
+}
+
 static void UpdateNativeMainMenu(uint16 inputs) {
-  enum { kNativeMainMenuItemCount = 4 };
+  enum { kNativeMainMenuItemCount = 5 };
   uint16 new_inputs = inputs & ~g_native_main_menu_prev_inputs;
   g_native_main_menu_prev_inputs = inputs;
 
@@ -1144,8 +1704,10 @@ static void UpdateNativeMainMenu(uint16 inputs) {
     menu_index = 0;
     screen_fade_delay = 0;
     screen_fade_counter = 0;
+  } else if (g_native_main_menu_selection == 2) {
+    OpenNativeLevelEditor(inputs);
   } else {
-    if (g_native_main_menu_selection == 3) {
+    if (g_native_main_menu_selection == 4) {
       g_native_main_menu_quit_requested = true;
       return;
     }
@@ -1156,7 +1718,111 @@ static void UpdateNativeMainMenu(uint16 inputs) {
 
 static uint16 MaskNativeMainMenuInputs(uint16 inputs) {
   return inputs & ~(uint16)(kInputBit_Up | kInputBit_Down | kInputBit_Left | kInputBit_Right |
-                            kInputBit_A | kInputBit_B | kInputBit_Start);
+                            kInputBit_A | kInputBit_B | kInputBit_Start |
+                            kInputBit_PageUp | kInputBit_PageDown);
+}
+
+static void UpdateNativeLevelEditor(uint16 inputs) {
+  enum { kVisibleItems = 10 };
+  int tileset_count;
+  int level_count;
+  EnsureNativeLevelEditorTilesetsLoaded();
+  tileset_count = GetNativeLevelEditorTilesetCount();
+  level_count = BlocksBoxRuntime_GetLevelCount();
+  uint16 new_inputs = inputs & ~g_native_level_editor_prev_inputs;
+  g_native_level_editor_prev_inputs = inputs;
+
+  if (MenuHasCancelInput(new_inputs) || (new_inputs & kInputBit_Select)) {
+    if (g_native_level_editor_page == kNativeLevelEditorPage_TileSets ||
+        g_native_level_editor_page == kNativeLevelEditorPage_LevelList) {
+      g_native_level_editor_page = kNativeLevelEditorPage_PackHome;
+      g_native_level_editor_prev_inputs = inputs;
+      UnloadNativeLevelEditorPreview();
+      return;
+    }
+    if (g_native_level_editor_page == kNativeLevelEditorPage_PackHome) {
+      g_native_level_editor_page = kNativeLevelEditorPage_PackList;
+      g_native_level_editor_prev_inputs = inputs;
+      return;
+    }
+    CloseNativeLevelEditor();
+    return;
+  }
+
+  if (g_native_level_editor_page == kNativeLevelEditorPage_PackList) {
+    if (MenuHasConfirmInput(new_inputs)) {
+      g_native_level_editor_page = kNativeLevelEditorPage_PackHome;
+      g_native_level_editor_pack_menu_selection = 0;
+      g_native_level_editor_prev_inputs = inputs;
+    }
+    return;
+  }
+
+  if (g_native_level_editor_page == kNativeLevelEditorPage_PackHome) {
+    if (new_inputs & (kInputBit_Up | kInputBit_Down)) {
+      g_native_level_editor_pack_menu_selection ^= 1;
+      return;
+    }
+    if (MenuHasConfirmInput(new_inputs)) {
+      if (g_native_level_editor_pack_menu_selection == 0) {
+        g_native_level_editor_page = kNativeLevelEditorPage_LevelList;
+        g_native_level_editor_level_selection = IntMin(g_native_level_editor_level_selection, IntMax(level_count - 1, 0));
+        g_native_level_editor_level_scroll = IntMin(g_native_level_editor_level_scroll, g_native_level_editor_level_selection);
+        UnloadNativeLevelEditorPreview();
+        if (level_count > 0)
+          LoadNativeLevelEditorLevelPreview(g_native_level_editor_level_selection);
+      } else {
+        OpenNativeLevelEditorTileSets();
+      }
+      g_native_level_editor_prev_inputs = inputs;
+    }
+    return;
+  }
+
+  if (g_native_level_editor_page == kNativeLevelEditorPage_LevelList) {
+    if (level_count <= 0)
+      return;
+    if (new_inputs & (kInputBit_Up | kInputBit_PageUp)) {
+      int delta = (new_inputs & kInputBit_PageUp) ? 10 : 1;
+      g_native_level_editor_level_selection = IntMax(g_native_level_editor_level_selection - delta, 0);
+    } else if (new_inputs & (kInputBit_Down | kInputBit_PageDown)) {
+      int delta = (new_inputs & kInputBit_PageDown) ? 10 : 1;
+      g_native_level_editor_level_selection = IntMin(g_native_level_editor_level_selection + delta, level_count - 1);
+    } else {
+      return;
+    }
+    if (g_native_level_editor_level_selection < g_native_level_editor_level_scroll)
+      g_native_level_editor_level_scroll = g_native_level_editor_level_selection;
+    if (g_native_level_editor_level_selection >= g_native_level_editor_level_scroll + kVisibleItems)
+      g_native_level_editor_level_scroll = g_native_level_editor_level_selection - kVisibleItems + 1;
+    LoadNativeLevelEditorLevelPreview(g_native_level_editor_level_selection);
+    return;
+  }
+
+  if (tileset_count <= 0)
+    return;
+
+  if (new_inputs & (kInputBit_Up | kInputBit_PageUp)) {
+    int delta = (new_inputs & kInputBit_PageUp) ? 10 : 1;
+    g_native_level_editor_selection = IntMax(g_native_level_editor_selection - delta, 0);
+  } else if (new_inputs & (kInputBit_Down | kInputBit_PageDown)) {
+    int delta = (new_inputs & kInputBit_PageDown) ? 10 : 1;
+    g_native_level_editor_selection = IntMin(g_native_level_editor_selection + delta, tileset_count - 1);
+  } else {
+    return;
+  }
+
+  if (g_native_level_editor_selection < g_native_level_editor_scroll)
+    g_native_level_editor_scroll = g_native_level_editor_selection;
+  if (g_native_level_editor_selection >= g_native_level_editor_scroll + kVisibleItems)
+    g_native_level_editor_scroll = g_native_level_editor_selection - kVisibleItems + 1;
+  LoadNativeLevelEditorPreview(g_native_level_editor_selection);
+}
+
+static uint16 MaskNativeLevelEditorInputs(uint16 inputs) {
+  return inputs & ~(uint16)(kInputBit_Up | kInputBit_Down | kInputBit_Left | kInputBit_Right |
+                            kInputBit_A | kInputBit_B | kInputBit_Start | kInputBit_Select |
+                            kInputBit_PageUp | kInputBit_PageDown);
 }
 
 static void ShowExitToMainMenuPrompt(void) {
@@ -1194,7 +1860,8 @@ static void UpdateExitToMainMenuPrompt(uint16 inputs) {
 
 static uint16 MaskExitToMainMenuPromptInputs(uint16 inputs) {
   return inputs & ~(uint16)(kInputBit_Up | kInputBit_Down | kInputBit_Left | kInputBit_Right |
-                            kInputBit_A | kInputBit_B | kInputBit_Start | kInputBit_Select);
+                            kInputBit_A | kInputBit_B | kInputBit_Start | kInputBit_Select |
+                            kInputBit_PageUp | kInputBit_PageDown);
 }
 
 static void RenderExitToMainMenuPrompt(uint8 *pixel_buffer, size_t pitch, int width, int height) {
@@ -1222,14 +1889,39 @@ static void RenderExitToMainMenuPrompt(uint8 *pixel_buffer, size_t pitch, int wi
               !g_exit_to_main_menu_prompt_selection_yes ? "> NO" : "  NO", scale, no_color);
 }
 
+static void DrawScaledPreviewImage(uint8 *pixel_buffer, size_t pitch, int width, int height,
+                                   int dst_x, int dst_y, int dst_w, int dst_h,
+                                   const uint32 *src_pixels, int src_w, int src_h) {
+  if (!src_pixels || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0)
+    return;
+  for (int y = 0; y < dst_h; y++) {
+    int py = dst_y + y;
+    if ((unsigned)py >= (unsigned)height)
+      continue;
+    int src_y = (y * src_h) / dst_h;
+    uint32 *dst_row = (uint32 *)(pixel_buffer + (size_t)py * pitch);
+    const uint32 *src_row = src_pixels + src_y * src_w;
+    for (int x = 0; x < dst_w; x++) {
+      int px = dst_x + x;
+      if ((unsigned)px >= (unsigned)width)
+        continue;
+      uint32 color = src_row[(x * src_w) / dst_w];
+      uint32 alpha = color >> 24;
+      if (alpha == 0)
+        continue;
+      dst_row[px] = color;
+    }
+  }
+}
+
 static void RenderNativeMainMenu(uint8 *pixel_buffer, size_t pitch, int width, int height) {
-  static const char *const kMenuItems[4] = { "PLAY", "OPTIONS", "TEST", "EXIT" };
+  static const char *const kMenuItems[5] = { "PLAY", "OPTIONS", "LEVEL EDITOR", "TEST", "EXIT" };
   if (!g_native_main_menu_active)
     return;
 
   const int scale = IntMax(1, height / 240);
-  const int panel_w = 108 * scale;
-  const int panel_h = 108 * scale;
+  const int panel_w = 132 * scale;
+  const int panel_h = 126 * scale;
   const int panel_x = (width - panel_w) / 2;
   const int panel_y = (height - panel_h) / 2 + 28 * scale;
   const int title_x = panel_x + 18 * scale;
@@ -1253,19 +1945,209 @@ static void RenderNativeMainMenu(uint8 *pixel_buffer, size_t pitch, int width, i
   DrawRectOutline(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, IntMax(1, scale), border_color);
   DrawText5x7(pixel_buffer, pitch, width, height, title_x, title_y, "MAIN MENU", scale, 0xFFFFFF);
 
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 5; i++) {
     int y = first_item_y + i * item_gap;
     uint32 text_color = i == g_native_main_menu_selection ? 0x8FEA7D : 0xC5D0D8;
     if (i == g_native_main_menu_selection) {
       DrawText5x7(pixel_buffer, pitch, width, height, item_x - 16 * scale, y, ">", scale, 0x8FEA7D);
       if (g_modern_layer_renderer)
-        FillRect(pixel_buffer, pitch, width, height, item_x - 5 * scale, y + 9 * scale, 55 * scale, IntMax(1, scale), 0x8c2E6F58);
+        FillRect(pixel_buffer, pitch, width, height, item_x - 5 * scale, y + 9 * scale, 84 * scale, IntMax(1, scale), 0x8c2E6F58);
       else
-        FillRectAlpha(pixel_buffer, pitch, width, height, item_x - 5 * scale, y + 9 * scale, 55 * scale, IntMax(1, scale), 0x2E6F58, 140);
+        FillRectAlpha(pixel_buffer, pitch, width, height, item_x - 5 * scale, y + 9 * scale, 84 * scale, IntMax(1, scale), 0x2E6F58, 140);
     }
     DrawText5x7(pixel_buffer, pitch, width, height, item_x, y, kMenuItems[i], scale, text_color);
   }
 
+}
+
+static void RenderNativeLevelEditor(uint8 *pixel_buffer, size_t pitch, int width, int height) {
+  char label[64];
+  const char *game_id;
+  int tileset_count;
+  int scale;
+  int margin;
+  int panel_y;
+  int panel_h;
+  int left_panel_x;
+  int left_panel_w;
+  int right_panel_x;
+  int right_panel_w;
+  int row_h;
+  int list_start_y;
+  int preview_box_x;
+  int preview_box_y;
+  int preview_box_w;
+  int preview_box_h;
+  int preview_draw_size;
+
+  if (!g_native_level_editor_active)
+    return;
+
+  scale = IntMax(1, height / 240);
+  margin = 16 * scale;
+  panel_y = 28 * scale;
+  panel_h = height - panel_y - 24 * scale;
+  left_panel_x = margin;
+  left_panel_w = 158 * scale;
+  right_panel_x = left_panel_x + left_panel_w + 12 * scale;
+  right_panel_w = width - right_panel_x - margin;
+  row_h = 14 * scale;
+  list_start_y = panel_y + 34 * scale;
+  preview_box_x = right_panel_x + 10 * scale;
+  preview_box_y = panel_y + 34 * scale;
+  preview_box_w = right_panel_w - 20 * scale;
+  preview_box_h = panel_h - 46 * scale;
+  preview_draw_size = IntMin(preview_box_w - 10 * scale, preview_box_h - 10 * scale);
+  tileset_count = BlocksBoxRuntime_GetTilesetCount();
+  EnsureNativeLevelEditorTilesetsLoaded();
+  tileset_count = GetNativeLevelEditorTilesetCount();
+  game_id = BlocksBoxRuntime_GetGameId();
+
+  FillRectAlpha(pixel_buffer, pitch, width, height, left_panel_x, panel_y, left_panel_w, panel_h, 0x101722, 168);
+  FillRectAlpha(pixel_buffer, pitch, width, height, right_panel_x, panel_y, right_panel_w, panel_h, 0x101722, 168);
+  DrawRectOutline(pixel_buffer, pitch, width, height, left_panel_x, panel_y, left_panel_w, panel_h, IntMax(1, scale), 0x8FEA7D);
+  DrawRectOutline(pixel_buffer, pitch, width, height, right_panel_x, panel_y, right_panel_w, panel_h, IntMax(1, scale), 0x8FEA7D);
+
+  if (g_native_level_editor_page == kNativeLevelEditorPage_PackList) {
+    DrawText5x7(pixel_buffer, pitch, width, height, left_panel_x + 10 * scale, panel_y + 10 * scale, "BLOCKSBOX PACKS", scale, 0xFFFFFF);
+    DrawText5x7(pixel_buffer, pitch, width, height, right_panel_x + 10 * scale, panel_y + 10 * scale, "PACK PREVIEW", scale, 0xFFFFFF);
+    FillRectAlpha(pixel_buffer, pitch, width, height,
+                  left_panel_x + 7 * scale, list_start_y - 1 * scale,
+                  left_panel_w - 14 * scale, 11 * scale, 0x2E6F58, 120);
+    DrawText5x7(pixel_buffer, pitch, width, height, left_panel_x + 10 * scale, list_start_y, ">", scale, 0x8FEA7D);
+    DrawText5x7(pixel_buffer, pitch, width, height, left_panel_x + 22 * scale, list_start_y, "SUPER METROID", scale, 0x8FEA7D);
+    DrawText5x7(pixel_buffer, pitch, width, height, right_panel_x + 10 * scale, preview_box_y, "SUPER METROID", scale, 0xFFFFFF);
+    snprintf(label, sizeof(label), "LEVELS %03d", BlocksBoxRuntime_GetLevelCount());
+    DrawText5x7(pixel_buffer, pitch, width, height, right_panel_x + 10 * scale, preview_box_y + 16 * scale, label, scale, 0xC5D0D8);
+    snprintf(label, sizeof(label), "TILE SETS %02d", tileset_count);
+    DrawText5x7(pixel_buffer, pitch, width, height, right_panel_x + 10 * scale, preview_box_y + 30 * scale, label, scale, 0xC5D0D8);
+    DrawText5x7(pixel_buffer, pitch, width, height, right_panel_x + 10 * scale, panel_y + panel_h - 14 * scale,
+                "B BACK", scale, 0xC5D0D8);
+    return;
+  }
+
+  if (g_native_level_editor_page == kNativeLevelEditorPage_PackHome) {
+    static const char *const kPackItems[2] = { "LEVEL LIST", "TILE SETS" };
+    DrawText5x7(pixel_buffer, pitch, width, height, left_panel_x + 10 * scale, panel_y + 10 * scale, "SUPER METROID", scale, 0xFFFFFF);
+    DrawText5x7(pixel_buffer, pitch, width, height, right_panel_x + 10 * scale, panel_y + 10 * scale, "PACK CONTENTS", scale, 0xFFFFFF);
+    for (int i = 0; i < 2; i++) {
+      int row_y = list_start_y + i * row_h;
+      uint32 text_color = i == g_native_level_editor_pack_menu_selection ? 0x8FEA7D : 0xC5D0D8;
+      if (i == g_native_level_editor_pack_menu_selection) {
+        FillRectAlpha(pixel_buffer, pitch, width, height,
+                      left_panel_x + 7 * scale, row_y - 1 * scale,
+                      left_panel_w - 14 * scale, 11 * scale, 0x2E6F58, 120);
+        DrawText5x7(pixel_buffer, pitch, width, height, left_panel_x + 10 * scale, row_y, ">", scale, 0x8FEA7D);
+      }
+      DrawText5x7(pixel_buffer, pitch, width, height, left_panel_x + 22 * scale, row_y, kPackItems[i], scale, text_color);
+    }
+    snprintf(label, sizeof(label), "LEVELS %03d", BlocksBoxRuntime_GetLevelCount());
+    DrawText5x7(pixel_buffer, pitch, width, height, right_panel_x + 10 * scale, preview_box_y, label, scale, 0xC5D0D8);
+    snprintf(label, sizeof(label), "TILE SETS %02d", tileset_count);
+    DrawText5x7(pixel_buffer, pitch, width, height, right_panel_x + 10 * scale, preview_box_y + 14 * scale, label, scale, 0xC5D0D8);
+    DrawText5x7(pixel_buffer, pitch, width, height, right_panel_x + 10 * scale, panel_y + panel_h - 14 * scale,
+                "B BACK", scale, 0xC5D0D8);
+    return;
+  }
+
+  if (g_native_level_editor_page == kNativeLevelEditorPage_LevelList) {
+    int level_count = BlocksBoxRuntime_GetLevelCount();
+    DrawText5x7(pixel_buffer, pitch, width, height, left_panel_x + 10 * scale, panel_y + 10 * scale, "LEVEL LIST", scale, 0xFFFFFF);
+    DrawText5x7(pixel_buffer, pitch, width, height, right_panel_x + 10 * scale, panel_y + 10 * scale, "LEVEL DETAILS", scale, 0xFFFFFF);
+    if (level_count <= 0) {
+      DrawText5x7(pixel_buffer, pitch, width, height, left_panel_x + 10 * scale, list_start_y, "NO LEVELS FOUND", scale, 0xFFFFFF);
+    } else {
+      for (int visible_index = 0; visible_index < 10; visible_index++) {
+        int level_index = g_native_level_editor_level_scroll + visible_index;
+        int row_y = list_start_y + visible_index * row_h;
+        uint32 text_color;
+        if (level_index >= level_count)
+          break;
+        snprintf(label, sizeof(label), "LEVEL %03d", level_index + 1);
+        text_color = level_index == g_native_level_editor_level_selection ? 0x8FEA7D : 0xC5D0D8;
+        if (level_index == g_native_level_editor_level_selection) {
+          FillRectAlpha(pixel_buffer, pitch, width, height,
+                        left_panel_x + 7 * scale, row_y - 1 * scale,
+                        left_panel_w - 14 * scale, 11 * scale, 0x2E6F58, 120);
+          DrawText5x7(pixel_buffer, pitch, width, height, left_panel_x + 10 * scale, row_y, ">", scale, 0x8FEA7D);
+        }
+        DrawText5x7(pixel_buffer, pitch, width, height, left_panel_x + 22 * scale, row_y, label, scale, text_color);
+      }
+      snprintf(label, sizeof(label), "%d/%d", g_native_level_editor_level_selection + 1, level_count);
+      DrawText5x7(pixel_buffer, pitch, width, height, left_panel_x + 10 * scale, panel_y + panel_h - 14 * scale, label, scale, 0xC5D0D8);
+      DrawRectOutline(pixel_buffer, pitch, width, height, preview_box_x, preview_box_y, preview_box_w, preview_box_h, IntMax(1, scale), 0x4F6B5C);
+      if (g_native_level_editor_preview.pixels != NULL) {
+        int max_w = preview_box_w - 10 * scale;
+        int max_h = preview_box_h - 10 * scale;
+        int draw_w = max_w;
+        int draw_h = (g_native_level_editor_preview.height * draw_w) / IntMax(1, g_native_level_editor_preview.width);
+        if (draw_h > max_h) {
+          draw_h = max_h;
+          draw_w = (g_native_level_editor_preview.width * draw_h) / IntMax(1, g_native_level_editor_preview.height);
+        }
+        DrawScaledPreviewImage(pixel_buffer, pitch, width, height,
+                               preview_box_x + (preview_box_w - draw_w) / 2,
+                               preview_box_y + (preview_box_h - draw_h) / 2,
+                               draw_w, draw_h,
+                               g_native_level_editor_preview.pixels,
+                               g_native_level_editor_preview.width, g_native_level_editor_preview.height);
+      } else {
+        DrawText5x7(pixel_buffer, pitch, width, height, preview_box_x + 14 * scale, preview_box_y + 16 * scale, "PREVIEW UNAVAILABLE", scale, 0xFFFFFF);
+      }
+    }
+    DrawText5x7(pixel_buffer, pitch, width, height, right_panel_x + 10 * scale, panel_y + panel_h - 14 * scale,
+                "B BACK", scale, 0xC5D0D8);
+    return;
+  }
+
+  DrawText5x7(pixel_buffer, pitch, width, height, left_panel_x + 10 * scale, panel_y + 10 * scale, "TILE SETS", scale, 0xFFFFFF);
+  DrawText5x7(pixel_buffer, pitch, width, height, right_panel_x + 10 * scale, panel_y + 10 * scale, "TILESET PREVIEW", scale, 0xFFFFFF);
+  DrawText5x7(pixel_buffer, pitch, width, height, left_panel_x + 10 * scale, panel_y + 20 * scale,
+              (game_id && strcmp(game_id, "super_metroid") == 0) ? "SUPER METROID" : "BLOCKSBOX", scale, 0xC5D0D8);
+
+  if (tileset_count <= 0) {
+    DrawText5x7(pixel_buffer, pitch, width, height, left_panel_x + 10 * scale, list_start_y, "NO TILESETS FOUND", scale, 0xFFFFFF);
+    DrawText5x7(pixel_buffer, pitch, width, height, right_panel_x + 18 * scale, preview_box_y + 18 * scale, "IMPORT REQUIRED", scale, 0xFFFFFF);
+    return;
+  }
+
+  for (int visible_index = 0; visible_index < 10; visible_index++) {
+    int tileset_index = g_native_level_editor_scroll + visible_index;
+    int row_y = list_start_y + visible_index * row_h;
+    uint32 text_color;
+    if (tileset_index >= tileset_count)
+      break;
+    snprintf(label, sizeof(label), "AREA %02d SET %02d",
+             GetNativeLevelEditorTilesetAreaIndex(tileset_index),
+             GetNativeLevelEditorTilesetGraphicsSet(tileset_index));
+    text_color = tileset_index == g_native_level_editor_selection ? 0x8FEA7D : 0xC5D0D8;
+    if (tileset_index == g_native_level_editor_selection) {
+      FillRectAlpha(pixel_buffer, pitch, width, height,
+                    left_panel_x + 7 * scale, row_y - 1 * scale,
+                    left_panel_w - 14 * scale, 11 * scale, 0x2E6F58, 120);
+      DrawText5x7(pixel_buffer, pitch, width, height, left_panel_x + 10 * scale, row_y, ">", scale, 0x8FEA7D);
+    }
+    DrawText5x7(pixel_buffer, pitch, width, height, left_panel_x + 22 * scale, row_y, label, scale, text_color);
+  }
+
+  DrawRectOutline(pixel_buffer, pitch, width, height, preview_box_x, preview_box_y, preview_box_w, preview_box_h, IntMax(1, scale), 0x4F6B5C);
+  if (preview_draw_size > 0 && g_native_level_editor_preview.pixels != NULL) {
+    int preview_draw_x = preview_box_x + (preview_box_w - preview_draw_size) / 2;
+    int preview_draw_y = preview_box_y + (preview_box_h - preview_draw_size) / 2;
+    DrawScaledPreviewImage(pixel_buffer, pitch, width, height,
+                           preview_draw_x, preview_draw_y, preview_draw_size, preview_draw_size,
+                           g_native_level_editor_preview.pixels,
+                           g_native_level_editor_preview.width, g_native_level_editor_preview.height);
+  } else {
+    DrawText5x7(pixel_buffer, pitch, width, height, preview_box_x + 14 * scale, preview_box_y + 16 * scale, "PREVIEW UNAVAILABLE", scale, 0xFFFFFF);
+  }
+
+  if (tileset_count > 10) {
+    snprintf(label, sizeof(label), "%d/%d", g_native_level_editor_selection + 1, tileset_count);
+    DrawText5x7(pixel_buffer, pitch, width, height, left_panel_x + 10 * scale, panel_y + panel_h - 14 * scale, label, scale, 0xC5D0D8);
+  }
+  DrawText5x7(pixel_buffer, pitch, width, height, right_panel_x + 10 * scale, panel_y + panel_h - 14 * scale,
+              "B BACK", scale, 0xC5D0D8);
 }
 
 static int GetCurrentVolumePercent(void) {
@@ -1287,34 +2169,102 @@ static void SetCurrentVolumePercent(int new_volume) {
   g_config.msuvolume = (uint8)new_volume;
 }
 
-static void RenderOptionsVolumeOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height) {
-  if (!IsOptionsVolumeSliderVisible())
+static void SaveNativeOptionsConfig(void) {
+  FILE *f = fopen("sm.user.ini", "wb");
+  if (!f) {
+    WidescreenDebugLog("options-save: failed to open sm.user.ini");
+    return;
+  }
+
+  fprintf(f,
+          "!include sm.ini\n"
+          "\n"
+          "[Graphics]\n"
+          "Widescreen16x9 = %d\n"
+          "\n"
+          "[Sound]\n"
+          "MSUVolume = %u\n",
+          g_config.extended_aspect_ratio ? 1 : 0,
+          (unsigned)g_config.msuvolume);
+  fclose(f);
+  WidescreenDebugLog("options-save: wrote sm.user.ini widescreen=%d msuvolume=%u",
+                     g_config.extended_aspect_ratio ? 1 : 0,
+                     (unsigned)g_config.msuvolume);
+}
+
+static void DrawNativeOptionsSlider(uint8 *pixel_buffer, size_t pitch, int width, int height,
+                                    int x, int y, int w, int scale, int value, bool selected, bool enabled) {
+  int slider_h = 6 * scale;
+  int fill_w = (w * IntMin(IntMax(value, 0), 100)) / 100;
+  int knob_x = x + IntMin(IntMax(fill_w - scale, 0), w - 2 * scale);
+  uint32 fill_color = enabled ? 0x8FEA7D : 0x5F7370;
+  uint32 outline_color = selected ? 0xFFFFFF : 0xC5D0D8;
+  FillRect(pixel_buffer, pitch, width, height, x, y, w, slider_h, 0x2C3440);
+  if (fill_w > 0)
+    FillRect(pixel_buffer, pitch, width, height, x, y, fill_w, slider_h, fill_color);
+  DrawRectOutline(pixel_buffer, pitch, width, height, x, y, w, slider_h, IntMax(1, scale), outline_color);
+  FillRect(pixel_buffer, pitch, width, height, knob_x, y - scale, 2 * scale, slider_h + 2 * scale, outline_color);
+}
+
+static void RenderNativeOptionsOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height) {
+  if (!IsNativeOptionsOverlayVisible())
     return;
 
   int scale = IntMax(1, height / 240);
-  int panel_w = 152 * scale;
-  int panel_h = 34 * scale;
+  int panel_w = 212 * scale;
+  int panel_h = 148 * scale;
   int panel_x = (width - panel_w) / 2;
-  int panel_y = height - panel_h - 14 * scale;
-  int slider_x = panel_x + 40 * scale;
-  int slider_y = panel_y + 18 * scale;
-  int slider_w = 86 * scale;
-  int slider_h = 6 * scale;
+  int panel_y = (height - panel_h) / 2;
+  int label_x = panel_x + 18 * scale;
+  int control_x = panel_x + 94 * scale;
+  int slider_w = 84 * scale;
+  int row_y;
   int volume = GetCurrentVolumePercent();
-  int fill_w = (slider_w * volume) / 100;
-  int knob_x = slider_x + IntMin(IntMax(fill_w - scale, 0), slider_w - 2 * scale);
-  char volume_text[8];
-  snprintf(volume_text, sizeof(volume_text), "%d", volume);
+  char text[16];
 
   FillRectAlpha(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, 0x101722, 176);
   DrawRectOutline(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, IntMax(1, scale), 0x8FEA7D);
-  DrawText5x7(pixel_buffer, pitch, width, height, panel_x + 8 * scale, panel_y + 6 * scale, "VOLUME", scale, 0xFFFFFF);
-  FillRect(pixel_buffer, pitch, width, height, slider_x, slider_y, slider_w, slider_h, 0x2C3440);
-  if (fill_w > 0)
-    FillRect(pixel_buffer, pitch, width, height, slider_x, slider_y, fill_w, slider_h, 0x8FEA7D);
-  DrawRectOutline(pixel_buffer, pitch, width, height, slider_x, slider_y, slider_w, slider_h, IntMax(1, scale), 0xC5D0D8);
-  FillRect(pixel_buffer, pitch, width, height, knob_x, slider_y - scale, 2 * scale, slider_h + 2 * scale, 0xFFFFFF);
-  DrawText5x7(pixel_buffer, pitch, width, height, panel_x + 131 * scale, panel_y + 6 * scale, volume_text, scale, 0xFFFFFF);
+
+  DrawText5x7(pixel_buffer, pitch, width, height, panel_x + 10 * scale, panel_y + 8 * scale, "OPTIONS", scale, 0xFFFFFF);
+
+  DrawText5x7(pixel_buffer, pitch, width, height, panel_x + 10 * scale, panel_y + 25 * scale, "CONTROLS", scale, 0x8FEA7D);
+  row_y = panel_y + 39 * scale;
+  if (g_native_options_selection == kNativeOptionsRow_Controls)
+    DrawText5x7(pixel_buffer, pitch, width, height, panel_x + 8 * scale, row_y, ">", scale, 0xFFFFFF);
+  DrawText5x7(pixel_buffer, pitch, width, height, label_x, row_y, "INPUT MAP", scale, 0xC5D0D8);
+
+  DrawText5x7(pixel_buffer, pitch, width, height, panel_x + 10 * scale, panel_y + 58 * scale, "VIDEO", scale, 0x8FEA7D);
+  row_y = panel_y + 72 * scale;
+  if (g_native_options_selection == kNativeOptionsRow_Aspect)
+    DrawText5x7(pixel_buffer, pitch, width, height, panel_x + 8 * scale, row_y, ">", scale, 0xFFFFFF);
+  DrawText5x7(pixel_buffer, pitch, width, height, label_x, row_y, "ASPECT", scale, 0xC5D0D8);
+  snprintf(text, sizeof(text), g_config.extended_aspect_ratio ? "<16:9>" : "<4:3>");
+  DrawText5x7(pixel_buffer, pitch, width, height, control_x, row_y, text, scale,
+              g_native_options_selection == kNativeOptionsRow_Aspect ? 0xFFFFFF : 0xC5D0D8);
+
+  DrawText5x7(pixel_buffer, pitch, width, height, panel_x + 10 * scale, panel_y + 91 * scale, "AUDIO", scale, 0x8FEA7D);
+  row_y = panel_y + 105 * scale;
+  if (g_native_options_selection == kNativeOptionsRow_Master)
+    DrawText5x7(pixel_buffer, pitch, width, height, panel_x + 8 * scale, row_y, ">", scale, 0xFFFFFF);
+  DrawText5x7(pixel_buffer, pitch, width, height, label_x, row_y, "MASTER", scale, 0xC5D0D8);
+  DrawNativeOptionsSlider(pixel_buffer, pitch, width, height, control_x, row_y + scale, slider_w, scale,
+                          volume, g_native_options_selection == kNativeOptionsRow_Master, true);
+  snprintf(text, sizeof(text), "%d", volume);
+  DrawText5x7(pixel_buffer, pitch, width, height, control_x + 91 * scale, row_y, text, scale, 0xFFFFFF);
+
+  row_y = panel_y + 119 * scale;
+  if (g_native_options_selection == kNativeOptionsRow_Bgm)
+    DrawText5x7(pixel_buffer, pitch, width, height, panel_x + 8 * scale, row_y, ">", scale, 0xFFFFFF);
+  DrawText5x7(pixel_buffer, pitch, width, height, label_x, row_y, "BGM", scale, 0x8A949C);
+  DrawNativeOptionsSlider(pixel_buffer, pitch, width, height, control_x, row_y + scale, slider_w, scale,
+                          100, g_native_options_selection == kNativeOptionsRow_Bgm, false);
+
+  row_y = panel_y + 133 * scale;
+  if (g_native_options_selection == kNativeOptionsRow_Sfx)
+    DrawText5x7(pixel_buffer, pitch, width, height, panel_x + 8 * scale, row_y, ">", scale, 0xFFFFFF);
+  DrawText5x7(pixel_buffer, pitch, width, height, label_x, row_y, "SFX", scale, 0x8A949C);
+  DrawNativeOptionsSlider(pixel_buffer, pitch, width, height, control_x, row_y + scale, slider_w, scale,
+                          100, g_native_options_selection == kNativeOptionsRow_Sfx, false);
 }
 
 static void RenderBuildTimestampOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height) {
@@ -1577,7 +2527,8 @@ static void RenderModernFrontCustomLayer(uint32 *pixels, int width, int height) 
   RenderOpeningIntroSkipPrompt((uint8 *)pixels, width * sizeof(uint32), width, height);
   RenderAnalogDebugOverlay((uint8 *)pixels, width * sizeof(uint32), width, height);
   RenderNativeMainMenu((uint8 *)pixels, width * sizeof(uint32), width, height);
-  RenderOptionsVolumeOverlay((uint8 *)pixels, width * sizeof(uint32), width, height);
+  RenderNativeLevelEditor((uint8 *)pixels, width * sizeof(uint32), width, height);
+  RenderNativeOptionsOverlay((uint8 *)pixels, width * sizeof(uint32), width, height);
   RenderExitToMainMenuPrompt((uint8 *)pixels, width * sizeof(uint32), width, height);
   RenderBuildTimestampOverlay((uint8 *)pixels, width * sizeof(uint32), width, height);
   for (int i = 0; i < width * height; i++) {
@@ -1663,7 +2614,23 @@ static bool IsGameplayMovementState(void) {
   return game_state == kGameState_7_MainGameplayFadeIn || game_state == kGameState_8_MainGameplay;
 }
 
-static int NormalizeGamepadButtonsForMenus(int inputs) {
+static uint16 GetNativeMenuInputs(void) {
+  uint16 inputs = (uint16)(g_input1_state | g_gamepad_dpad_buttons | GetMenuAnalogDirectionalInputs());
+
+  // Native UI controls keep their own face-button semantics independent from
+  // gameplay remaps so every native overlay sees the same actions.
+  if (g_gamepad_modifiers & (1u << kGamepadBtn_A))
+    inputs |= kInputBit_A;
+  if (g_gamepad_modifiers & (1u << kGamepadBtn_B))
+    inputs |= kInputBit_B;
+  if (g_gamepad_modifiers & (1u << kGamepadBtn_Start))
+    inputs |= kInputBit_Start;
+  if (g_gamepad_modifiers & (1u << kGamepadBtn_Back))
+    inputs |= kInputBit_Select;
+  if (g_gamepad_modifiers & (1u << kGamepadBtn_L2))
+    inputs |= kInputBit_PageUp;
+  if (g_gamepad_modifiers & (1u << kGamepadBtn_R2))
+    inputs |= kInputBit_PageDown;
   return inputs;
 }
 
@@ -1829,7 +2796,16 @@ static void HandleVolumeAdjustment(int volume_adjustment) {
   int current_volume = GetCurrentVolumePercent();
   int new_volume = IntMin(IntMax(0, current_volume + volume_adjustment * 5), 100);
   SetCurrentVolumePercent(new_volume);
+  SaveNativeOptionsConfig();
   printf("[Volume]=%i\n", new_volume);
+}
+
+static void HandleAspectRatioSelection(int direction) {
+  (void)direction;
+  g_config.extended_aspect_ratio = g_config.extended_aspect_ratio ? 0 : 85;
+  ApplyRuntimeAspectRatio();
+  SaveNativeOptionsConfig();
+  printf("[Aspect]=%s\n", g_config.extended_aspect_ratio ? "16:9" : "4:3");
 }
 
 // Approximates atan2(y, x) normalized to the [0,4) range
@@ -1859,7 +2835,7 @@ static float NormalizeGamepadAxis(int value) {
 }
 
 static void NormalizeStickPosition(int x, int y, float *out_x, float *out_y) {
-  const float deadzone = 0.025f;
+  const float deadzone = 0.0375f;
   const float raw_x = NormalizeGamepadAxis(x);
   const float raw_y = NormalizeGamepadAxis(y);
   const float magnitude = sqrtf(raw_x * raw_x + raw_y * raw_y);

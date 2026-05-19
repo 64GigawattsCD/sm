@@ -147,10 +147,12 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\third_party\gl_core\gl_core_3_1.c" />
+    <ClCompile Include="blocksbox_runtime.c" />
     <ClCompile Include="config.c" />
     <ClCompile Include="glsl_shader.c" />
     <ClCompile Include="main.c" />
     <ClCompile Include="opengl.c" />
+    <ClCompile Include="platform\win32\blocksbox_bootstrap.c" />
     <ClCompile Include="platform\win32\volume_control.c" />
     <ClCompile Include="sm_80.c" />
     <ClCompile Include="sm_81.c" />
@@ -231,6 +233,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\third_party\gl_core\gl_core_3_1.h" />
+    <ClInclude Include="blocksbox_runtime.h" />
     <ClInclude Include="config.h" />
     <ClInclude Include="enemy_defs.h" />
     <ClInclude Include="enemy_types.h" />
@@ -238,6 +241,7 @@
     <ClInclude Include="funcs.h" />
     <ClInclude Include="glsl_shader.h" />
     <ClInclude Include="ida_types.h" />
+    <ClInclude Include="platform\win32\blocksbox_bootstrap.h" />
     <ClInclude Include="sm_cpu_infra.h" />
     <ClInclude Include="sm_rtl.h" />
     <ClInclude Include="snes\apu.h" />

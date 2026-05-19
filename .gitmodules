@@ -1,0 +1,4 @@
+[submodule "BlockBox"]
+	path = BlockBox
+	url = git@github.com:64GigawattsCD/BlocksBox.git
+	branch = SuperMetroid
