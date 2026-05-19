@@ -4,7 +4,7 @@ This file is for future coding agents working in this repository.
 
 ## Working Preferences
 
-- Do not launch `sm.exe` without asking the user first. If they do want a launch, place the game on monitor 2 for now.
+- Launch `sm.exe` when it is useful for testing the current change. Place the game on monitor 2 for now when practical.
 - Prefer preserving the original game feel where possible, while allowing intentional behavior changes for PC-native features.
 
 ## Current High-Level Goals
@@ -34,7 +34,9 @@ This file is for future coding agents working in this repository.
 - When `g_skip_menu` is enabled, slot 1 loads directly and receives the all-items debug loadout if anything is missing.
 - Debug skip-menu loadout should equip everything except Spazer, which should remain turned off even if other beams/items are granted.
 - The PC-native main menu should appear as an overlay on the baby Metroid capsule/title scene, not after changing to file select. `Play` proceeds to the save-slot screen, vanilla file-select Exit returns to the native main menu, `Options` enters the existing options menu, `Test` currently launches the old skip-menu debug loadout until a proper debug scenario is specified, and `Exit` gracefully closes the app.
-- Missiles are intended to be a direct-fire right-bumper action, not part of the HUD item carousel; right bumper should fire missiles normally and power bombs while morphed.
+- Missiles/super missiles are intended to be a direct-fire right-bumper action. Keep their HUD icons visible, skip them in the Select-button cycle, keep one selected once acquired, and use physical d-pad Up to toggle missile versus super missile.
+- Right trigger should always fire/charge the beam even when missile/super missile is selected. Missile firing is blocked while beam charge is active, and a missile/super missile shot briefly locks out beam firing for 75% of that projectile's own refire cooldown.
+- Right stick click should fire/hold grapple directly without selecting it. Right bumper should fire power bombs while morphed and keep its missile/super missile behavior while non-morphed.
 - Analog-heading wave/plasma beams must still run off-screen cleanup so projectile slots are released instead of blocking future shots.
 - Shinespark direction should resolve from analog input at the end of windup: right stick when actively aiming, otherwise left stick movement, with no input defaulting to vertical.
 - Downward shinesparks reuse the vertical/diagonal-up shinespark poses with a runtime vertical spritemap flip and inverted Y movement rather than adding new pose IDs or art.
@@ -54,11 +56,13 @@ This file is for future coding agents working in this repository.
 - Keep the legacy flattened renderer available as a fallback while the modern layer path gains parity; color math/subscreen behavior is especially sensitive and should be validated carefully as the layer compositor matures.
 - Modern layer controls: `Shift+M` toggles the modern layer renderer at runtime and `Ctrl+M` toggles custom-layer debug stripes. The aim indicator/opening-skip prompt should be rendered through the front custom layer when the modern layer renderer is active, not painted directly over the final framebuffer.
 - Analog projectile visuals are being rotated in the software PPU by registering each projectile's OAM range with its own per-frame transform. The rotation should be the delta between the projectile's true analog heading and the nearest vanilla 8-way projectile art direction.
-- Desktop launches should default to borderless fullscreen with `Widescreen16x9` enabled, rendering the widened 426x240 PPU output instead of centering a 256-wide SNES frame.
-- 16:9 follow-up work remains on camera and special-object parity: room-edge camera clamping should stop early enough for the widened viewport, and gunship/other large enemy visibility should respect the widened horizontal view instead of culling against 256-wide assumptions.
+- Desktop launches should default to borderless fullscreen, but gameplay/rendering and the software PPU buffer are currently forced back to the vanilla 256-wide 4:3 view because the first 16:9 rendering pass caused level graphics artifacts. The leftover six-column widened room streamer in `sm_80.c` caused Ceres left-edge vertical bands and has been reverted to vanilla 4:3 streaming.
+- The options menu should keep showing the aspect selector as a placeholder; selecting it currently writes `Widescreen16x9 = 0` and leaves rendering/gameplay in 4:3 until the next 16:9 pass.
 - `Screenshot = F12` captures the current presented framebuffer to `debug_screenshots/manual_####.bmp` for renderer debugging.
+- Room loads currently queue an automatic delayed screenshot to `debug_screenshots/room_load_####.bmp` so left-edge rendering artifacts can be diagnosed from captured frames.
+- Native main menu activation currently queues an automatic delayed screenshot to `debug_screenshots/main_menu_####.bmp`; the preferred presentation is the near-stock title scene with only the native menu box drawn on top.
 - The vanilla options screen now has a native volume slider overlay on its main page; left/right adjusts the current runtime app volume in 5% steps.
-- The native options overlay is being reorganized into Controls, Video, and Audio zones. Master volume is the only wired audio slider for now; BGM/SFX sliders are visible placeholders, and the video zone has a functional 16:9/4:3 selector that updates runtime render dimensions.
+- The native options overlay is being reorganized into Controls, Video, and Audio zones. Master volume is the only wired audio slider for now; BGM/SFX sliders are visible placeholders, and the video zone has a visible 16:9/4:3 selector placeholder.
 - Native options currently persist to `sm.user.ini` by writing `!include sm.ini` plus overrides for `Widescreen16x9` and `MSUVolume`; add future native option values there as they become real controls.
 - BlockBox integration is active on branch `BlockBoxIntegration`: the `BlockBox/` submodule is branched to `SuperMetroid`, read-only Super Metroid room/header/state/level-data extraction now works there, startup bootstrap now emits a compact runtime manifest plus room/tileset/art indexes, tileset preview images, and assembled Samus frame exports, and the next phase is teaching room/graphics loading paths to consume those exported assets directly while preserving enough metadata to support future replacement graphics packs keyed against the dumped tileset/art manifests.
 - The PC-native main menu now has a prototype `Level Editor` browser path: it opens a BlocksBox pack list, currently with `Super Metroid`, then a pack page with `Level List` and `Tile Sets`; `Tile Sets` browses imported Super Metroid tilesets and shows exported preview images on hover. The first crash on selection was caused by BOM-prefixed TSV headers being parsed as data; TSV readers should continue to tolerate BOM/comment/header rows and missing fields.

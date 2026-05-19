@@ -140,8 +140,14 @@ static uint32 *g_modern_front_custom_layer;
 static size_t g_modern_front_custom_layer_size;
 static bool g_shinespark_screenshot_requested;
 static bool g_manual_screenshot_requested;
+static bool g_room_load_screenshot_requested;
+static bool g_main_menu_screenshot_requested;
 static int g_shinespark_screenshot_counter;
 static int g_manual_screenshot_counter;
+static int g_room_load_screenshot_counter;
+static int g_main_menu_screenshot_counter;
+static int g_room_load_screenshot_timer;
+static int g_main_menu_screenshot_timer;
 static int g_startup_screenshot_counter;
 static int g_startup_screenshot_remaining = 24;
 static int g_startup_screenshot_timer = 1;
@@ -192,6 +198,11 @@ static uint8 g_gamepad_analog_buttons;
 static uint8 g_gamepad_dpad_buttons;
 static int g_gamepad_button_inputs;
 static int g_input1_state;
+uint8 g_dedicated_missile_fire_pressed;
+uint8 g_dedicated_missile_toggle_pressed;
+uint8 g_dedicated_beam_fire_held;
+uint8 g_dedicated_grapple_fire_pressed;
+uint8 g_dedicated_grapple_fire_held;
 static bool g_display_perf;
 static int g_curr_fps;
 static int g_ppu_render_flags = 0;
@@ -750,6 +761,18 @@ static void DrawPpuFrameWithPerf(void) {
     SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
                         "manual", &g_manual_screenshot_counter);
   }
+  if (g_room_load_screenshot_requested && --g_room_load_screenshot_timer <= 0 &&
+      game_state == kGameState_8_MainGameplay) {
+    g_room_load_screenshot_requested = false;
+    SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
+                        "room_load", &g_room_load_screenshot_counter);
+  }
+  if (g_main_menu_screenshot_requested && --g_main_menu_screenshot_timer <= 0 &&
+      g_native_main_menu_active) {
+    g_main_menu_screenshot_requested = false;
+    SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
+                        "main_menu", &g_main_menu_screenshot_counter);
+  }
   if (g_startup_screenshot_remaining > 0 && --g_startup_screenshot_timer <= 0) {
     g_startup_screenshot_timer = 15;
     g_startup_screenshot_remaining--;
@@ -758,6 +781,13 @@ static void DrawPpuFrameWithPerf(void) {
   }
 
   g_renderer_funcs.EndDraw();
+}
+
+void DebugRequestRoomLoadScreenshot(uint16 room_address, uint16 state_address) {
+  g_room_load_screenshot_requested = true;
+  g_room_load_screenshot_timer = 45;
+  WidescreenDebugLog("room-load-screenshot queued: room=%04x state=%04x",
+                     room_address, state_address);
 }
 
 static void WriteLe16(FILE *f, uint16_t value) {
@@ -936,7 +966,8 @@ static bool SdlRenderer_RecreateTexture(void) {
 static void ApplyRuntimeAspectRatio(void) {
   int old_width = g_snes_width;
   int old_height = g_snes_height;
-  g_snes_width = g_config.extended_aspect_ratio * 2 + kSnesNativeWidth;
+  g_config.extended_aspect_ratio = 0;
+  g_snes_width = kSnesNativeWidth;
   g_snes_height = kSnesNativeHeight;
 
   if (old_width == g_snes_width && old_height == g_snes_height)
@@ -1211,8 +1242,23 @@ int main(int argc, char** argv) {
     // Gameplay uses analog-derived directions. Native menus use one
     // physical/menu-action input path so face buttons behave consistently
     // across overlays regardless of gameplay remaps.
+    static uint32 previous_gamepad_modifiers;
+    uint32 gamepad_new_modifiers = g_gamepad_modifiers & ~previous_gamepad_modifiers;
+    previous_gamepad_modifiers = g_gamepad_modifiers;
+    g_dedicated_missile_fire_pressed = 0;
+    g_dedicated_missile_toggle_pressed = 0;
+    g_dedicated_beam_fire_held = 0;
+    g_dedicated_grapple_fire_pressed = 0;
+    g_dedicated_grapple_fire_held = 0;
+
     int menu_inputs = GetNativeMenuInputs();
-    int inputs = menu_inputs;
+    int inputs = g_input1_state | g_gamepad_button_inputs;
+    if (g_gamepad_modifiers & (1u << kGamepadBtn_Start))
+      inputs |= kInputBit_Start;
+    if (g_gamepad_modifiers & (1u << kGamepadBtn_Back))
+      inputs |= kInputBit_Select;
+    if (g_gamepad_modifiers & (1u << kGamepadBtn_R1))
+      inputs &= ~kInputBit_PageDown;
     uint8 analog_buttons = g_gamepad_analog_buttons;
     if (g_input1_state & 0xf0)
       analog_buttons = 0;
@@ -1250,10 +1296,20 @@ int main(int argc, char** argv) {
         demo_timer = 900;
       g_snes->disableRender = (g_turbo ^ (is_replay & g_replay_turbo)) && (frameCtr & (g_turbo ? 0xf : 0x7f)) != 0;
     } else {
+      g_dedicated_missile_fire_pressed = (gamepad_new_modifiers & (1u << kGamepadBtn_R1)) != 0;
+      g_dedicated_missile_toggle_pressed = (gamepad_new_modifiers & (1u << kGamepadBtn_DpadUp)) != 0;
+      g_dedicated_beam_fire_held = (g_gamepad_modifiers & (1u << kGamepadBtn_R2)) != 0;
+      g_dedicated_grapple_fire_pressed = (gamepad_new_modifiers & (1u << kGamepadBtn_R3)) != 0;
+      g_dedicated_grapple_fire_held = (g_gamepad_modifiers & (1u << kGamepadBtn_R3)) != 0;
       UpdateOpeningIntroSkipState(inputs);
       if (log_loop)
         WidescreenDebugLog("main-loop RtlRunFrame gameplay: inputs=0x%x", inputs);
       is_replay = RtlRunFrame(inputs);
+      g_dedicated_missile_fire_pressed = 0;
+      g_dedicated_missile_toggle_pressed = 0;
+      g_dedicated_beam_fire_held = 0;
+      g_dedicated_grapple_fire_pressed = 0;
+      g_dedicated_grapple_fire_held = 0;
       if (log_loop)
         WidescreenDebugLog("main-loop RtlRunFrame gameplay done: replay=%u game_state=%u cinematic=%04x",
                            is_replay, game_state, cinematic_function);
@@ -1504,6 +1560,27 @@ static bool NativeMainMenuCanOpenOnTitleScene(void) {
          cinematic_var18 == 0;
 }
 
+static void ResetTitleSequenceObjectState(void) {
+  ClearCinematicSprites();
+  ClearPaletteFXObjects();
+  for (int i = 0; i < 2; i++) {
+    mode7_obj_instr_ptr[i] = 0;
+    mode7_obj_preinstr_func[i] = 0;
+    mode7_obj_instr_timer[i] = 0;
+    mode7_obj_goto_timer[i] = 0;
+  }
+  mode7_vram_write_queue_tail = 0;
+}
+
+static void StartNativeMainMenuTitleScene(void) {
+  ResetTitleSequenceObjectState();
+  LoadTitleSequenceGraphics();
+  QueueMusic_Delayed8(0xFF03);
+  cinematic_function = FUNC16(CinematicFunctionNone);
+  SpawnCinematicSpriteObject(addr_kCinematicSpriteObjectDef_8BA0EF, FUNC16(CinematicFunctionNone));
+  QueueMusic_Delayed8(5);
+}
+
 static void ClearTransientMenuInputs(void) {
   g_input1_state = 0;
   g_gamepad_button_inputs = 0;
@@ -1521,8 +1598,20 @@ static void ClearTransientMenuInputs(void) {
 }
 
 static void OpenNativeMainMenuScene(void) {
+  reg_BG1HOFS = 0;
+  reg_BG1VOFS = 0;
+  reg_BG2HOFS = 0;
+  reg_BG2VOFS = 0;
+  bg1_x_offset = 0;
+  bg1_y_offset = 0;
+  bg2_x_scroll = 0;
+  bg2_y_scroll = 0;
+  layer1_x_pos = 0;
+  layer1_y_pos = 0;
+  layer2_x_pos = 0;
+  layer2_y_pos = 0;
   game_state = kGameState_1_OpeningCinematic;
-  cinematic_function = FUNC16(CinematicFunctionOpening);
+  StartNativeMainMenuTitleScene();
   screen_fade_delay = 0;
   screen_fade_counter = 0;
   demo_timer = 900;
@@ -1561,6 +1650,8 @@ static void MaybeActivateNativeMainMenu(void) {
       NativeMainMenuCanOpenOnTitleScene()) {
     g_native_main_menu_active = true;
     g_native_main_menu_return_from_options = false;
+    g_main_menu_screenshot_requested = true;
+    g_main_menu_screenshot_timer = 15;
     ClearTransientMenuInputs();
     demo_timer = 900;
   }
@@ -2180,15 +2271,13 @@ static void SaveNativeOptionsConfig(void) {
           "!include sm.ini\n"
           "\n"
           "[Graphics]\n"
-          "Widescreen16x9 = %d\n"
+          "Widescreen16x9 = 0\n"
           "\n"
           "[Sound]\n"
           "MSUVolume = %u\n",
-          g_config.extended_aspect_ratio ? 1 : 0,
           (unsigned)g_config.msuvolume);
   fclose(f);
-  WidescreenDebugLog("options-save: wrote sm.user.ini widescreen=%d msuvolume=%u",
-                     g_config.extended_aspect_ratio ? 1 : 0,
+  WidescreenDebugLog("options-save: wrote sm.user.ini widescreen=0 msuvolume=%u",
                      (unsigned)g_config.msuvolume);
 }
 
@@ -2238,7 +2327,7 @@ static void RenderNativeOptionsOverlay(uint8 *pixel_buffer, size_t pitch, int wi
   if (g_native_options_selection == kNativeOptionsRow_Aspect)
     DrawText5x7(pixel_buffer, pitch, width, height, panel_x + 8 * scale, row_y, ">", scale, 0xFFFFFF);
   DrawText5x7(pixel_buffer, pitch, width, height, label_x, row_y, "ASPECT", scale, 0xC5D0D8);
-  snprintf(text, sizeof(text), g_config.extended_aspect_ratio ? "<16:9>" : "<4:3>");
+  snprintf(text, sizeof(text), "<4:3>");
   DrawText5x7(pixel_buffer, pitch, width, height, control_x, row_y, text, scale,
               g_native_options_selection == kNativeOptionsRow_Aspect ? 0xFFFFFF : 0xC5D0D8);
 
@@ -2723,6 +2812,10 @@ static void HandleCommand(uint32 j, bool pressed) {
 
 static void HandleInput(int keyCode, int keyMod, bool pressed) {
   if (pressed && keyCode == SDLK_ESCAPE) {
+    if (g_native_main_menu_active) {
+      g_native_main_menu_quit_requested = true;
+      return;
+    }
     if (g_exit_to_main_menu_prompt_active) {
       g_exit_to_main_menu_prompt_active = false;
       g_exit_to_main_menu_prompt_prev_inputs = 0;
@@ -2802,10 +2895,10 @@ static void HandleVolumeAdjustment(int volume_adjustment) {
 
 static void HandleAspectRatioSelection(int direction) {
   (void)direction;
-  g_config.extended_aspect_ratio = g_config.extended_aspect_ratio ? 0 : 85;
+  g_config.extended_aspect_ratio = 0;
   ApplyRuntimeAspectRatio();
   SaveNativeOptionsConfig();
-  printf("[Aspect]=%s\n", g_config.extended_aspect_ratio ? "16:9" : "4:3");
+  printf("[Aspect]=4:3\n");
 }
 
 // Approximates atan2(y, x) normalized to the [0,4) range
@@ -2835,7 +2928,7 @@ static float NormalizeGamepadAxis(int value) {
 }
 
 static void NormalizeStickPosition(int x, int y, float *out_x, float *out_y) {
-  const float deadzone = 0.0375f;
+  const float deadzone = 0.1f;
   const float raw_x = NormalizeGamepadAxis(x);
   const float raw_y = NormalizeGamepadAxis(y);
   const float magnitude = sqrtf(raw_x * raw_x + raw_y * raw_y);

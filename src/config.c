@@ -356,10 +356,12 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
       bool enabled;
       if (!ParseBool(value, &enabled))
         return false;
-      g_config.extended_aspect_ratio = enabled ? 85 : 0;
+      (void)enabled;
+      g_config.extended_aspect_ratio = 0;
       return true;
     } else if (StringEqualsNoCase(key, "ExtendedAspectRatio")) {
-      g_config.extended_aspect_ratio = (uint8)strtol(value, (char**)NULL, 10);
+      (void)value;
+      g_config.extended_aspect_ratio = 0;
       return true;
     } else if (StringEqualsNoCase(key, "Fullscreen")) {
       g_config.fullscreen = (uint8)strtol(value, (char**)NULL, 10);
@@ -468,7 +470,7 @@ static bool ParseOneConfigFile(const char *filename, int depth) {
 void ParseConfigFile(const char *filename) {
   g_config.msuvolume = 100;  // default msu volume, 100%
   g_config.fullscreen = 1;    // borderless desktop fullscreen
-  g_config.extended_aspect_ratio = 85;  // 426x240, close to 16:9, using the widened PPU output
+  g_config.extended_aspect_ratio = 0;  // 16:9 is temporarily menu-only while rendering is restored to 4:3.
 
   if (filename != NULL || !ParseOneConfigFile("sm.user.ini", 0)) {
     if (filename == NULL)

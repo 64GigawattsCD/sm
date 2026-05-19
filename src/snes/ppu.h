@@ -32,8 +32,8 @@ typedef struct BgLayer {
 } BgLayer;
 
 enum {
-  kPpuExtraLeftRight = 85,
-  kPpuXPixels = 256 + 2 * kPpuExtraLeftRight,
+  kPpuXPixels = 256,
+  kPpuExtraLeftRight = 0,
 };
 
 typedef uint16_t PpuZbufType;
@@ -164,7 +164,6 @@ struct Ppu {
   // times 2 for even and odd frame
   uint8_t pixelbuffer_placeholder;
 
-  uint32_t renderFlags;
   uint32_t windowsel;
   uint8_t extraLeftCur, extraRightCur, extraLeftRight;
   uint8_t screenEnabled[2];

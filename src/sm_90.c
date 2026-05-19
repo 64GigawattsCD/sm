@@ -22,6 +22,60 @@ static uint8 HudSelectionHandler_FireNonBeamProjectile(uint16 item_index, uint8 
 static uint8 HudSelectionHandler_TryFirePowerBomb(uint8 update_hud_selection);
 static uint8 HudSelectionHandler_MorphBall_Helper2ForInput(uint8 pressed);
 
+extern uint8 g_dedicated_missile_fire_pressed;
+extern uint8 g_dedicated_missile_toggle_pressed;
+extern uint8 g_dedicated_beam_fire_held;
+extern uint8 g_dedicated_grapple_fire_held;
+
+static uint8 g_beam_lockout_after_missile_timer;
+
+static bool HudHasMissiles(void) {
+  return samus_max_missiles != 0;
+}
+
+static bool HudHasSuperMissiles(void) {
+  return samus_max_super_missiles != 0;
+}
+
+static bool HudItemIsDedicatedMissile(uint16 item_index) {
+  return item_index == 1 || item_index == 2;
+}
+
+static uint16 HudFirstAvailableDedicatedMissile(void) {
+  if (HudHasMissiles())
+    return 1;
+  if (HudHasSuperMissiles())
+    return 2;
+  return 0;
+}
+
+static void HudEnsureDedicatedMissileSelected(void) {
+  if (HudItemIsDedicatedMissile(hud_item_index)) {
+    if (hud_item_index == 1 && HudHasMissiles())
+      return;
+    if (hud_item_index == 2 && HudHasSuperMissiles())
+      return;
+  }
+  uint16 item_index = HudFirstAvailableDedicatedMissile();
+  if (item_index)
+    hud_item_index = item_index;
+}
+
+static void HudToggleDedicatedMissileSelection(void) {
+  if (!HudHasMissiles() && !HudHasSuperMissiles())
+    return;
+  if (HudHasMissiles() && HudHasSuperMissiles()) {
+    hud_item_index = hud_item_index == 1 ? 2 : 1;
+  } else {
+    hud_item_index = HudFirstAvailableDedicatedMissile();
+  }
+  samus_auto_cancel_hud_item_index = 0;
+  hud_item_changed_this_frame = 1;
+  flare_counter = 0;
+  ClearFlareAnimationState();
+  Samus_LoadSuitPalette();
+}
+
 static bool Samus_IsRunCycleAnimMovement(void) {
   return samus_movement_type == kMovementType_01_Running ||
          samus_movement_type == kMovementType_10_Moonwalking;
@@ -324,6 +378,24 @@ static const uint8 kProjectileCooldown_Uncharged[38] = {
 };
 static const uint8 kNonBeamProjectileCooldowns[9] = { 0, 0xa, 0x14, 0x28, 0, 0x10, 0, 0, 0 };
 static const uint8 kBeamAutoFireCooldowns[12] = { 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19 };
+
+static bool BeamFireIsTemporarilyLockedOut(void) {
+  return g_beam_lockout_after_missile_timer != 0;
+}
+
+static void StartBeamLockoutAfterMissile(uint16 missile_item_index) {
+  uint8 missile_cooldown = kNonBeamProjectileCooldowns[missile_item_index & 0xf];
+  g_beam_lockout_after_missile_timer = (uint8)((missile_cooldown * 3 + 3) / 4);
+}
+
+static void TickBeamLockoutAfterMissile(void) {
+  if (g_beam_lockout_after_missile_timer)
+    --g_beam_lockout_after_missile_timer;
+}
+
+static bool BeamChargeIsActive(void) {
+  return flare_counter != 0 && (button_config_shoot_x & joypad1_lastkeys) != 0;
+}
 
 static void Samus_HandleAnimDelay(void);
 
@@ -3840,6 +3912,16 @@ void HudSelectionHandler_NothingOrPowerBombs(void) {  // 0x90B80D
     return;
 
   prev_beam_charge_counter = flare_counter;
+  if (BeamFireIsTemporarilyLockedOut()) {
+    if ((button_config_shoot_x & joypad1_lastkeys) != 0 || new_projectile_direction_changed_pose) {
+      if (flare_counter) {
+        flare_counter = 0;
+        ClearFlareAnimationState();
+        Samus_LoadSuitPalette();
+      }
+      return;
+    }
+  }
   if (hyper_beam_flag || (equipped_beams & 0x1000) == 0) {
     if ((button_config_shoot_x & joypad1_lastkeys) != 0)
       FireUnchargedBeam();
@@ -3896,6 +3978,8 @@ static const uint16 kProjectileBombPreInstr[12] = {  // 0x90B887
 void FireUnchargedBeam(void) {
   int8 v3;
 
+  if (BeamFireIsTemporarilyLockedOut())
+    return;
   if (hyper_beam_flag) {
     FireHyperBeam();
     return;
@@ -3977,6 +4061,8 @@ static const uint16 kFireChargedBeam_Funcs[12] = {  // 0x90B986
 };
 
 void FireChargedBeam(void) {
+  if (BeamFireIsTemporarilyLockedOut())
+    return;
   if (Samus_CanFireBeam() & 1) {
     uint16 v0 = 0;
     while (projectile_damage[v0 >> 1]) {
@@ -4373,6 +4459,8 @@ static uint8 Samus_CanFireNonBeamProjectile(uint16 item_index) {
 }
 
 static uint8 HudSelectionHandler_FireNonBeamProjectile(uint16 item_index, uint8 update_hud_selection) {
+  if (HudItemIsDedicatedMissile(item_index) && BeamChargeIsActive())
+    return 0;
   if (!(Samus_CanFireNonBeamProjectile(item_index) & 1))
     return 0;
   if (item_index == 2) {
@@ -4411,6 +4499,8 @@ static uint8 HudSelectionHandler_FireNonBeamProjectile(uint16 item_index, uint8 
     else
       projectile_bomb_pre_instructions[v1] = FUNC16(ProjPreInstr_Missile);
     cooldown_timer = kNonBeamProjectileCooldowns[HIBYTE(v7) & 0xF];
+    if (HudItemIsDedicatedMissile(item_index))
+      StartBeamLockoutAfterMissile(item_index);
     if (!update_hud_selection)
       return 1;
     if (samus_auto_cancel_hud_item_index) {
@@ -4435,13 +4525,21 @@ fail:
 }
 
 static uint8 HudSelectionHandler_TryFireDedicatedMissile(void) {
-  if ((joypad1_newkeys & kButton_R) == 0)
+  if ((joypad1_newkeys & kButton_R) == 0 && !g_dedicated_missile_fire_pressed)
     return 0;
-  HudSelectionHandler_FireNonBeamProjectile(1, 0);
+  if (BeamChargeIsActive())
+    return 1;
+  HudEnsureDedicatedMissileSelected();
+  if (HudItemIsDedicatedMissile(hud_item_index))
+    HudSelectionHandler_FireNonBeamProjectile(hud_item_index, 0);
   return 1;
 }
 
 void HudSelectionHandler_MissilesOrSuperMissiles(void) {  // 0x90BE62
+  if (g_dedicated_beam_fire_held || flare_counter) {
+    HudSelectionHandler_NothingOrPowerBombs();
+    return;
+  }
   if ((button_config_shoot_x & joypad1_newkeys) == 0 && (button_config_shoot_x & joypad1_newinput_samusfilter) == 0)
     return;
   HudSelectionHandler_FireNonBeamProjectile(hud_item_index, 1);
@@ -4507,7 +4605,7 @@ static uint8 HudSelectionHandler_TryFirePowerBomb(uint8 update_hud_selection) {
 }
 
 void HudSelectionHandler_MorphBall(void) {  // 0x90BF9D
-  if ((joypad1_newkeys & kButton_R) != 0) {
+  if ((joypad1_newkeys & kButton_R) != 0 || g_dedicated_missile_fire_pressed) {
     if (HudSelectionHandler_MorphBall_Helper2ForInput(1) & 1)
       HudSelectionHandler_TryFirePowerBomb(0);
     return;
@@ -4635,6 +4733,10 @@ void HandleSwitchingHudSelection(void) {
   uint16 v0;
   uint16 r22 = 0;
   uint16 r18 = hud_item_index;
+  if (g_dedicated_missile_toggle_pressed)
+    HudToggleDedicatedMissileSelection();
+  else
+    HudEnsureDedicatedMissileSelected();
   if ((button_config_itemcancel_y & joypad1_newkeys) != 0) {
     samus_auto_cancel_hud_item_index = 0;
 LABEL_5:
@@ -4649,7 +4751,7 @@ LABEL_5:
     goto LABEL_5;
 LABEL_6:
   hud_item_index = v0;
-  while (kRunSwitchedToHudHandler[v0]() & 1) {
+  while (HudItemIsDedicatedMissile(v0) || (kRunSwitchedToHudHandler[v0]() & 1)) {
     v0 = hud_item_index + 1;
     hud_item_index = v0;
     if (!sign16(v0 - 6)) {
@@ -4662,6 +4764,7 @@ LABEL_6:
   else
     samus_auto_cancel_hud_item_index = 0;
 LABEL_13:
+  HudEnsureDedicatedMissileSelected();
   if (hud_item_index == r18) {
     uint16 v1 = hud_item_changed_this_frame + 1;
     if (!sign16(hud_item_changed_this_frame - 2))
@@ -5927,6 +6030,10 @@ void HudSelectionHandler_Normal(void) {  // 0x90DD3D
   HudSelectionHandler_TurningAround,
   };
   uint16 v0;
+  if (g_dedicated_grapple_fire_held && (equipped_items & 0x4000) != 0) {
+    HudSelectionHandler_Grappling();
+    return;
+  }
   if (HudSelectionHandler_TryFireDedicatedMissile() & 1)
     return;
   if (grapple_beam_function == FUNC16(GrappleBeamFunc_Inactive)) {
@@ -6945,6 +7052,7 @@ void DrawSamusAndProjectiles(void) {  // 0x90EB35
   SamusDrawSprites();
   DrawPlayerExplosions2();
   Samus_JumpCheck();
+  TickBeamLockoutAfterMissile();
   Samus_ShootCheck();
 }
 

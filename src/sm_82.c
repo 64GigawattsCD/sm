@@ -6,6 +6,8 @@
 #include "blocksbox_runtime.h"
 #include "enemy_types.h"
 
+extern void DebugRequestRoomLoadScreenshot(uint16 room_address, uint16 state_address);
+
 #define kDemoRoomData ((uint16*)RomFixedPtr(0x82876c))
 #define kPauseScreenSpriteAnimationData_0 (*(PauseScreenSpriteAnimationData*)RomFixedPtr(0x82c0b2))
 #define kPauseScreenSpriteAnimationData_1 (*(PauseScreenSpriteAnimationData*)RomFixedPtr(0x82c0c4))
@@ -3644,6 +3646,7 @@ void LoadRoomHeader(void) {  // 0x82DE6F
   door_list_pointer = RoomDefHeader->ptr_to_doorout;
   HandleRoomDefStateSelect(room_ptr);
   BlocksBoxRuntime_OnRoomStateLoaded(room_ptr, roomdefroomstate_ptr);
+  DebugRequestRoomLoadScreenshot(room_ptr, roomdefroomstate_ptr);
   uint16 prod = Mult8x8(room_width_in_blocks, room_height_in_blocks);
   room_size_in_blocks = 2 * prod;
 }

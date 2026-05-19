@@ -107,15 +107,15 @@ enum {
 extern Config g_config;
 
 static inline uint16 GetGameplayVisibleWidth(void) {
-  return (uint16)(256 + 2 * g_config.extended_aspect_ratio);
+  return 256;
 }
 
 static inline uint16 GetGameplayVisibleCenterX(void) {
-  return (uint16)(GetGameplayVisibleWidth() / 2);
+  return 128;
 }
 
 static inline uint16 GetGameplayExtendedMarginX(void) {
-  return g_config.extended_aspect_ratio;
+  return 0;
 }
 
 void ParseConfigFile(const char *filename);

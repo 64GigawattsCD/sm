@@ -5,7 +5,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include <stdarg.h>
 
 #include "ppu.h"
 #include "snes.h"
@@ -36,18 +35,6 @@ extern int g_projectile_sprite_transform_sin[10];
 static void PpuDrawWholeLine(Ppu *ppu, uint y);
 static void PpuDrawWholeLineModernLayered(Ppu *ppu, uint y);
 extern void RtlRenderModernCustomLayer(int custom_slot, int y, uint32 *pixels, int width, int height);
-
-static void PpuWidescreenDebugLog(const char *fmt, ...) {
-  FILE *f = fopen("debug_widescreen.log", "ab");
-  if (!f)
-    return;
-  va_list ap;
-  va_start(ap, fmt);
-  vfprintf(f, fmt, ap);
-  va_end(ap);
-  fputc('\n', f);
-  fclose(f);
-}
 
 // array for layer definitions per mode:
 //   0-7: mode 0-7; 8: mode 1 + l3prio; 9: mode 7 + extbg
@@ -101,11 +88,6 @@ static const int spriteSizes[8][2] = {
   {16, 64}, {32, 64}, {16, 32}, {16, 32}
 };
 
-static int PpuPositiveModulo(int value, int modulus) {
-  int result = value % modulus;
-  return result < 0 ? result + modulus : result;
-}
-
 static void ppu_handlePixel(Ppu* ppu, int x, int y);
 static int ppu_getPixel(Ppu* ppu, int x, int y, bool sub, int* r, int* g, int* b);
 static uint16_t ppu_getOffsetValue(Ppu* ppu, int col, int row);
@@ -149,9 +131,6 @@ void ppu_copy(Ppu *ppu, Ppu *ppu_src) {
   ppu->renderBuffer = renderBuffer;
   ppu->renderPitch = (uint32_t)pitch;
   ppu->snes = snes;
-  ppu->extraLeftRight = kPpuExtraLeftRight;
-  ppu->extraLeftCur = kPpuExtraLeftRight;
-  ppu->extraRightCur = kPpuExtraLeftRight;
 }
 
 void ppu_reset(Ppu* ppu) {
@@ -165,9 +144,6 @@ void ppu_reset(Ppu* ppu) {
     ppu->snes = snes;
   }
   ppu->vramPointer = 0;
-  ppu->extraLeftRight = kPpuExtraLeftRight;
-  ppu->extraLeftCur = kPpuExtraLeftRight;
-  ppu->extraRightCur = kPpuExtraLeftRight;
   ppu->vramIncrementOnHigh = false;
   ppu->vramIncrement = 1;
   ppu->vramRemapMode = 0;
@@ -267,12 +243,6 @@ void ppu_saveload(Ppu *ppu, SaveLoadFunc *func, void *ctx) {
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags) {
   ppu->renderPitch = (uint)pitch;
   ppu->renderBuffer = pixels;
-  ppu->renderFlags = render_flags;
-  ppu->extraLeftRight = kPpuExtraLeftRight;
-  ppu->extraLeftCur = kPpuExtraLeftRight;
-  ppu->extraRightCur = kPpuExtraLeftRight;
-  PpuWidescreenDebugLog("PpuBeginDrawing: ppu=%p buffer=%p pitch=%zu extra=%u width=%u",
-                        (void *)ppu, (void *)pixels, pitch, ppu->extraLeftRight, kPpuXPixels);
 }
 
 bool ppu_checkOverscan(Ppu* ppu) {
@@ -292,21 +262,11 @@ void ppu_handleVblank(Ppu* ppu) {
 }
 
 static inline void ClearBackdrop(PpuPixelPrioBufs *buf) {
-  size_t i = 0;
-  for (; i + 3 < arraysize(buf->data); i += 4)
+  for (size_t i = 0; i != arraysize(buf->data); i += 4)
     *(uint64*)&buf->data[i] = 0x0500050005000500;
-  for (; i < arraysize(buf->data); i++)
-    buf->data[i] = 0x0500;
 }
 
 void ppu_runLine(Ppu* ppu, int line) {
-  static int run_line_log_budget = 64;
-  if ((line == 0 || line == 1 || line == 224 || line == 240) && run_line_log_budget-- > 0) {
-    PpuWidescreenDebugLog("ppu_runLine: ppu=%p line=%d forced=%d modern=%d pitch=%u buffer=%p extra=%u/%u/%u",
-                          (void *)ppu, line, ppu->forcedBlank ? 1 : 0, g_modern_layer_renderer ? 1 : 0,
-                          ppu->renderPitch, (void *)ppu->renderBuffer,
-                          ppu->extraLeftRight, ppu->extraLeftCur, ppu->extraRightCur);
-  }
   if(line == 0) {
     // pre-render line
     // TODO: this now happens halfway into the first line
@@ -656,7 +616,7 @@ static void PpuDrawBackground_mode7(Ppu *ppu, uint y, bool sub, PpuZbufType z) {
     uint32 outside_value = ppu->m7largeField ? 0x3ffff : 0xffffffff;
     bool char_fill = ppu->m7charFill;
     if (mosaic_enabled) {
-      int w = ppu->mosaicSize - PpuPositiveModulo(x, ppu->mosaicSize);
+      int w = ppu->mosaicSize - (x - ppu->mosaicModulo[x]);
       do {
         w = IntMin(w, dstz_end - dstz);
         if ((uint32)(xpos | ypos) > outside_value) {
@@ -839,15 +799,14 @@ static bool PpuModernLayerActive(Ppu *ppu, bool sub, int layer, int x) {
 }
 
 static int PpuModernGetBgPixel(Ppu *ppu, int x, int y, bool sub, int layer, bool priority) {
-  int screen_x = x - kPpuExtraLeftRight;
-  if (!PpuModernLayerActive(ppu, sub, layer, screen_x))
+  if (!PpuModernLayerActive(ppu, sub, layer, x))
     return 0;
 
-  int lx = screen_x;
+  int lx = x;
   int ly = y;
   if (ppu->bgLayer[layer].mosaicEnabled && ppu->mosaicSize > 1) {
-    lx -= PpuPositiveModulo(lx, ppu->mosaicSize);
-    ly -= PpuPositiveModulo(ly - ppu->mosaicStartLine, ppu->mosaicSize);
+    lx -= lx % ppu->mosaicSize;
+    ly -= (ly - ppu->mosaicStartLine) % ppu->mosaicSize;
   }
 
   if (ppu->mode == 7)
@@ -899,10 +858,9 @@ static void PpuModernEmitSpriteLayer(Ppu *ppu, bool sub, int sprite_priority, Mo
     return;
 
   for (int x = 0; x < kPpuXPixels; x++) {
-    int screen_x = x - kPpuExtraLeftRight;
-    if (IS_SCREEN_WINDOWED(ppu, sub, 4) && ppu_getWindowState(ppu, 4, screen_x))
+    if (IS_SCREEN_WINDOWED(ppu, sub, 4) && ppu_getWindowState(ppu, 4, x))
       continue;
-    PpuZbufType pixel = ppu->objBuffer.data[x];
+    PpuZbufType pixel = ppu->objBuffer.data[x + kPpuExtraLeftRight];
     if ((pixel >> 12) == SPRITE_PRIO_TO_PRIO_HI(sprite_priority)) {
       dst[slot].pixels[x] = 0xff000000 | PpuModernRgbFromCgram(ppu, ppu->cgram[pixel & 0xff]);
       dst[slot].palette[x] = pixel & 0xff;
@@ -991,7 +949,6 @@ static uint32 PpuModernApplyColorMath(Ppu *ppu, uint32 math_enabled_cur,
 }
 
 static void PpuModernCompositeLine(Ppu *ppu, uint y, ModernRenderLine *line) {
-  static int composite_log_budget = 48;
   uint8 *dst = &ppu->renderBuffer[(y - 1) * ppu->renderPitch];
   uint32 math_enabled = 0;
   for (int i = 0; i < 6; i++)
@@ -1007,19 +964,8 @@ static void PpuModernCompositeLine(Ppu *ppu, uint y, ModernRenderLine *line) {
     ((cwin.bits & kCwBitsMod[ppu->preventMathMode]) ^ kCwBitsMod[ppu->preventMathMode + 4]) << 8;
 
   for (uint32 windex = 0; windex < cwin.nr; windex++, cw_clip_math >>= 1) {
-    int left_i = cwin.edges[windex] + kPpuExtraLeftRight;
-    int right_i = cwin.edges[windex + 1] + kPpuExtraLeftRight;
-    if ((left_i < 0 || right_i > kPpuXPixels || right_i < left_i) && composite_log_budget-- > 0) {
-      PpuWidescreenDebugLog("PpuModernCompositeLine clamp: y=%u windex=%u edge=%d,%d mapped=%d,%d width=%d nr=%u bits=0x%x",
-                            y, windex, cwin.edges[windex], cwin.edges[windex + 1],
-                            left_i, right_i, kPpuXPixels, cwin.nr, cwin.bits);
-    }
-    left_i = IntMax(left_i, 0);
-    right_i = IntMin(right_i, kPpuXPixels);
-    if (right_i <= left_i)
-      continue;
-    uint32 left = (uint32)left_i;
-    uint32 right = (uint32)right_i;
+    uint32 left = cwin.edges[windex] + kPpuExtraLeftRight;
+    uint32 right = cwin.edges[windex + 1] + kPpuExtraLeftRight;
     uint32 clip_color_mask = (cw_clip_math & 1) ? 0x1f : 0;
     uint32 math_enabled_cur = (cw_clip_math & 0x100) ? math_enabled : 0;
     math_enabled_cur |= ppu->addSubscreen << 8 | ppu->subtractColor << 9;
@@ -1062,17 +1008,9 @@ static void PpuModernCompositeLine(Ppu *ppu, uint y, ModernRenderLine *line) {
 }
 
 static void PpuDrawWholeLineModernLayered(Ppu *ppu, uint y) {
-  static int modern_line_log_budget = 64;
-  bool log_line = (y <= 4 || y == 224 || y == 240) && modern_line_log_budget-- > 0;
-  if (log_line)
-    PpuWidescreenDebugLog("PpuDrawWholeLineModernLayered begin: y=%u forced=%d brightness=%u mode=%u screen0=0x%x screen1=0x%x",
-                          y, ppu->forcedBlank ? 1 : 0, ppu->brightness, ppu->mode,
-                          ppu->screenEnabled[0], ppu->screenEnabled[1]);
   if (ppu->forcedBlank) {
     uint8 *dst = &ppu->renderBuffer[(y - 1) * ppu->renderPitch];
     memset(dst, 0, sizeof(uint32) * kPpuXPixels);
-    if (log_line)
-      PpuWidescreenDebugLog("PpuDrawWholeLineModernLayered forced blank end: y=%u", y);
     return;
   }
 
@@ -1086,26 +1024,15 @@ static void PpuDrawWholeLineModernLayered(Ppu *ppu, uint y) {
   }
 
   PpuModernClearLine(&g_modern_render_line);
-  if (log_line)
-    PpuWidescreenDebugLog("PpuDrawWholeLineModernLayered after clear: y=%u", y);
   for (int custom_slot = 0; custom_slot < kModernCustomLayerCount; custom_slot++)
     PpuModernRenderCustomLayer(ppu, custom_slot, y, &g_modern_render_line.custom[custom_slot]);
-  if (log_line)
-    PpuWidescreenDebugLog("PpuDrawWholeLineModernLayered after custom: y=%u", y);
   PpuModernEmitSnesLayers(ppu, y, false, g_modern_render_line.snes);
-  if (log_line)
-    PpuWidescreenDebugLog("PpuDrawWholeLineModernLayered after main layers: y=%u", y);
   if (ppu->screenEnabled[1] != 0)
     PpuModernEmitSnesLayers(ppu, y, true, g_modern_render_line.subscreen);
-  if (log_line)
-    PpuWidescreenDebugLog("PpuDrawWholeLineModernLayered after subscreen: y=%u", y);
   PpuModernCompositeLine(ppu, y, &g_modern_render_line);
-  if (log_line)
-    PpuWidescreenDebugLog("PpuDrawWholeLineModernLayered end: y=%u", y);
 }
 
 static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
-  static int whole_line_log_budget = 48;
   if (ppu->forcedBlank) {
     uint8 *dst = &ppu->renderBuffer[(y - 1) * ppu->renderPitch];
     size_t n = sizeof(uint32) * (256 + ppu->extraLeftRight * 2);
@@ -1150,18 +1077,7 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
 
   uint32 windex = 0;
   do {
-    int left_i = cwin.edges[windex] + kPpuExtraLeftRight;
-    int right_i = cwin.edges[windex + 1] + kPpuExtraLeftRight;
-    if ((left_i < 0 || right_i > kPpuXPixels || right_i < left_i) && whole_line_log_budget-- > 0) {
-      PpuWidescreenDebugLog("PpuDrawWholeLine clamp: y=%u windex=%u edge=%d,%d mapped=%d,%d width=%d nr=%u bits=0x%x",
-                            y, windex, cwin.edges[windex], cwin.edges[windex + 1],
-                            left_i, right_i, kPpuXPixels, cwin.nr, cwin.bits);
-    }
-    left_i = IntMax(left_i, 0);
-    right_i = IntMin(right_i, kPpuXPixels);
-    if (right_i <= left_i)
-      continue;
-    uint32 left = (uint32)left_i, right = (uint32)right_i;
+    uint32 left = cwin.edges[windex] + kPpuExtraLeftRight, right = cwin.edges[windex + 1] + kPpuExtraLeftRight;
     // If clip is set, then zero out the rgb values from the main screen.
     uint32 clip_color_mask = (cw_clip_math & 1) ? 0x1f : 0;
     uint32 math_enabled_cur = (cw_clip_math & 0x100) ? math_enabled : 0;
@@ -1609,8 +1525,6 @@ static void PpuFixedTrigFromDegrees(int rotation_degrees, int *cos_fixed, int *s
 static bool ppu_evaluateTransformedSprite(Ppu* ppu, int line, int x, int y, int spriteSize,
                                           int oam1, int *tilesFound, int center_x2,
                                           int center_y2, int cos_fixed, int sin_fixed) {
-  int sprite_tile_limit = (ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits) ? 0x7fffffff :
-    (34 * (256 + ppu->extraLeftCur + ppu->extraRightCur) + 128) / 256;
   int sprite_center_x2 = 2 * x + spriteSize;
   int sprite_center_y2 = 2 * y + spriteSize;
   int rotated_center_x2 = PpuRotateFixedX2(sprite_center_x2, sprite_center_y2,
@@ -1621,15 +1535,13 @@ static bool ppu_evaluateTransformedSprite(Ppu* ppu, int line, int x, int y, int 
   int dst_top = PpuFloorDiv2(rotated_center_y2 - spriteSize);
   if (line < dst_top || line >= dst_top + spriteSize)
     return false;
-  int screen_left = -ppu->extraLeftCur;
-  int screen_right = 256 + ppu->extraRightCur;
-  if (dst_left <= screen_left - spriteSize || dst_left >= screen_right)
+  if (dst_left <= -spriteSize || dst_left >= 256)
     return false;
 
-  int px_left = IntMax(screen_left - dst_left, 0);
-  int px_right = IntMin(screen_right - dst_left, spriteSize);
+  int px_left = IntMax(-dst_left, 0);
+  int px_right = IntMin(256 - dst_left, spriteSize);
   *tilesFound += (px_right - px_left + 7) >> 3;
-  if (*tilesFound > sprite_tile_limit) {
+  if (*tilesFound > 34) {
     ppu->timeOver = true;
     return true;
   }
@@ -1682,12 +1594,6 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
   uint8_t index = ppu->objPriority ? (ppu->oamAdr & 0xfe) : 0;
   int spritesFound = 0;
   int tilesFound = 0;
-  int sprite_count_limit = (ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits) ? 0x7fffffff :
-    (32 * (256 + ppu->extraLeftCur + ppu->extraRightCur) + 128) / 256;
-  int sprite_tile_limit = (ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits) ? 0x7fffffff :
-    (34 * (256 + ppu->extraLeftCur + ppu->extraRightCur) + 128) / 256;
-  int screen_left = -ppu->extraLeftCur;
-  int screen_right = 256 + ppu->extraRightCur;
   for(int i = 0; i < 128; i++) {
     uint8_t y = ppu->oam[index] >> 8;
     // check if the sprite is on this line and get the sprite size
@@ -1709,12 +1615,12 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
                                         g_samus_sprite_transform_center_y2,
                                         cos_fixed, sin_fixed)) {
         spritesFound++;
-        if(spritesFound > sprite_count_limit) {
+        if(spritesFound > 32) {
           ppu->rangeOver = true;
           break;
         }
       }
-      if(tilesFound > sprite_tile_limit)
+      if(tilesFound > 34)
         break;
       index += 2;
       continue;
@@ -1730,12 +1636,12 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
                                         g_projectile_sprite_transform_cos[projectile_transform],
                                         g_projectile_sprite_transform_sin[projectile_transform])) {
         spritesFound++;
-        if(spritesFound > sprite_count_limit) {
+        if(spritesFound > 32) {
           ppu->rangeOver = true;
           break;
         }
       }
-      if(tilesFound > sprite_tile_limit)
+      if(tilesFound > 34)
         break;
       index += 2;
       continue;
@@ -1746,7 +1652,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
       if(x > -spriteSize) {
         // break if we found 32 sprites already
         spritesFound++;
-        if(spritesFound > sprite_count_limit) {
+        if(spritesFound > 32) {
           ppu->rangeOver = true;
           break;
         }
@@ -1764,10 +1670,10 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
         PpuZbufType z = paletteBase + (prio << 8);
 
         for(int col = 0; col < spriteSize; col += 8) {
-          if(col + x > screen_left - 8 && col + x < screen_right) {
+          if(col + x > -8 && col + x < 256) {
             // break if we found 34 8*1 slivers already
             tilesFound++;
-            if(tilesFound > sprite_tile_limit) {
+            if(tilesFound > 34) {
               ppu->timeOver = true;
               break;
             }
@@ -1777,8 +1683,8 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
             uint16 *addr = &ppu->vram[(objAdr + usedTile * 16 + (row & 0x7)) & 0x7fff];
             uint32 plane = addr[0] | addr[8] << 16;
             // go over each pixel
-            int px_left = IntMax(screen_left - (col + x), 0);
-            int px_right = IntMin(screen_right - (col + x), 8);
+            int px_left = IntMax(-(col + x + kPpuExtraLeftRight), 0);
+            int px_right = IntMin(256 + kPpuExtraLeftRight - (col + x), 8);
             PpuZbufType *dst = ppu->objBuffer.data + col + x + px_left + kPpuExtraLeftRight;
 
             for (int px = px_left; px < px_right; px++, dst++) {
@@ -1792,7 +1698,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
 
           }
         }
-        if(tilesFound > sprite_tile_limit) break; // break out of sprite-loop if max tiles found
+        if(tilesFound > 34) break; // break out of sprite-loop if max tiles found
       }
     }
     index += 2;

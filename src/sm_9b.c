@@ -3,6 +3,13 @@
 #include "variables.h"
 #include "funcs.h"
 
+extern uint8 g_dedicated_grapple_fire_pressed;
+extern uint8 g_dedicated_grapple_fire_held;
+
+static bool GrappleFireHeld(void) {
+  return (button_config_shoot_x & joypad1_lastkeys) != 0 || g_dedicated_grapple_fire_held;
+}
+
 #define g_off_9BA4B3 ((uint16*)RomFixedPtr(0x9ba4b3))
 #define g_off_9BA4CB ((uint16*)RomFixedPtr(0x9ba4cb))
 #define g_off_9BA4E3 ((uint16*)RomFixedPtr(0x9ba4e3))
@@ -687,7 +694,9 @@ void GrappleBeamHandler(void) {  // 0x9BC490
 }
 
 void GrappleBeamFunc_Inactive(void) {  // 0x9BC4F0
-  if ((button_config_shoot_x & joypad1_newkeys) != 0 || (button_config_shoot_x & joypad1_newinput_samusfilter) != 0) {
+  if ((button_config_shoot_x & joypad1_newkeys) != 0 ||
+      (button_config_shoot_x & joypad1_newinput_samusfilter) != 0 ||
+      g_dedicated_grapple_fire_pressed) {
     GrappleBeamFunc_FireGoToCancel();
   } else if (flare_counter) {
     flare_counter = 0;
@@ -804,7 +813,7 @@ uint8 ClearCarry_12(void) {  // 0x9BC701
 }
 
 void GrappleBeamFunc_Firing(void) {  // 0x9BC703
-  if ((button_config_shoot_x & joypad1_lastkeys) == 0) {
+  if (!GrappleFireHeld()) {
     grapple_beam_function = FUNC16(GrappleBeamFunc_Cancel);
     return;
   }
@@ -836,14 +845,14 @@ void GrappleBeamFunc_Firing(void) {  // 0x9BC703
 }
 
 void GrappleBeamFunc_ConnectedLockedInPlace(void) {  // 0x9BC77E
-  if ((button_config_shoot_x & joypad1_lastkeys) != 0 && (GrappleBeam_CollDetect_Enemy().k || CheckIfGrappleIsConnectedToBlock())) {
+  if (GrappleFireHeld() && (GrappleBeam_CollDetect_Enemy().k || CheckIfGrappleIsConnectedToBlock())) {
   } else {
     grapple_beam_function = FUNC16(GrappleBeamFunc_Cancel);
   }
 }
 
 void GrappleBeamFunc_Connected_Swinging(void) {  // 0x9BC79D
-  if ((button_config_shoot_x & joypad1_lastkeys) != 0) {
+  if (GrappleFireHeld()) {
     GrappleBeamFunc_BB64();
     if (grapple_beam_length_delta)
       BlockFunc_AC31();
@@ -874,7 +883,7 @@ LABEL_2:
 }
 
 void GrappleBeamFunc_Wallgrab(void) {  // 0x9BC814
-  if ((button_config_shoot_x & joypad1_lastkeys) != 0 && CheckIfGrappleIsConnectedToBlock() & 1) {
+  if (GrappleFireHeld() && CheckIfGrappleIsConnectedToBlock() & 1) {
 
   } else {
     grapple_walljump_timer = 30;
