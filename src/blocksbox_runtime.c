@@ -23,6 +23,7 @@ typedef struct BlocksBoxRuntimeLevelEntry {
   char *level_id;
   char *level_path;
   char *tileset_id;
+  char *preview_image_path;
   int area_index;
   int graphics_set;
   bool has_custom_background;
@@ -56,6 +57,7 @@ static const BlocksBoxRuntimeTilesetEntry *BlocksBoxRuntime_FindTilesetById(cons
 static const BlocksBoxRuntimeLevelEntry *BlocksBoxRuntime_FindLevelByRoomState(uint16_t room_address, uint16_t state_address);
 static void BlocksBoxRuntime_GetDirectoryName(const char *path, char *dst, size_t dst_size);
 static char *BlocksBoxRuntime_ResolvePackagePath(const char *index_path, const char *value);
+static const char *BlocksBoxRuntime_NextTsvField(char **fields);
 static int BlocksBoxRuntime_ParseIntField(const char *value);
 static uint16_t BlocksBoxRuntime_ParseHex16Field(const char *value);
 static bool BlocksBoxRuntime_ParseBoolField(const char *value);
@@ -138,6 +140,18 @@ int BlocksBoxRuntime_GetTilesetCount(void) {
   return g_blocksbox_runtime.tilesets_count;
 }
 
+const char *BlocksBoxRuntime_GetLevelIdByIndex(int index) {
+  if (index < 0 || index >= g_blocksbox_runtime.levels_count)
+    return NULL;
+  return g_blocksbox_runtime.levels[index].level_id;
+}
+
+const char *BlocksBoxRuntime_GetLevelPreviewPathByIndex(int index) {
+  if (index < 0 || index >= g_blocksbox_runtime.levels_count)
+    return NULL;
+  return g_blocksbox_runtime.levels[index].preview_image_path;
+}
+
 const char *BlocksBoxRuntime_GetTilesetIdByIndex(int index) {
   if (index < 0 || index >= g_blocksbox_runtime.tilesets_count)
     return NULL;
@@ -213,6 +227,7 @@ static void BlocksBoxRuntime_FreeLevelEntry(BlocksBoxRuntimeLevelEntry *entry) {
   free(entry->level_id);
   free(entry->level_path);
   free(entry->tileset_id);
+  free(entry->preview_image_path);
   memset(entry, 0, sizeof(*entry));
 }
 
@@ -266,18 +281,23 @@ static bool BlocksBoxRuntime_LoadTilesetsIndex(const char *path) {
       return false;
     }
     entry = &g_blocksbox_runtime.tilesets[g_blocksbox_runtime.tilesets_count];
-    entry->tileset_id = strdup(NextDelim(&fields, '\t'));
-    entry->area_index = BlocksBoxRuntime_ParseIntField(NextDelim(&fields, '\t'));
-    entry->graphics_set = BlocksBoxRuntime_ParseIntField(NextDelim(&fields, '\t'));
-    entry->palette_id = strdup(NextDelim(&fields, '\t'));
-    entry->palette_path = BlocksBoxRuntime_ResolvePackagePath(path, NextDelim(&fields, '\t'));
-    entry->art_manifest_path = BlocksBoxRuntime_ResolvePackagePath(path, NextDelim(&fields, '\t'));
-    entry->preview_image_path = BlocksBoxRuntime_ResolvePackagePath(path, NextDelim(&fields, '\t'));
-    entry->tile_count = BlocksBoxRuntime_ParseIntField(NextDelim(&fields, '\t'));
+    entry->tileset_id = strdup(BlocksBoxRuntime_NextTsvField(&fields));
+    entry->area_index = BlocksBoxRuntime_ParseIntField(BlocksBoxRuntime_NextTsvField(&fields));
+    entry->graphics_set = BlocksBoxRuntime_ParseIntField(BlocksBoxRuntime_NextTsvField(&fields));
+    entry->palette_id = strdup(BlocksBoxRuntime_NextTsvField(&fields));
+    entry->palette_path = BlocksBoxRuntime_ResolvePackagePath(path, BlocksBoxRuntime_NextTsvField(&fields));
+    entry->art_manifest_path = BlocksBoxRuntime_ResolvePackagePath(path, BlocksBoxRuntime_NextTsvField(&fields));
+    entry->preview_image_path = BlocksBoxRuntime_ResolvePackagePath(path, BlocksBoxRuntime_NextTsvField(&fields));
+    entry->tile_count = BlocksBoxRuntime_ParseIntField(BlocksBoxRuntime_NextTsvField(&fields));
     if (!entry->tileset_id || !entry->palette_id || !entry->palette_path ||
         !entry->art_manifest_path || !entry->preview_image_path) {
       free(text);
       return false;
+    }
+    if (!entry->tileset_id[0] || !entry->palette_id[0] || !entry->palette_path[0] ||
+        !entry->art_manifest_path[0] || !entry->preview_image_path[0]) {
+      BlocksBoxRuntime_FreeTilesetEntry(entry);
+      continue;
     }
     g_blocksbox_runtime.tilesets_count++;
   }
@@ -306,17 +326,22 @@ static bool BlocksBoxRuntime_LoadLevelsIndex(const char *path) {
       return false;
     }
     entry = &g_blocksbox_runtime.levels[g_blocksbox_runtime.levels_count];
-    entry->room_address = BlocksBoxRuntime_ParseHex16Field(NextDelim(&fields, '\t'));
-    entry->state_address = BlocksBoxRuntime_ParseHex16Field(NextDelim(&fields, '\t'));
-    entry->level_id = strdup(NextDelim(&fields, '\t'));
-    entry->level_path = BlocksBoxRuntime_ResolvePackagePath(path, NextDelim(&fields, '\t'));
-    entry->tileset_id = strdup(NextDelim(&fields, '\t'));
-    entry->area_index = BlocksBoxRuntime_ParseIntField(NextDelim(&fields, '\t'));
-    entry->graphics_set = BlocksBoxRuntime_ParseIntField(NextDelim(&fields, '\t'));
-    entry->has_custom_background = BlocksBoxRuntime_ParseBoolField(NextDelim(&fields, '\t'));
-    if (!entry->level_id || !entry->level_path || !entry->tileset_id) {
+    entry->room_address = BlocksBoxRuntime_ParseHex16Field(BlocksBoxRuntime_NextTsvField(&fields));
+    entry->state_address = BlocksBoxRuntime_ParseHex16Field(BlocksBoxRuntime_NextTsvField(&fields));
+    entry->level_id = strdup(BlocksBoxRuntime_NextTsvField(&fields));
+    entry->level_path = BlocksBoxRuntime_ResolvePackagePath(path, BlocksBoxRuntime_NextTsvField(&fields));
+    entry->tileset_id = strdup(BlocksBoxRuntime_NextTsvField(&fields));
+    entry->area_index = BlocksBoxRuntime_ParseIntField(BlocksBoxRuntime_NextTsvField(&fields));
+    entry->graphics_set = BlocksBoxRuntime_ParseIntField(BlocksBoxRuntime_NextTsvField(&fields));
+    entry->has_custom_background = BlocksBoxRuntime_ParseBoolField(BlocksBoxRuntime_NextTsvField(&fields));
+    entry->preview_image_path = BlocksBoxRuntime_ResolvePackagePath(path, BlocksBoxRuntime_NextTsvField(&fields));
+    if (!entry->level_id || !entry->level_path || !entry->tileset_id || !entry->preview_image_path) {
       free(text);
       return false;
+    }
+    if (!entry->level_id[0] || !entry->level_path[0] || !entry->tileset_id[0] || !entry->preview_image_path[0]) {
+      BlocksBoxRuntime_FreeLevelEntry(entry);
+      continue;
     }
     g_blocksbox_runtime.levels_count++;
   }
@@ -361,6 +386,11 @@ static char *BlocksBoxRuntime_ResolvePackagePath(const char *index_path, const c
   snprintf(candidate, sizeof(candidate), "%s/%s", output_root, value);
 #endif
   return strdup(candidate);
+}
+
+static const char *BlocksBoxRuntime_NextTsvField(char **fields) {
+  char *value = NextDelim(fields, '\t');
+  return value ? value : "";
 }
 
 static bool BlocksBoxRuntime_EnsureTilesetCapacity(void) {

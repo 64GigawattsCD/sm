@@ -11,3 +11,5 @@ SDL2.dll
 /sm.exe
 /glsl-shaders/
 /debug_screenshots/
+/debug_widescreen.log
+/sm.user.ini

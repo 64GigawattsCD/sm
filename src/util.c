@@ -60,6 +60,8 @@ char *NextLineStripComments(char **s) {
   char *p = *s;
   if (p == NULL)
     return NULL;
+  if ((uint8)p[0] == 0xef && (uint8)p[1] == 0xbb && (uint8)p[2] == 0xbf)
+    p += 3;
   // find end of line
   char *eol = strchr(p, '\n');
   *s = eol ? eol + 1 : NULL;

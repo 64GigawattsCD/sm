@@ -10,6 +10,8 @@ bool BlocksBoxRuntime_IsLoaded(void);
 const char *BlocksBoxRuntime_GetGameId(void);
 int BlocksBoxRuntime_GetLevelCount(void);
 int BlocksBoxRuntime_GetTilesetCount(void);
+const char *BlocksBoxRuntime_GetLevelIdByIndex(int index);
+const char *BlocksBoxRuntime_GetLevelPreviewPathByIndex(int index);
 const char *BlocksBoxRuntime_GetTilesetIdByIndex(int index);
 const char *BlocksBoxRuntime_GetTilesetPreviewPathByIndex(int index);
 int BlocksBoxRuntime_GetTilesetAreaIndexByIndex(int index);
