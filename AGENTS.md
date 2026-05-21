@@ -71,6 +71,7 @@ This file is for future coding agents working in this repository.
 - The PC-native main menu now has a prototype `Level Editor` browser path: it opens a BlocksBox pack list, currently with `Super Metroid`, then a pack page with `Level List` and `Tile Sets`; `Tile Sets` browses imported Super Metroid tilesets and shows exported preview images on hover. The first crash on selection was caused by BOM-prefixed TSV headers being parsed as data; TSV readers should continue to tolerate BOM/comment/header rows and missing fields.
 - BlocksBox tileset previews should render each tile once into the smallest near-square power-of-two grid that fits, up to 64x64 cells, leaving unused cells black instead of repeating tiles.
 - BlocksBox now exports level preview BMPs for each Super Metroid room state by drawing the optional background tile layer first and the foreground tile layer on top, using the room dimensions in 16x16 blocks and the state's selected tileset. Future level preview work should add optional BTS/collision and scroll-screen overlays.
+- Cinematic export work is starting on branch `cinematics`. The chosen video target is Matroska `.mkv` with FFV1 lossless video and FLAC audio; the first BlocksBox milestone is a profile-driven Super Metroid title-scene asset dump plus encoding-plan manifest, keeping emulator-like code out of BlocksBox unless a concrete cinematic profile requires it.
 
 ## Update Guidance
 
