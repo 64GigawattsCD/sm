@@ -1918,6 +1918,8 @@ void DrawOneEnemy(void) {  // 0xA09423
 }
 
 static bool IsGunshipEnemyForModernCustomLayer(const EnemyData *E) {
+  if (!E->enemy_ptr)
+    return false;
   EnemyDef *ED = get_EnemyDef_A2(E->enemy_ptr);
   return ED->ai_init == fnGunshipTop_Init || ED->ai_init == fnGunshipBottom_Init;
 }

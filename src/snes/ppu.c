@@ -19,6 +19,7 @@ typedef uint8_t uint8;
 extern bool g_new_ppu;
 bool g_modern_layer_renderer;
 bool g_modern_layer_debug;
+bool g_native_level_render_enabled;
 extern bool g_samus_sprite_transform_enabled;
 extern int g_samus_sprite_transform_rotation;
 extern int g_samus_sprite_transform_oam_start;
@@ -721,6 +722,7 @@ typedef struct ModernRenderLayerLine {
   uint32 pixels[kPpuXPixels];
   uint8 palette[kPpuXPixels];
   uint8 math_layer[kPpuXPixels];
+  uint8 snes_equiv[kPpuXPixels];
 } ModernRenderLayerLine;
 
 typedef struct ModernRenderLine {
@@ -763,7 +765,6 @@ static void PpuModernClearLine(ModernRenderLine *line) {
 }
 
 static void PpuModernRenderCustomLayer(Ppu *ppu, int custom_slot, uint y, ModernRenderLayerLine *dst) {
-  (void)ppu;
   if (custom_slot != kModernFrontCustomLayer)
     RtlRenderModernCustomLayer(custom_slot, y, dst->pixels, kPpuXPixels, 240);
   if (g_modern_layer_debug) {
@@ -834,7 +835,14 @@ static void PpuModernEmitBackdrop(Ppu *ppu, ModernRenderLayerLine *dst) {
     dst->pixels[x] = color;
     dst->palette[x] = 0;
     dst->math_layer[x] = 5;
+    dst->snes_equiv[x] = 1;
   }
+}
+
+static void PpuModernEmitNativeBackdrop(Ppu *ppu, ModernRenderLayerLine *dst) {
+  if (!g_native_level_render_enabled)
+    return;
+  PpuModernEmitBackdrop(ppu, dst);
 }
 
 static void PpuModernEmitBgLayer(Ppu *ppu, uint y, bool sub, int layer, bool priority, ModernRenderLayerLine *dst) {
@@ -848,8 +856,32 @@ static void PpuModernEmitBgLayer(Ppu *ppu, uint y, bool sub, int layer, bool pri
       dst[slot].pixels[x] = 0xff000000 | PpuModernRgbFromCgram(ppu, ppu->cgram[pixel & 0xff]);
       dst[slot].palette[x] = pixel & 0xff;
       dst[slot].math_layer[x] = layer;
+      dst[slot].snes_equiv[x] = 1;
     }
   }
+}
+
+static void PpuModernEmitNativeBgLayer(Ppu *ppu, uint y, int layer, bool priority, ModernRenderLayerLine *dst) {
+  int slot = PpuModernSnesSlotForPriority(PpuModernBgPriorityNibble(ppu, layer, priority));
+  if (slot < 0 || slot >= kModernFrontCustomLayer)
+    return;
+
+  for (int x = 0; x < kPpuXPixels; x++) {
+    int pixel = PpuModernGetBgPixel(ppu, x, y, false, layer, priority);
+    if (pixel != 0) {
+      dst[slot].pixels[x] = 0xff000000 | PpuModernRgbFromCgram(ppu, ppu->cgram[pixel & 0xff]);
+      dst[slot].palette[x] = pixel & 0xff;
+      dst[slot].math_layer[x] = layer;
+      dst[slot].snes_equiv[x] = 1;
+    }
+  }
+}
+
+static void PpuModernEmitNativeBg1(Ppu *ppu, uint y, ModernRenderLayerLine *dst) {
+  if (!g_native_level_render_enabled)
+    return;
+  PpuModernEmitNativeBgLayer(ppu, y, 0, false, dst);
+  PpuModernEmitNativeBgLayer(ppu, y, 0, true, dst);
 }
 
 static void PpuModernEmitSpriteLayer(Ppu *ppu, bool sub, int sprite_priority, ModernRenderLayerLine *dst) {
@@ -865,6 +897,7 @@ static void PpuModernEmitSpriteLayer(Ppu *ppu, bool sub, int sprite_priority, Mo
       dst[slot].pixels[x] = 0xff000000 | PpuModernRgbFromCgram(ppu, ppu->cgram[pixel & 0xff]);
       dst[slot].palette[x] = pixel & 0xff;
       dst[slot].math_layer[x] = (pixel >> 8) & 0xf;
+      dst[slot].snes_equiv[x] = 1;
     }
   }
 }
@@ -873,7 +906,8 @@ static void PpuModernEmitSnesLayers(Ppu *ppu, uint y, bool sub, ModernRenderLaye
   int actMode = ppu->mode == 1 && ppu->bg3priority ? 8 : ppu->mode;
   actMode = ppu->mode == 7 && ppu->m7extBg ? 9 : actMode;
 
-  PpuModernEmitBackdrop(ppu, &dst[0]);
+  if (!g_native_level_render_enabled)
+    PpuModernEmitBackdrop(ppu, &dst[0]);
 
   if (ppu->mode == 7)
     ppu_calculateMode7Starts(ppu, y);
@@ -973,14 +1007,45 @@ static void PpuModernCompositeLine(Ppu *ppu, uint y, ModernRenderLine *line) {
     for (uint32 x = left; x < right; x++) {
       int top_main_slot = PpuModernFindTopSnesSlot(line->snes, x);
       int top_sub_slot = PpuModernFindTopSnesSlot(line->subscreen, x);
-      uint32 snes_color = PpuModernApplyColorMath(ppu, math_enabled_cur,
-                                                  &line->snes[top_main_slot],
-                                                  &line->subscreen[top_sub_slot],
-                                                  x, clip_color_mask);
+      bool has_snes_pixel = !g_native_level_render_enabled || line->snes[top_main_slot].pixels[x] != 0;
+      uint32 snes_color = has_snes_pixel ? PpuModernApplyColorMath(ppu, math_enabled_cur,
+                                                                    &line->snes[top_main_slot],
+                                                                    &line->subscreen[top_sub_slot],
+                                                                    x, clip_color_mask) : 0;
       uint32 color = 0xff000000;
+      int native_bg1_low_slot = PpuModernSnesSlotForPriority(PpuModernBgPriorityNibble(ppu, 0, false));
+      int native_bg1_high_slot = PpuModernSnesSlotForPriority(PpuModernBgPriorityNibble(ppu, 0, true));
       for (int slot = 0; slot < kModernSnesLayerCount; slot++) {
-        color = PpuModernBlendOver(color, line->custom[slot].pixels[x]);
-        if (slot == top_main_slot)
+        bool native_bg1_slot = g_native_level_render_enabled &&
+            (slot == native_bg1_low_slot || slot == native_bg1_high_slot);
+        bool native_bg1_pixel = native_bg1_slot &&
+            line->custom[slot].pixels[x] != 0 &&
+            line->custom[slot].snes_equiv[x] &&
+            line->custom[slot].math_layer[x] == 0;
+        if (native_bg1_pixel) {
+          if (slot == top_main_slot && has_snes_pixel)
+            color = PpuModernBlendOver(color, snes_color);
+          else
+            color = PpuModernBlendOver(color, line->snes[slot].pixels[x]);
+
+          uint32 custom_color = PpuModernApplyColorMath(ppu, math_enabled_cur,
+                                                        &line->custom[slot],
+                                                        &line->subscreen[top_sub_slot],
+                                                        x, clip_color_mask);
+          color = PpuModernBlendOver(color, custom_color);
+          continue;
+        }
+
+        if (line->custom[slot].pixels[x] != 0) {
+          uint32 custom_color = line->custom[slot].snes_equiv[x] ?
+              PpuModernApplyColorMath(ppu, math_enabled_cur,
+                                      &line->custom[slot],
+                                      &line->subscreen[top_sub_slot],
+                                      x, clip_color_mask) :
+              line->custom[slot].pixels[x];
+          color = PpuModernBlendOver(color, custom_color);
+        }
+        if (slot == top_main_slot && has_snes_pixel)
           color = PpuModernBlendOver(color, snes_color);
         else
           color = PpuModernBlendOver(color, line->snes[slot].pixels[x]);
@@ -1026,6 +1091,8 @@ static void PpuDrawWholeLineModernLayered(Ppu *ppu, uint y) {
   PpuModernClearLine(&g_modern_render_line);
   for (int custom_slot = 0; custom_slot < kModernCustomLayerCount; custom_slot++)
     PpuModernRenderCustomLayer(ppu, custom_slot, y, &g_modern_render_line.custom[custom_slot]);
+  PpuModernEmitNativeBackdrop(ppu, &g_modern_render_line.custom[0]);
+  PpuModernEmitNativeBg1(ppu, y, g_modern_render_line.custom);
   PpuModernEmitSnesLayers(ppu, y, false, g_modern_render_line.snes);
   if (ppu->screenEnabled[1] != 0)
     PpuModernEmitSnesLayers(ppu, y, true, g_modern_render_line.subscreen);

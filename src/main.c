@@ -49,6 +49,8 @@ static void HandleVolumeAdjustment(int volume_adjustment);
 static void HandleAspectRatioSelection(int direction);
 static void ApplyRuntimeAspectRatio(void);
 static void SaveNativeOptionsConfig(void);
+static void SetModernLayerRendererEnabled(bool enabled);
+static void ToggleNativeLevelRenderMode(void);
 static void HandleGamepadAxisInput(int gamepad_id, int axis, int value);
 static int RemapSdlButton(int button);
 static void HandleGamepadInput(int button, bool pressed);
@@ -60,6 +62,7 @@ static bool IsGameplayMovementState(void);
 static uint16 GetNativeMenuInputs(void);
 static void UpdateOpeningIntroSkipState(uint16 inputs);
 static void MaybeActivateNativeMainMenu(void);
+static void OpenNativeMainMenuScene(void);
 static void OpenNativeLevelEditor(uint16 held_inputs);
 static void CloseNativeLevelEditor(void);
 static void UnloadNativeLevelEditorPreview(void);
@@ -142,6 +145,7 @@ static bool g_shinespark_screenshot_requested;
 static bool g_manual_screenshot_requested;
 static bool g_room_load_screenshot_requested;
 static bool g_main_menu_screenshot_requested;
+static bool g_native_level_render_saved_modern_layer_renderer;
 static int g_shinespark_screenshot_counter;
 static int g_manual_screenshot_counter;
 static int g_room_load_screenshot_counter;
@@ -154,6 +158,7 @@ static int g_startup_screenshot_timer = 1;
 static bool g_native_main_menu_active;
 static bool g_native_main_menu_dismissed;
 static bool g_native_main_menu_return_from_options;
+static bool g_native_main_menu_scene_pending;
 static int g_native_main_menu_selection;
 static uint16 g_native_main_menu_prev_inputs;
 static bool g_native_main_menu_quit_requested;
@@ -983,6 +988,26 @@ static void ApplyRuntimeAspectRatio(void) {
     SDL_SetWindowSize(g_window, g_current_window_scale * g_snes_width, g_current_window_scale * g_snes_height);
 }
 
+static void SetModernLayerRendererEnabled(bool enabled) {
+  if (enabled)
+    g_ppu_render_flags |= kPpuRenderFlags_ModernLayerRenderer;
+  else
+    g_ppu_render_flags &= ~kPpuRenderFlags_ModernLayerRenderer;
+  g_modern_layer_renderer = enabled;
+}
+
+static void ToggleNativeLevelRenderMode(void) {
+  if (!g_native_level_render_enabled) {
+    g_native_level_render_saved_modern_layer_renderer = g_modern_layer_renderer;
+    g_native_level_render_enabled = true;
+    SetModernLayerRendererEnabled(true);
+  } else {
+    g_native_level_render_enabled = false;
+    SetModernLayerRendererEnabled(g_native_level_render_saved_modern_layer_renderer);
+  }
+  printf("[Native level renderer]=%s\n", g_native_level_render_enabled ? "on" : "off");
+}
+
 static void SdlRenderer_BeginDraw(int width, int height, uint8 **pixels, int *pitch) {
   g_sdl_renderer_rect.w = width;
   g_sdl_renderer_rect.h = height;
@@ -1245,6 +1270,8 @@ int main(int argc, char** argv) {
     static uint32 previous_gamepad_modifiers;
     uint32 gamepad_new_modifiers = g_gamepad_modifiers & ~previous_gamepad_modifiers;
     previous_gamepad_modifiers = g_gamepad_modifiers;
+    if (gamepad_new_modifiers & (1u << kGamepadBtn_L3))
+      ToggleNativeLevelRenderMode();
     g_dedicated_missile_fire_pressed = 0;
     g_dedicated_missile_toggle_pressed = 0;
     g_dedicated_beam_fire_held = 0;
@@ -1271,6 +1298,10 @@ int main(int argc, char** argv) {
       uint16 game_inputs = MaskExitToMainMenuPromptInputs((uint16)menu_inputs);
       UpdateExitToMainMenuPrompt((uint16)menu_inputs);
       is_replay = RtlRunFrame(game_inputs);
+      if (g_native_main_menu_scene_pending) {
+        g_native_main_menu_scene_pending = false;
+        OpenNativeMainMenuScene();
+      }
       g_snes->disableRender = (g_turbo ^ (is_replay & g_replay_turbo)) && (frameCtr & (g_turbo ? 0xf : 0x7f)) != 0;
     } else if (g_native_level_editor_active) {
       uint16 game_inputs = MaskNativeLevelEditorInputs((uint16)menu_inputs);
@@ -1598,6 +1629,10 @@ static void ClearTransientMenuInputs(void) {
 }
 
 static void OpenNativeMainMenuScene(void) {
+  if (g_native_level_render_enabled) {
+    g_native_level_render_enabled = false;
+    SetModernLayerRendererEnabled(g_native_level_render_saved_modern_layer_renderer);
+  }
   reg_BG1HOFS = 0;
   reg_BG1VOFS = 0;
   reg_BG2HOFS = 0;
@@ -1619,6 +1654,7 @@ static void OpenNativeMainMenuScene(void) {
   g_native_main_menu_active = false;
   g_native_main_menu_dismissed = false;
   g_native_main_menu_return_from_options = false;
+  g_native_main_menu_scene_pending = false;
   g_native_level_editor_active = false;
   g_native_level_editor_page = kNativeLevelEditorPage_PackList;
   g_native_level_editor_pack_selection = 0;
@@ -1941,7 +1977,7 @@ static void UpdateExitToMainMenuPrompt(uint16 inputs) {
 
   if (MenuHasConfirmInput(new_inputs)) {
     if (g_exit_to_main_menu_prompt_selection_yes)
-      OpenNativeMainMenuScene();
+      g_native_main_menu_scene_pending = true;
     else {
       g_exit_to_main_menu_prompt_active = false;
       g_exit_to_main_menu_prompt_prev_inputs = 0;
@@ -2373,6 +2409,8 @@ static void RenderBuildTimestampOverlay(uint8 *pixel_buffer, size_t pitch, int w
 }
 
 static bool IsGunshipEnemyData(const EnemyData *E) {
+  if (!E->enemy_ptr)
+    return false;
   EnemyDef *ED = get_EnemyDef_A2(E->enemy_ptr);
   return ED->ai_init == fnGunshipTop_Init || ED->ai_init == fnGunshipBottom_Init;
 }
@@ -2506,6 +2544,8 @@ static void RenderModernGunshipCustomLayerLine(int custom_slot, int y, uint32 *p
     return;
   if (!g_modern_layer_renderer)
     return;
+  if (custom_slot != 3 && custom_slot != 7 && custom_slot != 11 && custom_slot != 15)
+    return;
 
   Ppu *ppu = g_snes->ppu;
   for (int i = 0; i < num_enemies_in_room; i++) {
@@ -2581,7 +2621,19 @@ static void RenderAnalogDebugOverlay(uint8 *pixel_buffer, size_t pitch, int widt
   int arrow_box = 18 * scale;
   int arrow_cx = width - 14 * scale;
   int arrow_cy = height - 14 * scale;
+  const char *mode_text = g_native_level_render_enabled ? "NATIVE" : "SNES";
+  int mode_w = 44 * scale;
+  int mode_h = 12 * scale;
+  int mode_x = arrow_cx - arrow_box / 2 - mode_w - 4 * scale;
+  int mode_y = arrow_cy - mode_h / 2;
+  uint32 mode_color = g_native_level_render_enabled ? 0x8FEA7D : 0xC5D0D8;
   float aim_x, aim_y;
+
+  FillRectAlpha(pixel_buffer, pitch, width, height, mode_x, mode_y, mode_w, mode_h, 0x101722, 176);
+  DrawRectOutline(pixel_buffer, pitch, width, height,
+      mode_x, mode_y, mode_w, mode_h, IntMax(1, scale), mode_color);
+  DrawText5x7(pixel_buffer, pitch, width, height,
+      mode_x + 4 * scale, mode_y + 3 * scale, mode_text, scale, mode_color);
 
   Samus_GetNormalizedAimDirection(&aim_x, &aim_y);
   DrawRectOutline(pixel_buffer, pitch, width, height,
@@ -2791,8 +2843,9 @@ static void HandleCommand(uint32 j, bool pressed) {
       g_new_ppu = (g_ppu_render_flags & kPpuRenderFlags_NewRenderer) != 0;
       break;
     case kKeys_ToggleModernLayerRenderer:
-      g_ppu_render_flags ^= kPpuRenderFlags_ModernLayerRenderer;
-      g_modern_layer_renderer = (g_ppu_render_flags & kPpuRenderFlags_ModernLayerRenderer) != 0;
+      SetModernLayerRendererEnabled(!g_modern_layer_renderer);
+      if (g_native_level_render_enabled && !g_modern_layer_renderer)
+        g_native_level_render_enabled = false;
       printf("[Modern layer renderer]=%s\n", g_modern_layer_renderer ? "on" : "off");
       break;
     case kKeys_ToggleModernLayerDebug:

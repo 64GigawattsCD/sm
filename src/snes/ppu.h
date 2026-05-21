@@ -13,6 +13,7 @@ typedef struct Ppu Ppu;
 
 extern bool g_modern_layer_renderer;
 extern bool g_modern_layer_debug;
+extern bool g_native_level_render_enabled;
 
 enum {
   kModernSnesLayerCount = 16,
