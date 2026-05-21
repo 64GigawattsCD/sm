@@ -145,13 +145,17 @@ static bool g_shinespark_screenshot_requested;
 static bool g_manual_screenshot_requested;
 static bool g_room_load_screenshot_requested;
 static bool g_main_menu_screenshot_requested;
+static bool g_toggle_screenshot_requested;
 static bool g_native_level_render_saved_modern_layer_renderer;
 static int g_shinespark_screenshot_counter;
 static int g_manual_screenshot_counter;
 static int g_room_load_screenshot_counter;
 static int g_main_menu_screenshot_counter;
+static int g_toggle_screenshot_counter;
 static int g_room_load_screenshot_timer;
 static int g_main_menu_screenshot_timer;
+static int g_toggle_screenshot_timer;
+static char g_toggle_screenshot_prefix[64];
 static int g_startup_screenshot_counter;
 static int g_startup_screenshot_remaining = 24;
 static int g_startup_screenshot_timer = 1;
@@ -720,6 +724,66 @@ void DebugRequestShinesparkScreenshot(void) {
   g_shinespark_screenshot_requested = true;
 }
 
+static void QueueToggleScreenshot(const char *prefix) {
+  snprintf(g_toggle_screenshot_prefix, sizeof(g_toggle_screenshot_prefix), "%s", prefix);
+  g_toggle_screenshot_requested = true;
+  g_toggle_screenshot_timer = 3;
+}
+
+static bool IsNativeTitleLogoPixel(uint32 color) {
+  uint8 r = (uint8)((color >> 16) & 0xff);
+  uint8 g = (uint8)((color >> 8) & 0xff);
+  uint8 b = (uint8)(color & 0xff);
+  return (r > 70 && (g > 35 || b < 90)) ||
+         (r > 170 && g > 120 && b > 80);
+}
+
+static void ApplyNativeTitleSceneBackdropCompensation(uint8 *pixel_buffer, size_t pitch, int width, int height, int scale) {
+  if (!g_native_level_render_enabled ||
+      game_state != kGameState_1_OpeningCinematic ||
+      scale <= 0)
+    return;
+
+  int shift = scale;
+  if (shift >= height)
+    return;
+
+  size_t row_bytes = (size_t)width * sizeof(uint32);
+
+  int top_end_y = IntMin(82 * scale, height - shift);
+  int logo_left = 40 * scale;
+  int logo_right = IntMin(218 * scale, width);
+  int logo_top = 10 * scale;
+  int logo_bottom = 84 * scale;
+  int trademark_left = 216 * scale;
+  int trademark_right = IntMin(230 * scale, width);
+  int trademark_top = 60 * scale;
+  int trademark_bottom = 78 * scale;
+  for (int y = 0; y < top_end_y; y++) {
+    uint32 *dst = (uint32 *)(pixel_buffer + (size_t)y * pitch);
+    uint32 *src = (uint32 *)(pixel_buffer + (size_t)(y + shift) * pitch);
+    bool in_logo_y = y >= logo_top && y < logo_bottom;
+    bool in_trademark_y = y >= trademark_top && y < trademark_bottom;
+    for (int x = 0; x < width; x++) {
+      if (in_trademark_y && x >= trademark_left && x < trademark_right)
+        continue;
+      if (in_logo_y && x >= logo_left && x < logo_right &&
+          (IsNativeTitleLogoPixel(dst[x]) || IsNativeTitleLogoPixel(src[x])))
+        continue;
+      dst[x] = src[x];
+    }
+  }
+
+  int start_y = 96 * scale;
+  if (start_y < 0 || start_y + shift >= height)
+    return;
+
+  for (int y = start_y; y < height - shift; y++)
+    memmove(pixel_buffer + (size_t)y * pitch,
+            pixel_buffer + (size_t)(y + shift) * pitch,
+            row_bytes);
+}
+
 static void DrawPpuFrameWithPerf(void) {
   int render_scale = PpuGetCurrentRenderScale(g_snes->ppu, g_ppu_render_flags);
   uint8 *pixel_buffer = 0;
@@ -742,20 +806,20 @@ static void DrawPpuFrameWithPerf(void) {
   } else {
     RtlDrawPpuFrame(pixel_buffer, pitch, g_ppu_render_flags);
   }
+  ApplyNativeTitleSceneBackdropCompensation(pixel_buffer, pitch,
+                                            g_snes_width * render_scale,
+                                            g_snes_height * render_scale,
+                                            render_scale);
   if (g_display_perf)
     RenderNumber(pixel_buffer + pitch * render_scale, pitch, g_curr_fps, render_scale == 4);
 
-  if (!g_modern_layer_renderer) {
-    RenderAnalogDebugOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
-    RenderOpeningIntroSkipPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
-    RenderNativeMainMenu(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
-    RenderNativeLevelEditor(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
-    RenderNativeOptionsOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
-    RenderExitToMainMenuPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
-    RenderBuildTimestampOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
-  } else {
-    CompositeModernFrontCustomLayer(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
-  }
+  RenderAnalogDebugOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+  RenderOpeningIntroSkipPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+  RenderNativeMainMenu(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+  RenderNativeLevelEditor(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+  RenderNativeOptionsOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+  RenderExitToMainMenuPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+  RenderBuildTimestampOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
   if (g_shinespark_screenshot_requested) {
     g_shinespark_screenshot_requested = false;
     SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
@@ -777,6 +841,11 @@ static void DrawPpuFrameWithPerf(void) {
     g_main_menu_screenshot_requested = false;
     SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
                         "main_menu", &g_main_menu_screenshot_counter);
+  }
+  if (g_toggle_screenshot_requested && --g_toggle_screenshot_timer <= 0) {
+    g_toggle_screenshot_requested = false;
+    SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
+                        g_toggle_screenshot_prefix, &g_toggle_screenshot_counter);
   }
   if (g_startup_screenshot_remaining > 0 && --g_startup_screenshot_timer <= 0) {
     g_startup_screenshot_timer = 15;
@@ -1005,6 +1074,7 @@ static void ToggleNativeLevelRenderMode(void) {
     g_native_level_render_enabled = false;
     SetModernLayerRendererEnabled(g_native_level_render_saved_modern_layer_renderer);
   }
+  QueueToggleScreenshot(g_native_level_render_enabled ? "toggle_native_on" : "toggle_native_off");
   printf("[Native level renderer]=%s\n", g_native_level_render_enabled ? "on" : "off");
 }
 
@@ -2059,15 +2129,9 @@ static void RenderNativeMainMenu(uint8 *pixel_buffer, size_t pitch, int width, i
   uint8 border_flicker = (uint8)(190 + ((nmi_frame_counter_word * 17 + (nmi_frame_counter_word >> 2) * 53) & 63));
   uint32 border_color = BlendColorOverBgr(0x1C3A2B, 0x8FEA7D, border_flicker);
 
-  if (g_modern_layer_renderer)
-    FillRect(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, 0x9c101722);
-  else
-    FillRectAlpha(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, 0x101722, 156);
+  FillRectAlpha(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, 0x101722, 156);
   for (int y = panel_y + 4 * scale + (nmi_frame_counter_word & 3) * scale; y < panel_y + panel_h - 4 * scale; y += 4 * scale) {
-    if (g_modern_layer_renderer)
-      FillRect(pixel_buffer, pitch, width, height, panel_x + 3 * scale, y, panel_w - 6 * scale, IntMax(1, scale), 0x352D6F58);
-    else
-      FillRectAlpha(pixel_buffer, pitch, width, height, panel_x + 3 * scale, y, panel_w - 6 * scale, IntMax(1, scale), 0x2D6F58, 53);
+    FillRectAlpha(pixel_buffer, pitch, width, height, panel_x + 3 * scale, y, panel_w - 6 * scale, IntMax(1, scale), 0x2D6F58, 53);
   }
   DrawRectOutline(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, IntMax(1, scale), border_color);
   DrawText5x7(pixel_buffer, pitch, width, height, title_x, title_y, "MAIN MENU", scale, 0xFFFFFF);
@@ -2077,10 +2141,7 @@ static void RenderNativeMainMenu(uint8 *pixel_buffer, size_t pitch, int width, i
     uint32 text_color = i == g_native_main_menu_selection ? 0x8FEA7D : 0xC5D0D8;
     if (i == g_native_main_menu_selection) {
       DrawText5x7(pixel_buffer, pitch, width, height, item_x - 16 * scale, y, ">", scale, 0x8FEA7D);
-      if (g_modern_layer_renderer)
-        FillRect(pixel_buffer, pitch, width, height, item_x - 5 * scale, y + 9 * scale, 84 * scale, IntMax(1, scale), 0x8c2E6F58);
-      else
-        FillRectAlpha(pixel_buffer, pitch, width, height, item_x - 5 * scale, y + 9 * scale, 84 * scale, IntMax(1, scale), 0x2E6F58, 140);
+      FillRectAlpha(pixel_buffer, pitch, width, height, item_x - 5 * scale, y + 9 * scale, 84 * scale, IntMax(1, scale), 0x2E6F58, 140);
     }
     DrawText5x7(pixel_buffer, pitch, width, height, item_x, y, kMenuItems[i], scale, text_color);
   }
@@ -2846,10 +2907,14 @@ static void HandleCommand(uint32 j, bool pressed) {
       SetModernLayerRendererEnabled(!g_modern_layer_renderer);
       if (g_native_level_render_enabled && !g_modern_layer_renderer)
         g_native_level_render_enabled = false;
+      QueueToggleScreenshot(g_modern_layer_renderer ? "toggle_modern_layers_on" : "toggle_modern_layers_off");
       printf("[Modern layer renderer]=%s\n", g_modern_layer_renderer ? "on" : "off");
       break;
     case kKeys_ToggleModernLayerDebug:
       g_modern_layer_debug = !g_modern_layer_debug;
+      if (g_modern_layer_debug && !g_modern_layer_renderer)
+        SetModernLayerRendererEnabled(true);
+      QueueToggleScreenshot(g_modern_layer_debug ? "toggle_false_color_on" : "toggle_false_color_off");
       printf("[Modern layer debug]=%s\n", g_modern_layer_debug ? "on" : "off");
       break;
     case kKeys_Screenshot:
