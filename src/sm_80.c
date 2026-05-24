@@ -7,6 +7,22 @@
 #include "enemy_types.h"
 #include "spc_player.h"
 
+#include <stdarg.h>
+#include <stdio.h>
+
+static void CinematicAssetTraceLog80(const char *fmt, ...) {
+  if (game_state != kGameState_1_OpeningCinematic)
+    return;
+  FILE *f = fopen("cinematic_assets.log", "ab");
+  if (!f)
+    return;
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(f, fmt, ap);
+  va_end(ap);
+  fputc('\n', f);
+  fclose(f);
+}
 
 #define kMusicPointers (*(LongPtr*)RomFixedPtr(0x8fe7e1))
 #define kTimerDigitsSpritemapPtr ((uint16*)RomFixedPtr(0x809fd4))
@@ -417,13 +433,20 @@ void ClearOamExt(void) {  // 0x808B1A
 void QueueMode7Transfers(uint8 db, uint16 k) {  // 0x808B4F
   const uint8 *p = RomPtrWithBank(db, k);
   uint8 *dst = (uint8 *)mode7_write_queue + mode7_vram_write_queue_tail;
+  CinematicAssetTraceLog80("[m7-queue] list=%02X:%04x tail-start=%04x", db, k, mode7_vram_write_queue_tail);
   for (;;) {
     int f = GET_BYTE(p);
     if (f & 0x80) {
+      Mode7CgvmWriteQueue *q = (Mode7CgvmWriteQueue *)p;
+      CinematicAssetTraceLog80("[m7-queue-vram] tag=%02x src=%02x:%04x count=%04x vram=%04x vmain=%02x",
+                               q->tag, q->src_addr.bank, q->src_addr.addr, q->count,
+                               q->vram_addr, q->vmain);
       dst[9] = 0;
       memcpy(dst, p, 9);
       p += 9, dst += 9;
     } else if (f & 0x40) {
+      CinematicAssetTraceLog80("[m7-queue-cgram] tag=%02x src=%02x:%04x count=%04x cgadd=%02x",
+                               p[0], p[3], GET_WORD(p + 1), GET_WORD(p + 4), p[6]);
       dst[7] = 0;
       memcpy(dst, p, 7);
       p += 7, dst += 7;
@@ -830,6 +853,8 @@ void QueueSfx3_Internal(uint16 a) {  // 0x809155
 void SetupDmaTransfer(const void *p) {  // 0x8091A9
   const StartDmaCopy *s = (const StartDmaCopy *)p;
 
+  CinematicAssetTraceLog80("[dma-setup] chan=%u dmap=%02x bbad=%02x src=%02x:%04x size=%04x",
+                           s->chan, s->dmap, s->bbad, s->a1.bank, s->a1.addr, s->das);
   int v2 = s->chan * 16;
   WriteRegWord((SnesRegs)(v2 + DMAP0), *(uint16 *)&s->dmap);
   WriteRegWord((SnesRegs)(v2 + A1T0L), *(uint16 *)&s->a1.addr);
@@ -2487,6 +2512,8 @@ static uint8 DecompNextByte() {
 }
 
 void DecompressToMem(uint32 src, uint8 *decompress_dst) {  // 0x80B119
+  uint32 original_src = src;
+  uint8 *original_dst = decompress_dst;
   decompress_src = src;
 
   int src_pos, dst_pos = 0;
@@ -2549,6 +2576,8 @@ void DecompressToMem(uint32 src, uint8 *decompress_dst) {  // 0x80B119
       }
     }
   }
+  CinematicAssetTraceLog80("[decomp] src=%06x dst-ram=%05llx len=%04x end-src=%06x",
+                           original_src, (long long)(original_dst - g_ram), dst_pos, decompress_src);
 }
 
 static uint8 ReadPpuByte(uint16 addr) {

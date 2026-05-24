@@ -104,6 +104,7 @@ static void RenderModernFrontCustomLayer(uint32 *pixels, int width, int height);
 static void RenderModernGunshipCustomLayerLine(int custom_slot, int y, uint32 *pixels, int width, int height);
 static void CompositeModernFrontCustomLayer(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void SaveDebugScreenshot(uint8 *pixel_buffer, size_t pitch, int width, int height, const char *prefix, int *counter);
+static void CaptureCinematicFrame(uint8 *pixel_buffer, size_t pitch, int width, int height, int render_scale);
 static void WidescreenDebugLog(const char *fmt, ...);
 void OpenGLRenderer_Create(struct RendererFuncs *funcs);
 
@@ -159,6 +160,12 @@ static char g_toggle_screenshot_prefix[64];
 static int g_startup_screenshot_counter;
 static int g_startup_screenshot_remaining = 24;
 static int g_startup_screenshot_timer = 1;
+static const char *g_cinematic_capture_path;
+static FILE *g_cinematic_capture_file;
+static int g_cinematic_capture_frame_limit;
+static int g_cinematic_capture_frames_written;
+static bool g_cinematic_capture_quit_when_done;
+static bool g_cinematic_capture_done;
 static bool g_native_main_menu_active;
 static bool g_native_main_menu_dismissed;
 static bool g_native_main_menu_return_from_options;
@@ -813,13 +820,16 @@ static void DrawPpuFrameWithPerf(void) {
   if (g_display_perf)
     RenderNumber(pixel_buffer + pitch * render_scale, pitch, g_curr_fps, render_scale == 4);
 
-  RenderAnalogDebugOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
-  RenderOpeningIntroSkipPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
-  RenderNativeMainMenu(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
-  RenderNativeLevelEditor(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
-  RenderNativeOptionsOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
-  RenderExitToMainMenuPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
-  RenderBuildTimestampOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+  if (!g_cinematic_capture_path) {
+    RenderAnalogDebugOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+    RenderOpeningIntroSkipPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+    RenderNativeMainMenu(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+    RenderNativeLevelEditor(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+    RenderNativeOptionsOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+    RenderExitToMainMenuPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+    RenderBuildTimestampOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+  }
+  CaptureCinematicFrame(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale, render_scale);
   if (g_shinespark_screenshot_requested) {
     g_shinespark_screenshot_requested = false;
     SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
@@ -830,24 +840,27 @@ static void DrawPpuFrameWithPerf(void) {
     SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
                         "manual", &g_manual_screenshot_counter);
   }
-  if (g_room_load_screenshot_requested && --g_room_load_screenshot_timer <= 0 &&
+  if (!g_cinematic_capture_path &&
+      g_room_load_screenshot_requested && --g_room_load_screenshot_timer <= 0 &&
       game_state == kGameState_8_MainGameplay) {
     g_room_load_screenshot_requested = false;
     SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
                         "room_load", &g_room_load_screenshot_counter);
   }
-  if (g_main_menu_screenshot_requested && --g_main_menu_screenshot_timer <= 0 &&
+  if (!g_cinematic_capture_path &&
+      g_main_menu_screenshot_requested && --g_main_menu_screenshot_timer <= 0 &&
       g_native_main_menu_active) {
     g_main_menu_screenshot_requested = false;
     SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
                         "main_menu", &g_main_menu_screenshot_counter);
   }
-  if (g_toggle_screenshot_requested && --g_toggle_screenshot_timer <= 0) {
+  if (!g_cinematic_capture_path &&
+      g_toggle_screenshot_requested && --g_toggle_screenshot_timer <= 0) {
     g_toggle_screenshot_requested = false;
     SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
                         g_toggle_screenshot_prefix, &g_toggle_screenshot_counter);
   }
-  if (g_startup_screenshot_remaining > 0 && --g_startup_screenshot_timer <= 0) {
+  if (!g_cinematic_capture_path && g_startup_screenshot_remaining > 0 && --g_startup_screenshot_timer <= 0) {
     g_startup_screenshot_timer = 15;
     g_startup_screenshot_remaining--;
     SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
@@ -929,6 +942,52 @@ static void SaveDebugScreenshot(uint8 *pixel_buffer, size_t pitch, int width, in
 
   fclose(f);
   printf("Saved debug screenshot: %s\n", filename);
+}
+
+static void CaptureCinematicFrame(uint8 *pixel_buffer, size_t pitch, int width, int height, int render_scale) {
+  if (!g_cinematic_capture_path || g_cinematic_capture_done)
+    return;
+  if (g_cinematic_capture_frame_limit > 0 &&
+      g_cinematic_capture_frames_written >= g_cinematic_capture_frame_limit) {
+    g_cinematic_capture_done = true;
+    return;
+  }
+  if (!g_cinematic_capture_file) {
+    g_cinematic_capture_file = fopen(g_cinematic_capture_path, "wb");
+    if (!g_cinematic_capture_file) {
+      printf("Failed to open cinematic capture output: %s\n", g_cinematic_capture_path);
+      g_cinematic_capture_done = true;
+      return;
+    }
+  }
+
+  int out_width = g_snes_width;
+  int out_height = IntMin(g_snes_height, 224);
+  if (render_scale <= 0)
+    render_scale = 1;
+  uint8 rgb[3];
+  for (int y = 0; y < out_height; y++) {
+    int source_y = y * render_scale;
+    if (source_y >= height)
+      source_y = height - 1;
+    const uint32_t *src = (const uint32_t *)(pixel_buffer + (size_t)source_y * pitch);
+    for (int x = 0; x < out_width; x++) {
+      int source_x = x * render_scale;
+      if (source_x >= width)
+        source_x = width - 1;
+      uint32_t color = src[source_x];
+      rgb[0] = (uint8)((color >> 16) & 0xff);
+      rgb[1] = (uint8)((color >> 8) & 0xff);
+      rgb[2] = (uint8)(color & 0xff);
+      fwrite(rgb, 1, 3, g_cinematic_capture_file);
+    }
+  }
+  g_cinematic_capture_frames_written++;
+  if (g_cinematic_capture_frame_limit > 0 &&
+      g_cinematic_capture_frames_written >= g_cinematic_capture_frame_limit) {
+    fflush(g_cinematic_capture_file);
+    g_cinematic_capture_done = true;
+  }
 }
 
 static SDL_mutex *g_audio_mutex;
@@ -1132,6 +1191,20 @@ int main(int argc, char** argv) {
   if (argc >= 1 && strcmp(argv[0], "--debug") == 0) {
     g_debug_flag = true;
     argc -= 1, argv += 1;
+  }
+  while (argc >= 1) {
+    if (argc >= 2 && strcmp(argv[0], "--capture-cinematic-frames") == 0) {
+      g_cinematic_capture_path = argv[1];
+      argc -= 2, argv += 2;
+    } else if (argc >= 2 && strcmp(argv[0], "--capture-frames") == 0) {
+      g_cinematic_capture_frame_limit = atoi(argv[1]);
+      argc -= 2, argv += 2;
+    } else if (strcmp(argv[0], "--capture-quit") == 0) {
+      g_cinematic_capture_quit_when_done = true;
+      argc -= 1, argv += 1;
+    } else {
+      break;
+    }
   }
   char bootstrap_rom_path[kPathBufferSize];
   char bootstrap_manifest_path[kPathBufferSize];
@@ -1450,6 +1523,13 @@ int main(int argc, char** argv) {
     }
     if (log_loop)
       WidescreenDebugLog("main-loop end");
+    if (g_cinematic_capture_done && g_cinematic_capture_quit_when_done)
+      running = false;
+  }
+
+  if (g_cinematic_capture_file) {
+    fclose(g_cinematic_capture_file);
+    g_cinematic_capture_file = NULL;
   }
 
   if (g_config.autosave)
