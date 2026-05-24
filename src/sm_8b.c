@@ -1942,7 +1942,11 @@ void CinematicFunc_Func7(void) {  // 0x8B9E8B
     } else {
       cinematic_var6 = 256;
       cinematic_function = FUNC16(nullsub_117);
-      SpawnCinematicSpriteObject(addr_kCinematicSpriteObjectDef_8BA107, FUNC16(nullsub_117));
+      if (g_cinematic_capture_active) {
+        ClearCinematicSprites();
+      } else {
+        SpawnCinematicSpriteObject(addr_kCinematicSpriteObjectDef_8BA107, FUNC16(nullsub_117));
+      }
     }
   }
 }

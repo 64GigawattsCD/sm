@@ -100,11 +100,14 @@ static uint16 MaskExitToMainMenuPromptInputs(uint16 inputs);
 static void RenderExitToMainMenuPrompt(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void RenderOpeningIntroSkipPrompt(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void RenderAnalogDebugOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height);
+static bool NativeMainMenuCanOpenOnTitleScene(void);
 static void RenderModernFrontCustomLayer(uint32 *pixels, int width, int height);
 static void RenderModernGunshipCustomLayerLine(int custom_slot, int y, uint32 *pixels, int width, int height);
 static void CompositeModernFrontCustomLayer(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void SaveDebugScreenshot(uint8 *pixel_buffer, size_t pitch, int width, int height, const char *prefix, int *counter);
 static void CaptureCinematicFrame(uint8 *pixel_buffer, size_t pitch, int width, int height, int render_scale);
+static void CaptureCinematicAudioForFrame(void);
+static void FinalizeCinematicAudioCapture(void);
 static void WidescreenDebugLog(const char *fmt, ...);
 void OpenGLRenderer_Create(struct RendererFuncs *funcs);
 
@@ -135,6 +138,7 @@ bool g_want_dump_memmap_flags;
 bool g_new_ppu;
 bool g_new_ppu = true;
 bool g_other_image;
+bool g_cinematic_capture_active;
 struct SpcPlayer *g_spc_player;
 static uint32_t button_state;
 
@@ -162,6 +166,10 @@ static int g_startup_screenshot_remaining = 24;
 static int g_startup_screenshot_timer = 1;
 static const char *g_cinematic_capture_path;
 static FILE *g_cinematic_capture_file;
+static const char *g_cinematic_audio_capture_path;
+static FILE *g_cinematic_audio_capture_file;
+static uint32_t g_cinematic_audio_capture_bytes;
+static int64_t g_cinematic_audio_capture_sample_accum;
 static int g_cinematic_capture_frame_limit;
 static int g_cinematic_capture_frames_written;
 static bool g_cinematic_capture_quit_when_done;
@@ -199,6 +207,8 @@ enum {
   kDefaultFreq = 44100,
   kDefaultChannels = 2,
   kDefaultSamples = 2048,
+  kCinematicCaptureAudioFreq = 44100,
+  kCinematicCaptureAudioChannels = 2,
   kSnesNativeWidth = 256,
   kSnesNativeHeight = 240,
   kPathBufferSize = 1024,
@@ -990,6 +1000,67 @@ static void CaptureCinematicFrame(uint8 *pixel_buffer, size_t pitch, int width, 
   }
 }
 
+static void WriteCinematicAudioWavHeader(FILE *f, uint32_t data_bytes) {
+  uint16_t channels = kCinematicCaptureAudioChannels;
+  uint32_t sample_rate = kCinematicCaptureAudioFreq;
+  uint16_t bits_per_sample = 16;
+  uint16_t block_align = channels * bits_per_sample / 8;
+  uint32_t byte_rate = sample_rate * block_align;
+  uint32_t riff_size = 36 + data_bytes;
+
+  fwrite("RIFF", 1, 4, f);
+  WriteLe32(f, riff_size);
+  fwrite("WAVE", 1, 4, f);
+  fwrite("fmt ", 1, 4, f);
+  WriteLe32(f, 16);
+  WriteLe16(f, 1);
+  WriteLe16(f, channels);
+  WriteLe32(f, sample_rate);
+  WriteLe32(f, byte_rate);
+  WriteLe16(f, block_align);
+  WriteLe16(f, bits_per_sample);
+  fwrite("data", 1, 4, f);
+  WriteLe32(f, data_bytes);
+}
+
+static void FinalizeCinematicAudioCapture(void) {
+  if (!g_cinematic_audio_capture_file)
+    return;
+  fseek(g_cinematic_audio_capture_file, 0, SEEK_SET);
+  WriteCinematicAudioWavHeader(g_cinematic_audio_capture_file, g_cinematic_audio_capture_bytes);
+  fclose(g_cinematic_audio_capture_file);
+  g_cinematic_audio_capture_file = NULL;
+}
+
+static void CaptureCinematicAudioForFrame(void) {
+  if (!g_cinematic_audio_capture_path || g_cinematic_capture_done)
+    return;
+  if (!g_cinematic_audio_capture_file) {
+    g_cinematic_audio_capture_file = fopen(g_cinematic_audio_capture_path, "wb");
+    if (!g_cinematic_audio_capture_file) {
+      printf("Failed to open cinematic audio capture output: %s\n", g_cinematic_audio_capture_path);
+      return;
+    }
+    WriteCinematicAudioWavHeader(g_cinematic_audio_capture_file, 0);
+  }
+
+  int next_frame = g_cinematic_capture_frames_written + 1;
+  int64_t target_samples = (int64_t)((double)next_frame * kCinematicCaptureAudioFreq / 60.0988138974405 + 0.5);
+  int samples = (int)(target_samples - g_cinematic_audio_capture_sample_accum);
+  if (samples <= 0)
+    return;
+
+  int16 *buffer = (int16 *)malloc((size_t)samples * kCinematicCaptureAudioChannels * sizeof(int16));
+  if (!buffer)
+    return;
+  RtlRenderAudio(buffer, samples, kCinematicCaptureAudioChannels);
+  uint32_t bytes = (uint32_t)((size_t)samples * kCinematicCaptureAudioChannels * sizeof(int16));
+  fwrite(buffer, 1, bytes, g_cinematic_audio_capture_file);
+  free(buffer);
+  g_cinematic_audio_capture_sample_accum = target_samples;
+  g_cinematic_audio_capture_bytes += bytes;
+}
+
 static SDL_mutex *g_audio_mutex;
 static uint8 *g_audiobuffer, *g_audiobuffer_cur, *g_audiobuffer_end;
 static int g_frames_per_block;
@@ -1195,6 +1266,10 @@ int main(int argc, char** argv) {
   while (argc >= 1) {
     if (argc >= 2 && strcmp(argv[0], "--capture-cinematic-frames") == 0) {
       g_cinematic_capture_path = argv[1];
+      g_cinematic_capture_active = true;
+      argc -= 2, argv += 2;
+    } else if (argc >= 2 && strcmp(argv[0], "--capture-cinematic-audio") == 0) {
+      g_cinematic_audio_capture_path = argv[1];
       argc -= 2, argv += 2;
     } else if (argc >= 2 && strcmp(argv[0], "--capture-frames") == 0) {
       g_cinematic_capture_frame_limit = atoi(argv[1]);
@@ -1307,7 +1382,7 @@ int main(int argc, char** argv) {
   g_spc_player = SpcPlayer_Create();
   SpcPlayer_Initialize(g_spc_player);
 
-  bool enable_audio = true;
+  bool enable_audio = g_cinematic_audio_capture_path == NULL;
   if (enable_audio) {
     SDL_AudioSpec want = { 0 }, have;
     want.freq = 44100;
@@ -1323,6 +1398,8 @@ int main(int argc, char** argv) {
     g_audio_channels = 2;
     g_frames_per_block = (534 * have.freq) / 32000;
     g_audiobuffer = (uint8 *)malloc(g_frames_per_block * have.channels * sizeof(int16));
+  } else {
+    g_audio_channels = kCinematicCaptureAudioChannels;
   }
 
   PpuBeginDrawing(snes->snes_ppu, g_pixels, kPpuXPixels * 4, 0);
@@ -1490,9 +1567,13 @@ int main(int argc, char** argv) {
       g_snes->disableRender = (g_turbo ^ (is_replay & g_replay_turbo)) && (frameCtr & (g_turbo ? 0xf : 0x7f)) != 0;
     }
 
+    if (g_cinematic_capture_path && NativeMainMenuCanOpenOnTitleScene())
+      demo_timer = 900;
+
     frameCtr++;
 
     if (!g_snes->disableRender) {
+      CaptureCinematicAudioForFrame();
       if (log_loop)
         WidescreenDebugLog("main-loop DrawPpuFrameWithPerf begin");
       DrawPpuFrameWithPerf();
@@ -1531,13 +1612,16 @@ int main(int argc, char** argv) {
     fclose(g_cinematic_capture_file);
     g_cinematic_capture_file = NULL;
   }
+  FinalizeCinematicAudioCapture();
 
   if (g_config.autosave)
     HandleCommand(kKeys_Save + 0, true);
 
   // clean sdl
-  SDL_PauseAudioDevice(g_audio_device, 1);
-  SDL_CloseAudioDevice(g_audio_device);
+  if (g_audio_device) {
+    SDL_PauseAudioDevice(g_audio_device, 1);
+    SDL_CloseAudioDevice(g_audio_device);
+  }
   SDL_DestroyMutex(g_audio_mutex);
   free(g_audiobuffer);
 
@@ -1820,6 +1904,9 @@ static void OpenNativeMainMenuScene(void) {
 }
 
 static void MaybeActivateNativeMainMenu(void) {
+  if (g_cinematic_capture_path)
+    return;
+
   if (g_native_main_menu_return_from_options) {
     if (game_state == kGameState_4_FileSelectMenus) {
       OpenNativeMainMenuScene();
