@@ -63,6 +63,10 @@ static uint16 GetNativeMenuInputs(void);
 static void UpdateOpeningIntroSkipState(uint16 inputs);
 static void MaybeActivateNativeMainMenu(void);
 static void OpenNativeMainMenuScene(void);
+void StartNativePlayFromMainMenu(void);
+static void OpenNativeOptionsFromMainMenu(uint16 held_inputs);
+static void OpenNativeFileSelect(uint16 held_inputs);
+static void CloseNativeFileSelect(void);
 static void OpenNativeLevelEditor(uint16 held_inputs);
 static void CloseNativeLevelEditor(void);
 static void UnloadNativeLevelEditorPreview(void);
@@ -85,10 +89,13 @@ static void DrawScaledPreviewImage(uint8 *pixel_buffer, size_t pitch, int width,
                                    const uint32 *src_pixels, int src_w, int src_h);
 static void UpdateNativeMainMenu(uint16 inputs);
 static uint16 MaskNativeMainMenuInputs(uint16 inputs);
+static void UpdateNativeOptionsOverlay(uint16 inputs);
+static void UpdateNativeFileSelect(uint16 inputs);
 static void UpdateNativeLevelEditor(uint16 inputs);
 static uint16 MaskNativeLevelEditorInputs(uint16 inputs);
 static uint16 GetMenuAnalogDirectionalInputs(void);
 static void RenderNativeMainMenu(uint8 *pixel_buffer, size_t pitch, int width, int height);
+static void RenderNativeFileSelect(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void RenderNativeLevelEditor(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void RenderNativeOptionsOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void DrawNativeOptionsSlider(uint8 *pixel_buffer, size_t pitch, int width, int height,
@@ -101,6 +108,7 @@ static void RenderExitToMainMenuPrompt(uint8 *pixel_buffer, size_t pitch, int wi
 static void RenderOpeningIntroSkipPrompt(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void RenderAnalogDebugOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static bool NativeMainMenuCanOpenOnTitleScene(void);
+static void ClearTransientMenuInputs(void);
 static void RenderModernFrontCustomLayer(uint32 *pixels, int width, int height);
 static void RenderModernGunshipCustomLayerLine(int custom_slot, int y, uint32 *pixels, int width, int height);
 static void CompositeModernFrontCustomLayer(uint8 *pixel_buffer, size_t pitch, int width, int height);
@@ -108,8 +116,15 @@ static bool TryStartTitleVideoPlayback(void);
 static void StopTitleVideoPlayback(bool open_title_scene);
 static bool UpdateTitleVideoPlayback(uint16 inputs);
 static void RenderTitleVideoFrame(void);
+static void SeekTitleVideoPlayback(int frame_index);
 static bool LoadTitleVideoAudio(const char *audio_path);
 static void MixTitleVideoAudio(Uint8 *stream, int len);
+static bool LoadTitleVideoOverlays(void);
+static void RenderTitleVideoOverlays(void);
+static void DrawTitleVideoSubtitleText(const char *text);
+static void DrawTitleVideoOverlayImage(const struct TitleVideoOverlayImage *image, int dst_x, int dst_y);
+static void FreeTitleVideoOverlayImage(struct TitleVideoOverlayImage *image);
+static void DrawText5x7(uint8 *pixel_buffer, size_t pitch, int width, int height, int x, int y, const char *text, int scale, uint32 color);
 static void SaveDebugScreenshot(uint8 *pixel_buffer, size_t pitch, int width, int height, const char *prefix, int *counter);
 static void CaptureCinematicFrame(uint8 *pixel_buffer, size_t pitch, int width, int height, int render_scale);
 static void CaptureCinematicAudioForFrame(void);
@@ -130,6 +145,25 @@ typedef struct {
   char *preview_file_path;
 } NativeLevelEditorTilesetEntry;
 
+typedef enum TitleVideoSubtitleKind {
+  kTitleVideoSubtitleKind_Text,
+  kTitleVideoSubtitleKind_RedText,
+  kTitleVideoSubtitleKind_NintendoLogo,
+} TitleVideoSubtitleKind;
+
+typedef struct TitleVideoSubtitleCue {
+  int start_frame;
+  int end_frame;
+  TitleVideoSubtitleKind kind;
+  char text[32];
+} TitleVideoSubtitleCue;
+
+typedef struct TitleVideoOverlayImage {
+  uint32 *pixels;
+  int width;
+  int height;
+} TitleVideoOverlayImage;
+
 typedef struct TitleVideoPlayback {
   bool active;
   FILE *frames_file;
@@ -145,6 +179,11 @@ typedef struct TitleVideoPlayback {
   size_t frame_bytes;
   SDL_Texture *texture;
   bool changed_logical_size;
+  bool show_menu;
+  TitleVideoOverlayImage title_logo;
+  TitleVideoOverlayImage nintendo_logo;
+  TitleVideoSubtitleCue *subtitle_cues;
+  int subtitle_cue_count;
 } TitleVideoPlayback;
 
 typedef enum NativeLevelEditorPage {
@@ -201,10 +240,17 @@ static bool g_native_main_menu_active;
 static bool g_native_main_menu_dismissed;
 static bool g_native_main_menu_return_from_options;
 static bool g_native_main_menu_scene_pending;
+static bool g_native_options_active;
+static bool g_native_file_select_active;
 static int g_native_main_menu_selection;
 static uint16 g_native_main_menu_prev_inputs;
 static bool g_native_main_menu_quit_requested;
 static int g_native_options_selection;
+static uint16 g_native_options_prev_inputs;
+static int g_native_file_select_selection;
+static uint16 g_native_file_select_prev_inputs;
+static int g_native_file_select_status_slot;
+static int g_native_file_select_status_timer;
 static bool g_native_level_editor_active;
 static NativeLevelEditorPage g_native_level_editor_page;
 static int g_native_level_editor_pack_selection;
@@ -237,6 +283,7 @@ enum {
   kSnesNativeHeight = 240,
   kTitleVideoWidth = 398,
   kTitleVideoHeight = 224,
+  kTitleVideoLoopFrame = 1893,
   kPathBufferSize = 1024,
 };
 
@@ -324,20 +371,26 @@ static uint16 GetMenuAnalogDirectionalInputs(void) {
 }
 
 static bool IsNativeOptionsOverlayVisible(void) {
-  return game_state == kGameState_2_GameOptionsMenu &&
-         game_options_screen_index == 3 &&
-         g_native_main_menu_return_from_options;
+  return g_native_options_active;
 }
 
-static void UpdateOptionsVolumeSlider(uint16 menu_inputs) {
-  static uint16 prev_inputs;
+static void UpdateNativeOptionsOverlay(uint16 menu_inputs) {
   if (!IsNativeOptionsOverlayVisible()) {
-    prev_inputs = 0;
+    g_native_options_prev_inputs = 0;
     return;
   }
 
-  uint16 new_inputs = menu_inputs & ~prev_inputs;
-  prev_inputs = menu_inputs;
+  uint16 new_inputs = menu_inputs & ~g_native_options_prev_inputs;
+  g_native_options_prev_inputs = menu_inputs;
+
+  if (MenuHasCancelInput(new_inputs)) {
+    SaveNativeOptionsConfig();
+    g_native_options_active = false;
+    g_native_main_menu_active = true;
+    g_native_options_prev_inputs = 0;
+    ClearTransientMenuInputs();
+    return;
+  }
 
   if (new_inputs & kInputBit_Up)
     g_native_options_selection = (g_native_options_selection + kNativeOptionsRow_Count - 1) % kNativeOptionsRow_Count;
@@ -860,6 +913,7 @@ static void DrawPpuFrameWithPerf(void) {
     RenderAnalogDebugOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
     RenderOpeningIntroSkipPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
     RenderNativeMainMenu(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+    RenderNativeFileSelect(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
     RenderNativeLevelEditor(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
     RenderNativeOptionsOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
     RenderExitToMainMenuPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
@@ -1352,12 +1406,180 @@ static bool LoadTitleVideoAudio(const char *audio_path) {
   return true;
 }
 
+static bool LoadTitleVideoOverlayImage(const char *path, TitleVideoOverlayImage *image) {
+  SDL_Surface *loaded = SDL_LoadBMP(path);
+  if (!loaded)
+    return false;
+  SDL_Surface *surface = SDL_ConvertSurfaceFormat(loaded, SDL_PIXELFORMAT_ARGB8888, 0);
+  SDL_FreeSurface(loaded);
+  if (!surface)
+    return false;
+
+  image->pixels = (uint32 *)malloc((size_t)surface->w * surface->h * sizeof(uint32));
+  image->width = surface->w;
+  image->height = surface->h;
+  if (!image->pixels) {
+    SDL_FreeSurface(surface);
+    memset(image, 0, sizeof(*image));
+    return false;
+  }
+
+  for (int y = 0; y < surface->h; y++) {
+    const uint32 *src = (const uint32 *)((const uint8 *)surface->pixels + (size_t)y * surface->pitch);
+    for (int x = 0; x < surface->w; x++) {
+      Uint8 r, g, b, a;
+      SDL_GetRGBA(src[x], surface->format, &r, &g, &b, &a);
+      if (a == 0 || (r == 0 && g == 0 && b == 0))
+        image->pixels[y * surface->w + x] = 0;
+      else
+        image->pixels[y * surface->w + x] = ((uint32)a << 24) | ((uint32)r << 16) | ((uint32)g << 8) | b;
+    }
+  }
+
+  SDL_FreeSurface(surface);
+  return true;
+}
+
+static void FreeTitleVideoOverlayImage(TitleVideoOverlayImage *image) {
+  free(image->pixels);
+  memset(image, 0, sizeof(*image));
+}
+
+static int SplitTsvPreserveEmptyFields(char *line, char **columns, int max_columns) {
+  int count = 0;
+  char *cursor = line;
+
+  while (count < max_columns) {
+    columns[count++] = cursor;
+    char *tab = strchr(cursor, '\t');
+    if (!tab)
+      break;
+    *tab = 0;
+    cursor = tab + 1;
+  }
+
+  for (int i = 0; i < count; i++) {
+    char *end = columns[i] + strlen(columns[i]);
+    while (end > columns[i] && (end[-1] == '\r' || end[-1] == '\n')) {
+      end--;
+      *end = 0;
+    }
+  }
+
+  return count;
+}
+
+static bool ParseTitleVideoSubtitleCue(char *line, TitleVideoSubtitleCue *cue) {
+  char *columns[10] = { 0 };
+  int column_count = SplitTsvPreserveEmptyFields(line, columns, 10);
+  if (column_count < 5)
+    return false;
+
+  cue->start_frame = atoi(columns[0]);
+  cue->end_frame = atoi(columns[1]);
+  cue->kind = kTitleVideoSubtitleKind_RedText;
+  cue->text[0] = 0;
+
+  const char *kind = NULL;
+  const char *text = NULL;
+  if (column_count >= 7) {
+    kind = columns[4];
+    text = columns[5];
+  } else {
+    text = columns[4];
+  }
+
+  if (kind) {
+    if (strcmp(kind, "nintendo-logo") == 0)
+      cue->kind = kTitleVideoSubtitleKind_NintendoLogo;
+    else if (strcmp(kind, "red-text") == 0)
+      cue->kind = kTitleVideoSubtitleKind_RedText;
+    else
+      cue->kind = kTitleVideoSubtitleKind_Text;
+  }
+
+  if (text)
+    snprintf(cue->text, sizeof(cue->text), "%s", text);
+  return cue->end_frame > cue->start_frame;
+}
+
+static bool LoadTitleVideoSubtitleCues(const char *path) {
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return false;
+
+  int capacity = 32;
+  TitleVideoSubtitleCue *cues = (TitleVideoSubtitleCue *)calloc((size_t)capacity, sizeof(*cues));
+  if (!cues) {
+    fclose(f);
+    return false;
+  }
+
+  char line[512];
+  int count = 0;
+  while (fgets(line, sizeof(line), f)) {
+    if (line[0] == '#' || line[0] == 0)
+      continue;
+    if (count == capacity) {
+      capacity *= 2;
+      TitleVideoSubtitleCue *new_cues = (TitleVideoSubtitleCue *)realloc(cues, (size_t)capacity * sizeof(*cues));
+      if (!new_cues)
+        break;
+      cues = new_cues;
+    }
+    char parse_line[512];
+    snprintf(parse_line, sizeof(parse_line), "%s", line);
+    if (ParseTitleVideoSubtitleCue(parse_line, &cues[count]))
+      count++;
+  }
+
+  fclose(f);
+  free(g_title_video.subtitle_cues);
+  g_title_video.subtitle_cues = cues;
+  g_title_video.subtitle_cue_count = count;
+  return count > 0;
+}
+
+static bool LoadTitleVideoOverlays(void) {
+  char path[kPathBufferSize];
+  bool loaded_any = false;
+
+  if (ResolveBlocksBoxPath("BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\overlays\\super-metroid-title-logo.bmp",
+                           "..\\..\\BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\overlays\\super-metroid-title-logo.bmp",
+                           path, sizeof(path)) &&
+      FileExists(path)) {
+    loaded_any |= LoadTitleVideoOverlayImage(path, &g_title_video.title_logo);
+  }
+
+  if (ResolveBlocksBoxPath("BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\overlays\\nintendo-logo.bmp",
+                           "..\\..\\BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\overlays\\nintendo-logo.bmp",
+                           path, sizeof(path)) &&
+      FileExists(path)) {
+    loaded_any |= LoadTitleVideoOverlayImage(path, &g_title_video.nintendo_logo);
+  }
+
+  if (ResolveBlocksBoxPath("BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\plan\\title-subtitles.tsv",
+                           "..\\..\\BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\plan\\title-subtitles.tsv",
+                           path, sizeof(path)) &&
+      FileExists(path)) {
+    loaded_any |= LoadTitleVideoSubtitleCues(path);
+  }
+
+  WidescreenDebugLog("title-video: overlays loaded title=%dx%d nintendo=%dx%d cues=%d",
+                     g_title_video.title_logo.width, g_title_video.title_logo.height,
+                     g_title_video.nintendo_logo.width, g_title_video.nintendo_logo.height,
+                     g_title_video.subtitle_cue_count);
+  return loaded_any;
+}
+
 static bool TryStartTitleVideoPlayback(void) {
   char frames_path[kPathBufferSize];
   char audio_path[kPathBufferSize];
   FILE *frames_file;
   long frame_file_size;
 
+  if (g_title_video.active)
+    return true;
   if (g_cinematic_capture_path)
     return false;
   if (!ResolveBlocksBoxPath("BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\frames.rgb24",
@@ -1395,6 +1617,7 @@ static bool TryStartTitleVideoPlayback(void) {
     StopTitleVideoPlayback(false);
     return false;
   }
+  LoadTitleVideoOverlays();
 
   if (g_renderer) {
     g_title_video.texture = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
@@ -1406,7 +1629,17 @@ static bool TryStartTitleVideoPlayback(void) {
   }
 
   g_title_video.active = true;
-  g_native_main_menu_dismissed = true;
+  g_title_video.show_menu = false;
+  game_state = kGameState_3_Unused;
+  g_native_main_menu_active = true;
+  g_native_main_menu_dismissed = false;
+  g_native_main_menu_return_from_options = false;
+  g_native_main_menu_scene_pending = false;
+  g_native_options_active = false;
+  g_native_file_select_active = false;
+  g_native_level_editor_active = false;
+  g_exit_to_main_menu_prompt_active = false;
+  demo_timer = 900;
   WidescreenDebugLog("title-video: started frames=%d path=%s", g_title_video.frame_count, frames_path);
   return true;
 }
@@ -1431,6 +1664,9 @@ static void StopTitleVideoPlayback(bool open_title_scene) {
   free(g_title_video.rgb_frame);
   free(g_title_video.argb_frame);
   free(g_title_video.audio);
+  free(g_title_video.subtitle_cues);
+  FreeTitleVideoOverlayImage(&g_title_video.title_logo);
+  FreeTitleVideoOverlayImage(&g_title_video.nintendo_logo);
   memset(&g_title_video, 0, sizeof(g_title_video));
   if (open_title_scene)
     OpenNativeMainMenuScene();
@@ -1459,17 +1695,146 @@ static void MixTitleVideoAudio(Uint8 *stream, int len) {
 static bool UpdateTitleVideoPlayback(uint16 inputs) {
   if (!g_title_video.active)
     return false;
-  if (inputs & (kInputBit_Start | kInputBit_A | kInputBit_B)) {
-    StopTitleVideoPlayback(true);
+  bool menu_just_shown = false;
+
+  if (!g_title_video.show_menu && inputs != 0) {
+    SeekTitleVideoPlayback(kTitleVideoLoopFrame);
+    g_title_video.show_menu = true;
+    ClearTransientMenuInputs();
+    g_native_main_menu_prev_inputs = inputs;
+    menu_just_shown = true;
+  }
+
+  if (!g_title_video.show_menu && g_title_video.frame_index >= kTitleVideoLoopFrame) {
+    g_title_video.show_menu = true;
+    ClearTransientMenuInputs();
+    g_native_main_menu_prev_inputs = inputs;
+    menu_just_shown = true;
+  }
+
+  if (g_title_video.show_menu && g_native_options_active && !menu_just_shown)
+    UpdateNativeOptionsOverlay(inputs);
+  else if (g_title_video.show_menu && g_native_file_select_active && !menu_just_shown)
+    UpdateNativeFileSelect(inputs);
+  else if (g_title_video.show_menu && g_native_level_editor_active && !menu_just_shown)
+    UpdateNativeLevelEditor(inputs);
+  else if (g_title_video.show_menu && g_native_main_menu_active && !menu_just_shown)
+    UpdateNativeMainMenu(inputs);
+
+  if (!g_native_main_menu_active && !g_native_options_active && !g_native_file_select_active && !g_native_level_editor_active) {
+    StopTitleVideoPlayback(false);
     return true;
   }
+
   if (g_title_video.frame_index >= g_title_video.frame_count) {
-    StopTitleVideoPlayback(true);
-    return true;
+    SeekTitleVideoPlayback(kTitleVideoLoopFrame);
+    g_title_video.show_menu = true;
   }
   RenderTitleVideoFrame();
   g_title_video.frame_index++;
   return true;
+}
+
+static void SeekTitleVideoPlayback(int frame_index) {
+  if (!g_title_video.active || !g_title_video.frames_file)
+    return;
+
+  frame_index = IntMin(IntMax(frame_index, 0), IntMax(g_title_video.frame_count - 1, 0));
+  if (fseek(g_title_video.frames_file, (long)((size_t)frame_index * g_title_video.frame_bytes), SEEK_SET) != 0)
+    return;
+  g_title_video.frame_index = frame_index;
+
+  if (g_audio_mutex)
+    SDL_LockMutex(g_audio_mutex);
+  if (g_title_video.audio_size != 0 && g_title_video.frame_count > 0) {
+    size_t audio_offset = ((size_t)frame_index * g_title_video.audio_size) / (size_t)g_title_video.frame_count;
+    audio_offset &= ~(size_t)3;
+    g_title_video.audio_offset = audio_offset < g_title_video.audio_size ? audio_offset : g_title_video.audio_size;
+  }
+  if (g_audio_mutex)
+    SDL_UnlockMutex(g_audio_mutex);
+}
+
+static const TitleVideoSubtitleCue *FindTitleVideoSubtitleCue(int frame_index) {
+  for (int i = 0; i < g_title_video.subtitle_cue_count; i++) {
+    const TitleVideoSubtitleCue *cue = &g_title_video.subtitle_cues[i];
+    if (frame_index >= cue->start_frame && frame_index < cue->end_frame)
+      return cue;
+  }
+  return NULL;
+}
+
+static void DrawTitleVideoOverlayImage(const TitleVideoOverlayImage *image, int dst_x, int dst_y) {
+  if (!image || !image->pixels || !g_title_video.argb_frame)
+    return;
+  for (int y = 0; y < image->height; y++) {
+    int py = dst_y + y;
+    if ((unsigned)py >= (unsigned)g_title_video.height)
+      continue;
+    uint32 *dst = g_title_video.argb_frame + (size_t)py * g_title_video.width;
+    const uint32 *src = image->pixels + (size_t)y * image->width;
+    for (int x = 0; x < image->width; x++) {
+      int px = dst_x + x;
+      if ((unsigned)px >= (unsigned)g_title_video.width)
+        continue;
+      uint32 color = src[x];
+      uint32 alpha = color >> 24;
+      if (alpha == 0)
+        continue;
+      if (alpha == 255) {
+        dst[px] = color;
+      } else {
+        uint32 dst_color = dst[px];
+        uint32 inv = 255 - alpha;
+        uint32 r = (((color >> 16) & 0xff) * alpha + ((dst_color >> 16) & 0xff) * inv) / 255;
+        uint32 g = (((color >> 8) & 0xff) * alpha + ((dst_color >> 8) & 0xff) * inv) / 255;
+        uint32 b = ((color & 0xff) * alpha + (dst_color & 0xff) * inv) / 255;
+        dst[px] = 0xff000000u | (r << 16) | (g << 8) | b;
+      }
+    }
+  }
+}
+
+static void DrawTitleVideoSubtitleText(const char *text) {
+  if (!text || !text[0])
+    return;
+  int scale = 1;
+  int text_width = ((int)strlen(text) * 6 - 1) * scale;
+  int x = (g_title_video.width - text_width) / 2;
+  int y = 112 - (7 * scale) / 2;
+  DrawText5x7((uint8 *)g_title_video.argb_frame,
+              (size_t)g_title_video.width * sizeof(uint32),
+              g_title_video.width,
+              g_title_video.height,
+              x,
+              y,
+              text,
+              scale,
+              0xF6241C);
+}
+
+static void RenderTitleVideoOverlays(void) {
+  if (g_title_video.show_menu) {
+    if (g_title_video.title_logo.pixels) {
+      int x = (g_title_video.width - g_title_video.title_logo.width) / 2;
+      DrawTitleVideoOverlayImage(&g_title_video.title_logo, x, 14);
+    }
+    return;
+  }
+
+  const TitleVideoSubtitleCue *cue = FindTitleVideoSubtitleCue(g_title_video.frame_index);
+  if (!cue)
+    return;
+  if (cue->kind == kTitleVideoSubtitleKind_NintendoLogo) {
+    if (g_title_video.nintendo_logo.pixels) {
+      int x = (g_title_video.width - g_title_video.nintendo_logo.width) / 2;
+      int y = (g_title_video.height - g_title_video.nintendo_logo.height) / 2;
+      DrawTitleVideoOverlayImage(&g_title_video.nintendo_logo, x, y);
+    }
+    return;
+  }
+
+  DrawTitleVideoSubtitleText(cue->text);
 }
 
 static void RenderTitleVideoFrame(void) {
@@ -1487,6 +1852,21 @@ static void RenderTitleVideoFrame(void) {
     uint8 b = g_title_video.rgb_frame[i * 3 + 2];
     g_title_video.argb_frame[i] = 0xff000000u | ((uint32)r << 16) | ((uint32)g << 8) | b;
   }
+
+  RenderTitleVideoOverlays();
+
+  if (g_title_video.show_menu)
+    RenderNativeMainMenu((uint8 *)g_title_video.argb_frame, g_title_video.width * sizeof(uint32),
+                         g_title_video.width, g_title_video.height);
+  if (g_title_video.show_menu)
+    RenderNativeFileSelect((uint8 *)g_title_video.argb_frame, g_title_video.width * sizeof(uint32),
+                           g_title_video.width, g_title_video.height);
+  if (g_title_video.show_menu)
+    RenderNativeLevelEditor((uint8 *)g_title_video.argb_frame, g_title_video.width * sizeof(uint32),
+                            g_title_video.width, g_title_video.height);
+  if (g_title_video.show_menu)
+    RenderNativeOptionsOverlay((uint8 *)g_title_video.argb_frame, g_title_video.width * sizeof(uint32),
+                               g_title_video.width, g_title_video.height);
 
   if (g_renderer && g_title_video.texture) {
     SDL_UpdateTexture(g_title_video.texture, NULL, g_title_video.argb_frame, g_title_video.width * (int)sizeof(uint32));
@@ -1786,6 +2166,10 @@ int main(int argc, char** argv) {
     inputs |= analog_buttons;
 
     if (UpdateTitleVideoPlayback((uint16)(inputs | menu_inputs))) {
+      if (g_native_main_menu_quit_requested) {
+        running = false;
+        continue;
+      }
       frameCtr++;
       curTick = SDL_GetTicks();
       if (!g_config.disable_frame_delay) {
@@ -1806,7 +2190,6 @@ int main(int argc, char** argv) {
     }
 
     MaybeActivateNativeMainMenu();
-    UpdateOptionsVolumeSlider((uint16)menu_inputs);
     uint8 is_replay = 0;
     if (g_exit_to_main_menu_prompt_active) {
       uint16 game_inputs = MaskExitToMainMenuPromptInputs((uint16)menu_inputs);
@@ -1816,6 +2199,18 @@ int main(int argc, char** argv) {
         g_native_main_menu_scene_pending = false;
         OpenNativeMainMenuScene();
       }
+      g_snes->disableRender = (g_turbo ^ (is_replay & g_replay_turbo)) && (frameCtr & (g_turbo ? 0xf : 0x7f)) != 0;
+    } else if (g_native_options_active) {
+      uint16 game_inputs = MaskNativeMainMenuInputs((uint16)menu_inputs);
+      UpdateNativeOptionsOverlay((uint16)menu_inputs);
+      is_replay = RtlRunFrame(game_inputs);
+      if (game_state == kGameState_1_OpeningCinematic)
+        demo_timer = 900;
+      g_snes->disableRender = (g_turbo ^ (is_replay & g_replay_turbo)) && (frameCtr & (g_turbo ? 0xf : 0x7f)) != 0;
+    } else if (g_native_file_select_active) {
+      uint16 game_inputs = MaskNativeMainMenuInputs((uint16)menu_inputs);
+      UpdateNativeFileSelect((uint16)menu_inputs);
+      is_replay = RtlRunFrame(game_inputs);
       g_snes->disableRender = (g_turbo ^ (is_replay & g_replay_turbo)) && (frameCtr & (g_turbo ? 0xf : 0x7f)) != 0;
     } else if (g_native_level_editor_active) {
       uint16 game_inputs = MaskNativeLevelEditorInputs((uint16)menu_inputs);
@@ -2175,16 +2570,21 @@ static void OpenNativeMainMenuScene(void) {
   layer1_y_pos = 0;
   layer2_x_pos = 0;
   layer2_y_pos = 0;
-  game_state = kGameState_1_OpeningCinematic;
-  StartNativeMainMenuTitleScene();
+  game_state = kGameState_3_Unused;
   screen_fade_delay = 0;
   screen_fade_counter = 0;
   demo_timer = 900;
   g_skip_menu = false;
-  g_native_main_menu_active = false;
+  g_native_main_menu_active = true;
   g_native_main_menu_dismissed = false;
   g_native_main_menu_return_from_options = false;
   g_native_main_menu_scene_pending = false;
+  g_native_options_active = false;
+  g_native_file_select_active = false;
+  g_native_file_select_selection = 0;
+  g_native_file_select_prev_inputs = 0;
+  g_native_file_select_status_slot = -1;
+  g_native_file_select_status_timer = 0;
   g_native_level_editor_active = false;
   g_native_level_editor_page = kNativeLevelEditorPage_PackList;
   g_native_level_editor_pack_selection = 0;
@@ -2197,11 +2597,22 @@ static void OpenNativeMainMenuScene(void) {
   g_exit_to_main_menu_prompt_active = false;
   UnloadNativeLevelEditorPreview();
   ClearTransientMenuInputs();
+  ScreenOff();
+  if (TryStartTitleVideoPlayback()) {
+    SeekTitleVideoPlayback(kTitleVideoLoopFrame);
+    g_title_video.show_menu = true;
+  }
 }
 
 static void MaybeActivateNativeMainMenu(void) {
   if (g_cinematic_capture_path)
     return;
+  if (g_native_options_active)
+    return;
+  if (game_state == kGameState_1_OpeningCinematic && !g_title_video.active) {
+    OpenNativeMainMenuScene();
+    return;
+  }
 
   if (g_native_main_menu_return_from_options) {
     if (game_state == kGameState_4_FileSelectMenus) {
@@ -2215,7 +2626,7 @@ static void MaybeActivateNativeMainMenu(void) {
     }
   }
 
-  if (!g_native_main_menu_dismissed && !g_native_main_menu_active && !g_native_level_editor_active &&
+  if (!g_native_main_menu_dismissed && !g_native_main_menu_active && !g_native_file_select_active && !g_native_level_editor_active &&
       NativeMainMenuCanOpenOnTitleScene()) {
     g_native_main_menu_active = true;
     g_native_main_menu_return_from_options = false;
@@ -2228,6 +2639,90 @@ static void MaybeActivateNativeMainMenu(void) {
 
 void RequestNativeMainMenuFromFileSelect(void) {
   OpenNativeMainMenuScene();
+}
+
+void StartNativePlayFromMainMenu(void) {
+  OpenNativeFileSelect(0);
+  WidescreenDebugLog("native-menu: play -> native file select");
+}
+
+static void OpenNativeOptionsFromMainMenu(uint16 held_inputs) {
+  g_native_main_menu_active = false;
+  g_native_options_active = true;
+  g_native_main_menu_return_from_options = false;
+  g_native_main_menu_prev_inputs = 0;
+  g_native_options_selection = kNativeOptionsRow_Master;
+  ClearTransientMenuInputs();
+  (void)held_inputs;
+}
+
+static void OpenNativeFileSelect(uint16 held_inputs) {
+  g_native_main_menu_active = false;
+  g_native_options_active = false;
+  g_native_file_select_active = true;
+  g_native_level_editor_active = false;
+  g_native_main_menu_dismissed = false;
+  g_native_main_menu_return_from_options = false;
+  g_native_main_menu_prev_inputs = 0;
+  g_native_file_select_prev_inputs = held_inputs;
+  g_native_file_select_selection = 0;
+  g_native_file_select_status_slot = -1;
+  g_native_file_select_status_timer = 0;
+  game_state = kGameState_3_Unused;
+  screen_fade_delay = 0;
+  screen_fade_counter = 0;
+  demo_timer = 900;
+  if (g_title_video.active) {
+    g_title_video.show_menu = true;
+    if (g_title_video.frame_index < kTitleVideoLoopFrame)
+      SeekTitleVideoPlayback(kTitleVideoLoopFrame);
+  } else if (TryStartTitleVideoPlayback()) {
+    SeekTitleVideoPlayback(kTitleVideoLoopFrame);
+    g_title_video.show_menu = true;
+  }
+  ClearTransientMenuInputs();
+}
+
+static void CloseNativeFileSelect(void) {
+  g_native_file_select_active = false;
+  g_native_main_menu_active = true;
+  g_native_main_menu_prev_inputs = 0;
+  g_native_file_select_prev_inputs = 0;
+  g_native_file_select_status_slot = -1;
+  g_native_file_select_status_timer = 0;
+  ClearTransientMenuInputs();
+}
+
+static void UpdateNativeFileSelect(uint16 inputs) {
+  enum { kNativeFileSelectItemCount = 4 };
+  uint16 new_inputs = inputs & ~g_native_file_select_prev_inputs;
+  g_native_file_select_prev_inputs = inputs;
+
+  if (g_native_file_select_status_timer > 0)
+    g_native_file_select_status_timer--;
+
+  if (MenuHasCancelInput(new_inputs) || (new_inputs & kInputBit_Select)) {
+    CloseNativeFileSelect();
+    return;
+  }
+  if (new_inputs & kInputBit_Up) {
+    g_native_file_select_selection = (g_native_file_select_selection + kNativeFileSelectItemCount - 1) % kNativeFileSelectItemCount;
+    return;
+  }
+  if (new_inputs & kInputBit_Down) {
+    g_native_file_select_selection = (g_native_file_select_selection + 1) % kNativeFileSelectItemCount;
+    return;
+  }
+  if (!MenuHasConfirmInput(new_inputs))
+    return;
+
+  if (g_native_file_select_selection == 3) {
+    CloseNativeFileSelect();
+    return;
+  }
+
+  g_native_file_select_status_slot = g_native_file_select_selection;
+  g_native_file_select_status_timer = 120;
 }
 
 static void UnloadNativeLevelEditorPreview(void) {
@@ -2353,17 +2848,9 @@ static void UpdateNativeMainMenu(uint16 inputs) {
   g_native_main_menu_prev_inputs = 0;
   g_skip_menu = false;
   if (g_native_main_menu_selection == 0) {
-    g_native_main_menu_dismissed = true;
-    cinematic_function = FUNC16(CinematicFunc_Func10);
-    screen_fade_delay = 2;
-    screen_fade_counter = 2;
+    StartNativePlayFromMainMenu();
   } else if (g_native_main_menu_selection == 1) {
-    g_native_main_menu_return_from_options = true;
-    game_state = kGameState_2_GameOptionsMenu;
-    game_options_screen_index = 0;
-    menu_index = 0;
-    screen_fade_delay = 0;
-    screen_fade_counter = 0;
+    OpenNativeOptionsFromMainMenu(inputs);
   } else if (g_native_main_menu_selection == 2) {
     OpenNativeLevelEditor(inputs);
   } else {
@@ -2609,6 +3096,48 @@ static void RenderNativeMainMenu(uint8 *pixel_buffer, size_t pitch, int width, i
     DrawText5x7(pixel_buffer, pitch, width, height, item_x, y, kMenuItems[i], scale, text_color);
   }
 
+}
+
+static void RenderNativeFileSelect(uint8 *pixel_buffer, size_t pitch, int width, int height) {
+  static const char *const kFileItems[4] = { "FILE A", "FILE B", "FILE C", "BACK" };
+  char label[64];
+  if (!g_native_file_select_active)
+    return;
+
+  const int scale = IntMax(1, height / 240);
+  const int panel_w = 154 * scale;
+  const int panel_h = 104 * scale;
+  const int panel_x = (width - panel_w) / 2;
+  const int panel_y = (height - panel_h) / 2 + 30 * scale;
+  const int title_x = panel_x + 17 * scale;
+  const int title_y = panel_y + 10 * scale;
+  const int item_x = panel_x + 35 * scale;
+  const int first_item_y = panel_y + 33 * scale;
+  const int item_gap = 15 * scale;
+  uint8 border_flicker = (uint8)(190 + ((nmi_frame_counter_word * 19 + (nmi_frame_counter_word >> 1) * 41) & 63));
+  uint32 border_color = BlendColorOverBgr(0x1C3A2B, 0x8FEA7D, border_flicker);
+
+  FillRectAlpha(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, 0x101722, 168);
+  for (int y = panel_y + 4 * scale + (nmi_frame_counter_word & 3) * scale; y < panel_y + panel_h - 4 * scale; y += 4 * scale)
+    FillRectAlpha(pixel_buffer, pitch, width, height, panel_x + 3 * scale, y, panel_w - 6 * scale, IntMax(1, scale), 0x2D6F58, 46);
+  DrawRectOutline(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, IntMax(1, scale), border_color);
+  DrawText5x7(pixel_buffer, pitch, width, height, title_x, title_y, "FILE SELECT", scale, 0xFFFFFF);
+
+  for (int i = 0; i < 4; i++) {
+    int y = first_item_y + i * item_gap;
+    uint32 text_color = i == g_native_file_select_selection ? 0x8FEA7D : 0xC5D0D8;
+    if (i == g_native_file_select_selection) {
+      DrawText5x7(pixel_buffer, pitch, width, height, item_x - 16 * scale, y, ">", scale, 0x8FEA7D);
+      FillRectAlpha(pixel_buffer, pitch, width, height, item_x - 5 * scale, y + 9 * scale, 88 * scale, IntMax(1, scale), 0x2E6F58, 130);
+    }
+    DrawText5x7(pixel_buffer, pitch, width, height, item_x, y, kFileItems[i], scale, text_color);
+  }
+
+  if (g_native_file_select_status_timer > 0 && g_native_file_select_status_slot >= 0) {
+    snprintf(label, sizeof(label), "FILE %c NOT WIRED", 'A' + g_native_file_select_status_slot);
+    DrawText5x7(pixel_buffer, pitch, width, height, panel_x + 19 * scale, panel_y + panel_h - 13 * scale,
+                label, scale, 0xFFFFFF);
+  }
 }
 
 static void RenderNativeLevelEditor(uint8 *pixel_buffer, size_t pitch, int width, int height) {
@@ -3192,6 +3721,7 @@ static void RenderModernFrontCustomLayer(uint32 *pixels, int width, int height) 
   RenderOpeningIntroSkipPrompt((uint8 *)pixels, width * sizeof(uint32), width, height);
   RenderAnalogDebugOverlay((uint8 *)pixels, width * sizeof(uint32), width, height);
   RenderNativeMainMenu((uint8 *)pixels, width * sizeof(uint32), width, height);
+  RenderNativeFileSelect((uint8 *)pixels, width * sizeof(uint32), width, height);
   RenderNativeLevelEditor((uint8 *)pixels, width * sizeof(uint32), width, height);
   RenderNativeOptionsOverlay((uint8 *)pixels, width * sizeof(uint32), width, height);
   RenderExitToMainMenuPrompt((uint8 *)pixels, width * sizeof(uint32), width, height);
@@ -3392,9 +3922,38 @@ static void HandleCommand(uint32 j, bool pressed) {
 }
 
 static void HandleInput(int keyCode, int keyMod, bool pressed) {
+  if (pressed && g_title_video.active && !g_title_video.show_menu) {
+    SeekTitleVideoPlayback(kTitleVideoLoopFrame);
+    g_title_video.show_menu = true;
+    g_native_main_menu_active = true;
+    g_native_main_menu_dismissed = false;
+    g_native_main_menu_prev_inputs = 0;
+    ClearTransientMenuInputs();
+    return;
+  }
   if (pressed && keyCode == SDLK_ESCAPE) {
+    if (g_native_options_active) {
+      SaveNativeOptionsConfig();
+      g_native_options_active = false;
+      g_native_main_menu_active = true;
+      g_native_options_prev_inputs = 0;
+      ClearTransientMenuInputs();
+      return;
+    }
+    if (g_native_file_select_active) {
+      CloseNativeFileSelect();
+      return;
+    }
+    if (g_native_level_editor_active) {
+      CloseNativeLevelEditor();
+      return;
+    }
     if (g_native_main_menu_active) {
       g_native_main_menu_quit_requested = true;
+      return;
+    }
+    if (game_state == kGameState_4_FileSelectMenus || game_state == kGameState_5_FileSelectMap) {
+      OpenNativeMainMenuScene();
       return;
     }
     if (g_exit_to_main_menu_prompt_active) {

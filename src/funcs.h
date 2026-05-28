@@ -301,6 +301,7 @@ void sub_81AEC8(void);
 void SoftReset(void);
 void StartDebugScenarioFromMainMenu(void);
 void RequestNativeMainMenuFromFileSelect(void);
+void StartNativePlayFromMainMenu(void);
 
 // Bank 82
 uint16 CalculateNthTransitionColorComponentFromXtoY(uint16 a, uint16 k, uint16 j);

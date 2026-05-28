@@ -5,6 +5,7 @@ This file is for future coding agents working in this repository.
 ## Working Preferences
 
 - Launch `sm.exe` when it is useful for testing the current change. Place the game on monitor 2 for now when practical.
+- For native UI/title-menu testing, use `python tools/sm_ui_test.py` to launch/focus `sm.exe`, send key inputs, and capture window BMPs under `debug_screenshots/`.
 - Prefer preserving the original game feel where possible, while allowing intentional behavior changes for PC-native features.
 
 ## Current High-Level Goals

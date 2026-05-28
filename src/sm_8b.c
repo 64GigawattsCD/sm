@@ -2029,8 +2029,7 @@ void CinematicFunc_Func10(void) {  // 0x8B9F52
       *(uint16 *)((uint8 *)&cinematic_var5 + (uint16)i) = 0;
     for (j = 510; (j & 0x8000) == 0; j -= 2)
       hdma_table_1[j >> 1] = 0;
-    game_state = 4;
-    game_options_screen_index = 0;
+    StartNativePlayFromMainMenu();
   }
 }
 
