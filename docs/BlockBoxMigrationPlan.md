@@ -6,6 +6,12 @@ Move Super Metroid room and level parsing into BlockBox without breaking the cur
 
 Current submodule target: `BlockBox/` in this repo, sourced from `64GigawattsCD/BlocksBox` on branch `SuperMetroid`.
 
+## Host project role
+
+This `sm` repository is now also the Super Metroid host/test project for guiding BlocksBox development. The runtime can still read directly from the ROM while parity work is in progress, but the long-term target is that all replaceable/runtime-consumed assets and level data come from the BlocksBox dump instead of direct ROM reads. That includes room blocks, BTS/collision data, background layers, PLMs, doors, enemies, title/cinematic props, character frames, palettes, audio/cinematics, and any convenience objects we define for editing or rendering.
+
+BlocksBox should remain the place where game-specific extraction happens. The host project should increasingly act as a consumer of normalized dumped assets, with direct ROM access kept as a fallback or verification path until the dump is complete enough to stand on its own.
+
 ## Current parsing seam in `sm`
 
 - `src/ida_types.h`

@@ -13,6 +13,7 @@ extern const uint8 *g_rom;
 extern bool g_use_my_apu_code;
 #define LONGPTR(t) {(t) & 0xffff, (t) >> 16}
 extern bool g_debug_flag;
+extern bool g_cinematic_capture_active;
 extern float g_left_stick_x;
 extern float g_left_stick_y;
 extern float g_right_stick_x;

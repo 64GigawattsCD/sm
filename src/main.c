@@ -49,6 +49,8 @@ static void HandleVolumeAdjustment(int volume_adjustment);
 static void HandleAspectRatioSelection(int direction);
 static void ApplyRuntimeAspectRatio(void);
 static void SaveNativeOptionsConfig(void);
+static void SetModernLayerRendererEnabled(bool enabled);
+static void ToggleNativeLevelRenderMode(void);
 static void HandleGamepadAxisInput(int gamepad_id, int axis, int value);
 static int RemapSdlButton(int button);
 static void HandleGamepadInput(int button, bool pressed);
@@ -60,6 +62,11 @@ static bool IsGameplayMovementState(void);
 static uint16 GetNativeMenuInputs(void);
 static void UpdateOpeningIntroSkipState(uint16 inputs);
 static void MaybeActivateNativeMainMenu(void);
+static void OpenNativeMainMenuScene(void);
+void StartNativePlayFromMainMenu(void);
+static void OpenNativeOptionsFromMainMenu(uint16 held_inputs);
+static void OpenNativeFileSelect(uint16 held_inputs);
+static void CloseNativeFileSelect(void);
 static void OpenNativeLevelEditor(uint16 held_inputs);
 static void CloseNativeLevelEditor(void);
 static void UnloadNativeLevelEditorPreview(void);
@@ -82,10 +89,13 @@ static void DrawScaledPreviewImage(uint8 *pixel_buffer, size_t pitch, int width,
                                    const uint32 *src_pixels, int src_w, int src_h);
 static void UpdateNativeMainMenu(uint16 inputs);
 static uint16 MaskNativeMainMenuInputs(uint16 inputs);
+static void UpdateNativeOptionsOverlay(uint16 inputs);
+static void UpdateNativeFileSelect(uint16 inputs);
 static void UpdateNativeLevelEditor(uint16 inputs);
 static uint16 MaskNativeLevelEditorInputs(uint16 inputs);
 static uint16 GetMenuAnalogDirectionalInputs(void);
 static void RenderNativeMainMenu(uint8 *pixel_buffer, size_t pitch, int width, int height);
+static void RenderNativeFileSelect(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void RenderNativeLevelEditor(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void RenderNativeOptionsOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void DrawNativeOptionsSlider(uint8 *pixel_buffer, size_t pitch, int width, int height,
@@ -97,10 +107,28 @@ static uint16 MaskExitToMainMenuPromptInputs(uint16 inputs);
 static void RenderExitToMainMenuPrompt(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void RenderOpeningIntroSkipPrompt(uint8 *pixel_buffer, size_t pitch, int width, int height);
 static void RenderAnalogDebugOverlay(uint8 *pixel_buffer, size_t pitch, int width, int height);
+static bool NativeMainMenuCanOpenOnTitleScene(void);
+static void ClearTransientMenuInputs(void);
 static void RenderModernFrontCustomLayer(uint32 *pixels, int width, int height);
 static void RenderModernGunshipCustomLayerLine(int custom_slot, int y, uint32 *pixels, int width, int height);
 static void CompositeModernFrontCustomLayer(uint8 *pixel_buffer, size_t pitch, int width, int height);
+static bool TryStartTitleVideoPlayback(void);
+static void StopTitleVideoPlayback(bool open_title_scene);
+static bool UpdateTitleVideoPlayback(uint16 inputs);
+static void RenderTitleVideoFrame(void);
+static void SeekTitleVideoPlayback(int frame_index);
+static bool LoadTitleVideoAudio(const char *audio_path);
+static void MixTitleVideoAudio(Uint8 *stream, int len);
+static bool LoadTitleVideoOverlays(void);
+static void RenderTitleVideoOverlays(void);
+static void DrawTitleVideoSubtitleText(const char *text);
+static void DrawTitleVideoOverlayImage(const struct TitleVideoOverlayImage *image, int dst_x, int dst_y);
+static void FreeTitleVideoOverlayImage(struct TitleVideoOverlayImage *image);
+static void DrawText5x7(uint8 *pixel_buffer, size_t pitch, int width, int height, int x, int y, const char *text, int scale, uint32 color);
 static void SaveDebugScreenshot(uint8 *pixel_buffer, size_t pitch, int width, int height, const char *prefix, int *counter);
+static void CaptureCinematicFrame(uint8 *pixel_buffer, size_t pitch, int width, int height, int render_scale);
+static void CaptureCinematicAudioForFrame(void);
+static void FinalizeCinematicAudioCapture(void);
 static void WidescreenDebugLog(const char *fmt, ...);
 void OpenGLRenderer_Create(struct RendererFuncs *funcs);
 
@@ -117,6 +145,47 @@ typedef struct {
   char *preview_file_path;
 } NativeLevelEditorTilesetEntry;
 
+typedef enum TitleVideoSubtitleKind {
+  kTitleVideoSubtitleKind_Text,
+  kTitleVideoSubtitleKind_RedText,
+  kTitleVideoSubtitleKind_NintendoLogo,
+} TitleVideoSubtitleKind;
+
+typedef struct TitleVideoSubtitleCue {
+  int start_frame;
+  int end_frame;
+  TitleVideoSubtitleKind kind;
+  char text[32];
+} TitleVideoSubtitleCue;
+
+typedef struct TitleVideoOverlayImage {
+  uint32 *pixels;
+  int width;
+  int height;
+} TitleVideoOverlayImage;
+
+typedef struct TitleVideoPlayback {
+  bool active;
+  FILE *frames_file;
+  uint8 *rgb_frame;
+  uint32 *argb_frame;
+  uint8 *audio;
+  size_t audio_size;
+  size_t audio_offset;
+  int width;
+  int height;
+  int frame_count;
+  int frame_index;
+  size_t frame_bytes;
+  SDL_Texture *texture;
+  bool changed_logical_size;
+  bool show_menu;
+  TitleVideoOverlayImage title_logo;
+  TitleVideoOverlayImage nintendo_logo;
+  TitleVideoSubtitleCue *subtitle_cues;
+  int subtitle_cue_count;
+} TitleVideoPlayback;
+
 typedef enum NativeLevelEditorPage {
   kNativeLevelEditorPage_PackList,
   kNativeLevelEditorPage_PackHome,
@@ -131,6 +200,7 @@ bool g_want_dump_memmap_flags;
 bool g_new_ppu;
 bool g_new_ppu = true;
 bool g_other_image;
+bool g_cinematic_capture_active;
 struct SpcPlayer *g_spc_player;
 static uint32_t button_state;
 
@@ -142,22 +212,45 @@ static bool g_shinespark_screenshot_requested;
 static bool g_manual_screenshot_requested;
 static bool g_room_load_screenshot_requested;
 static bool g_main_menu_screenshot_requested;
+static bool g_toggle_screenshot_requested;
+static bool g_native_level_render_saved_modern_layer_renderer;
 static int g_shinespark_screenshot_counter;
 static int g_manual_screenshot_counter;
 static int g_room_load_screenshot_counter;
 static int g_main_menu_screenshot_counter;
+static int g_toggle_screenshot_counter;
 static int g_room_load_screenshot_timer;
 static int g_main_menu_screenshot_timer;
+static int g_toggle_screenshot_timer;
+static char g_toggle_screenshot_prefix[64];
 static int g_startup_screenshot_counter;
 static int g_startup_screenshot_remaining = 24;
 static int g_startup_screenshot_timer = 1;
+static const char *g_cinematic_capture_path;
+static FILE *g_cinematic_capture_file;
+static const char *g_cinematic_audio_capture_path;
+static FILE *g_cinematic_audio_capture_file;
+static uint32_t g_cinematic_audio_capture_bytes;
+static int64_t g_cinematic_audio_capture_sample_accum;
+static int g_cinematic_capture_frame_limit;
+static int g_cinematic_capture_frames_written;
+static bool g_cinematic_capture_quit_when_done;
+static bool g_cinematic_capture_done;
 static bool g_native_main_menu_active;
 static bool g_native_main_menu_dismissed;
 static bool g_native_main_menu_return_from_options;
+static bool g_native_main_menu_scene_pending;
+static bool g_native_options_active;
+static bool g_native_file_select_active;
 static int g_native_main_menu_selection;
 static uint16 g_native_main_menu_prev_inputs;
 static bool g_native_main_menu_quit_requested;
 static int g_native_options_selection;
+static uint16 g_native_options_prev_inputs;
+static int g_native_file_select_selection;
+static uint16 g_native_file_select_prev_inputs;
+static int g_native_file_select_status_slot;
+static int g_native_file_select_status_timer;
 static bool g_native_level_editor_active;
 static NativeLevelEditorPage g_native_level_editor_page;
 static int g_native_level_editor_pack_selection;
@@ -173,6 +266,7 @@ static int g_native_level_editor_tilesets_count;
 static bool g_exit_to_main_menu_prompt_active;
 static bool g_exit_to_main_menu_prompt_selection_yes;
 static uint16 g_exit_to_main_menu_prompt_prev_inputs;
+static TitleVideoPlayback g_title_video;
 
 int g_got_mismatch_count;
 
@@ -183,8 +277,13 @@ enum {
   kDefaultFreq = 44100,
   kDefaultChannels = 2,
   kDefaultSamples = 2048,
+  kCinematicCaptureAudioFreq = 44100,
+  kCinematicCaptureAudioChannels = 2,
   kSnesNativeWidth = 256,
   kSnesNativeHeight = 240,
+  kTitleVideoWidth = 398,
+  kTitleVideoHeight = 224,
+  kTitleVideoLoopFrame = 1893,
   kPathBufferSize = 1024,
 };
 
@@ -272,20 +371,26 @@ static uint16 GetMenuAnalogDirectionalInputs(void) {
 }
 
 static bool IsNativeOptionsOverlayVisible(void) {
-  return game_state == kGameState_2_GameOptionsMenu &&
-         game_options_screen_index == 3 &&
-         g_native_main_menu_return_from_options;
+  return g_native_options_active;
 }
 
-static void UpdateOptionsVolumeSlider(uint16 menu_inputs) {
-  static uint16 prev_inputs;
+static void UpdateNativeOptionsOverlay(uint16 menu_inputs) {
   if (!IsNativeOptionsOverlayVisible()) {
-    prev_inputs = 0;
+    g_native_options_prev_inputs = 0;
     return;
   }
 
-  uint16 new_inputs = menu_inputs & ~prev_inputs;
-  prev_inputs = menu_inputs;
+  uint16 new_inputs = menu_inputs & ~g_native_options_prev_inputs;
+  g_native_options_prev_inputs = menu_inputs;
+
+  if (MenuHasCancelInput(new_inputs)) {
+    SaveNativeOptionsConfig();
+    g_native_options_active = false;
+    g_native_main_menu_active = true;
+    g_native_options_prev_inputs = 0;
+    ClearTransientMenuInputs();
+    return;
+  }
 
   if (new_inputs & kInputBit_Up)
     g_native_options_selection = (g_native_options_selection + kNativeOptionsRow_Count - 1) % kNativeOptionsRow_Count;
@@ -715,6 +820,66 @@ void DebugRequestShinesparkScreenshot(void) {
   g_shinespark_screenshot_requested = true;
 }
 
+static void QueueToggleScreenshot(const char *prefix) {
+  snprintf(g_toggle_screenshot_prefix, sizeof(g_toggle_screenshot_prefix), "%s", prefix);
+  g_toggle_screenshot_requested = true;
+  g_toggle_screenshot_timer = 3;
+}
+
+static bool IsNativeTitleLogoPixel(uint32 color) {
+  uint8 r = (uint8)((color >> 16) & 0xff);
+  uint8 g = (uint8)((color >> 8) & 0xff);
+  uint8 b = (uint8)(color & 0xff);
+  return (r > 70 && (g > 35 || b < 90)) ||
+         (r > 170 && g > 120 && b > 80);
+}
+
+static void ApplyNativeTitleSceneBackdropCompensation(uint8 *pixel_buffer, size_t pitch, int width, int height, int scale) {
+  if (!g_native_level_render_enabled ||
+      game_state != kGameState_1_OpeningCinematic ||
+      scale <= 0)
+    return;
+
+  int shift = scale;
+  if (shift >= height)
+    return;
+
+  size_t row_bytes = (size_t)width * sizeof(uint32);
+
+  int top_end_y = IntMin(82 * scale, height - shift);
+  int logo_left = 40 * scale;
+  int logo_right = IntMin(218 * scale, width);
+  int logo_top = 10 * scale;
+  int logo_bottom = 84 * scale;
+  int trademark_left = 216 * scale;
+  int trademark_right = IntMin(230 * scale, width);
+  int trademark_top = 60 * scale;
+  int trademark_bottom = 78 * scale;
+  for (int y = 0; y < top_end_y; y++) {
+    uint32 *dst = (uint32 *)(pixel_buffer + (size_t)y * pitch);
+    uint32 *src = (uint32 *)(pixel_buffer + (size_t)(y + shift) * pitch);
+    bool in_logo_y = y >= logo_top && y < logo_bottom;
+    bool in_trademark_y = y >= trademark_top && y < trademark_bottom;
+    for (int x = 0; x < width; x++) {
+      if (in_trademark_y && x >= trademark_left && x < trademark_right)
+        continue;
+      if (in_logo_y && x >= logo_left && x < logo_right &&
+          (IsNativeTitleLogoPixel(dst[x]) || IsNativeTitleLogoPixel(src[x])))
+        continue;
+      dst[x] = src[x];
+    }
+  }
+
+  int start_y = 96 * scale;
+  if (start_y < 0 || start_y + shift >= height)
+    return;
+
+  for (int y = start_y; y < height - shift; y++)
+    memmove(pixel_buffer + (size_t)y * pitch,
+            pixel_buffer + (size_t)(y + shift) * pitch,
+            row_bytes);
+}
+
 static void DrawPpuFrameWithPerf(void) {
   int render_scale = PpuGetCurrentRenderScale(g_snes->ppu, g_ppu_render_flags);
   uint8 *pixel_buffer = 0;
@@ -737,20 +902,24 @@ static void DrawPpuFrameWithPerf(void) {
   } else {
     RtlDrawPpuFrame(pixel_buffer, pitch, g_ppu_render_flags);
   }
+  ApplyNativeTitleSceneBackdropCompensation(pixel_buffer, pitch,
+                                            g_snes_width * render_scale,
+                                            g_snes_height * render_scale,
+                                            render_scale);
   if (g_display_perf)
     RenderNumber(pixel_buffer + pitch * render_scale, pitch, g_curr_fps, render_scale == 4);
 
-  if (!g_modern_layer_renderer) {
+  if (!g_cinematic_capture_path) {
     RenderAnalogDebugOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
     RenderOpeningIntroSkipPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
     RenderNativeMainMenu(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
+    RenderNativeFileSelect(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
     RenderNativeLevelEditor(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
     RenderNativeOptionsOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
     RenderExitToMainMenuPrompt(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
     RenderBuildTimestampOverlay(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
-  } else {
-    CompositeModernFrontCustomLayer(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale);
   }
+  CaptureCinematicFrame(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale, render_scale);
   if (g_shinespark_screenshot_requested) {
     g_shinespark_screenshot_requested = false;
     SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
@@ -761,19 +930,27 @@ static void DrawPpuFrameWithPerf(void) {
     SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
                         "manual", &g_manual_screenshot_counter);
   }
-  if (g_room_load_screenshot_requested && --g_room_load_screenshot_timer <= 0 &&
+  if (!g_cinematic_capture_path &&
+      g_room_load_screenshot_requested && --g_room_load_screenshot_timer <= 0 &&
       game_state == kGameState_8_MainGameplay) {
     g_room_load_screenshot_requested = false;
     SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
                         "room_load", &g_room_load_screenshot_counter);
   }
-  if (g_main_menu_screenshot_requested && --g_main_menu_screenshot_timer <= 0 &&
+  if (!g_cinematic_capture_path &&
+      g_main_menu_screenshot_requested && --g_main_menu_screenshot_timer <= 0 &&
       g_native_main_menu_active) {
     g_main_menu_screenshot_requested = false;
     SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
                         "main_menu", &g_main_menu_screenshot_counter);
   }
-  if (g_startup_screenshot_remaining > 0 && --g_startup_screenshot_timer <= 0) {
+  if (!g_cinematic_capture_path &&
+      g_toggle_screenshot_requested && --g_toggle_screenshot_timer <= 0) {
+    g_toggle_screenshot_requested = false;
+    SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
+                        g_toggle_screenshot_prefix, &g_toggle_screenshot_counter);
+  }
+  if (!g_cinematic_capture_path && g_startup_screenshot_remaining > 0 && --g_startup_screenshot_timer <= 0) {
     g_startup_screenshot_timer = 15;
     g_startup_screenshot_remaining--;
     SaveDebugScreenshot(pixel_buffer, pitch, g_snes_width * render_scale, g_snes_height * render_scale,
@@ -857,6 +1034,113 @@ static void SaveDebugScreenshot(uint8 *pixel_buffer, size_t pitch, int width, in
   printf("Saved debug screenshot: %s\n", filename);
 }
 
+static void CaptureCinematicFrame(uint8 *pixel_buffer, size_t pitch, int width, int height, int render_scale) {
+  if (!g_cinematic_capture_path || g_cinematic_capture_done)
+    return;
+  if (g_cinematic_capture_frame_limit > 0 &&
+      g_cinematic_capture_frames_written >= g_cinematic_capture_frame_limit) {
+    g_cinematic_capture_done = true;
+    return;
+  }
+  if (!g_cinematic_capture_file) {
+    g_cinematic_capture_file = fopen(g_cinematic_capture_path, "wb");
+    if (!g_cinematic_capture_file) {
+      printf("Failed to open cinematic capture output: %s\n", g_cinematic_capture_path);
+      g_cinematic_capture_done = true;
+      return;
+    }
+  }
+
+  int out_width = g_snes_width;
+  int out_height = IntMin(g_snes_height, 224);
+  if (render_scale <= 0)
+    render_scale = 1;
+  uint8 rgb[3];
+  for (int y = 0; y < out_height; y++) {
+    int source_y = y * render_scale;
+    if (source_y >= height)
+      source_y = height - 1;
+    const uint32_t *src = (const uint32_t *)(pixel_buffer + (size_t)source_y * pitch);
+    for (int x = 0; x < out_width; x++) {
+      int source_x = x * render_scale;
+      if (source_x >= width)
+        source_x = width - 1;
+      uint32_t color = src[source_x];
+      rgb[0] = (uint8)((color >> 16) & 0xff);
+      rgb[1] = (uint8)((color >> 8) & 0xff);
+      rgb[2] = (uint8)(color & 0xff);
+      fwrite(rgb, 1, 3, g_cinematic_capture_file);
+    }
+  }
+  g_cinematic_capture_frames_written++;
+  if (g_cinematic_capture_frame_limit > 0 &&
+      g_cinematic_capture_frames_written >= g_cinematic_capture_frame_limit) {
+    fflush(g_cinematic_capture_file);
+    g_cinematic_capture_done = true;
+  }
+}
+
+static void WriteCinematicAudioWavHeader(FILE *f, uint32_t data_bytes) {
+  uint16_t channels = kCinematicCaptureAudioChannels;
+  uint32_t sample_rate = kCinematicCaptureAudioFreq;
+  uint16_t bits_per_sample = 16;
+  uint16_t block_align = channels * bits_per_sample / 8;
+  uint32_t byte_rate = sample_rate * block_align;
+  uint32_t riff_size = 36 + data_bytes;
+
+  fwrite("RIFF", 1, 4, f);
+  WriteLe32(f, riff_size);
+  fwrite("WAVE", 1, 4, f);
+  fwrite("fmt ", 1, 4, f);
+  WriteLe32(f, 16);
+  WriteLe16(f, 1);
+  WriteLe16(f, channels);
+  WriteLe32(f, sample_rate);
+  WriteLe32(f, byte_rate);
+  WriteLe16(f, block_align);
+  WriteLe16(f, bits_per_sample);
+  fwrite("data", 1, 4, f);
+  WriteLe32(f, data_bytes);
+}
+
+static void FinalizeCinematicAudioCapture(void) {
+  if (!g_cinematic_audio_capture_file)
+    return;
+  fseek(g_cinematic_audio_capture_file, 0, SEEK_SET);
+  WriteCinematicAudioWavHeader(g_cinematic_audio_capture_file, g_cinematic_audio_capture_bytes);
+  fclose(g_cinematic_audio_capture_file);
+  g_cinematic_audio_capture_file = NULL;
+}
+
+static void CaptureCinematicAudioForFrame(void) {
+  if (!g_cinematic_audio_capture_path || g_cinematic_capture_done)
+    return;
+  if (!g_cinematic_audio_capture_file) {
+    g_cinematic_audio_capture_file = fopen(g_cinematic_audio_capture_path, "wb");
+    if (!g_cinematic_audio_capture_file) {
+      printf("Failed to open cinematic audio capture output: %s\n", g_cinematic_audio_capture_path);
+      return;
+    }
+    WriteCinematicAudioWavHeader(g_cinematic_audio_capture_file, 0);
+  }
+
+  int next_frame = g_cinematic_capture_frames_written + 1;
+  int64_t target_samples = (int64_t)((double)next_frame * kCinematicCaptureAudioFreq / 60.0988138974405 + 0.5);
+  int samples = (int)(target_samples - g_cinematic_audio_capture_sample_accum);
+  if (samples <= 0)
+    return;
+
+  int16 *buffer = (int16 *)malloc((size_t)samples * kCinematicCaptureAudioChannels * sizeof(int16));
+  if (!buffer)
+    return;
+  RtlRenderAudio(buffer, samples, kCinematicCaptureAudioChannels);
+  uint32_t bytes = (uint32_t)((size_t)samples * kCinematicCaptureAudioChannels * sizeof(int16));
+  fwrite(buffer, 1, bytes, g_cinematic_audio_capture_file);
+  free(buffer);
+  g_cinematic_audio_capture_sample_accum = target_samples;
+  g_cinematic_audio_capture_bytes += bytes;
+}
+
 static SDL_mutex *g_audio_mutex;
 static uint8 *g_audiobuffer, *g_audiobuffer_cur, *g_audiobuffer_end;
 static int g_frames_per_block;
@@ -873,6 +1157,11 @@ void RtlApuUnlock(void) {
 
 static void SDLCALL AudioCallback(void *userdata, Uint8 *stream, int len) {
   if (SDL_LockMutex(g_audio_mutex)) Die("Mutex lock failed!");
+  if (g_title_video.active && g_title_video.audio != NULL) {
+    MixTitleVideoAudio(stream, len);
+    SDL_UnlockMutex(g_audio_mutex);
+    return;
+  }
   while (len != 0) {
     if (g_audiobuffer_end - g_audiobuffer_cur == 0) {
       RtlRenderAudio((int16 *)g_audiobuffer, g_frames_per_block, g_audio_channels);
@@ -983,6 +1272,27 @@ static void ApplyRuntimeAspectRatio(void) {
     SDL_SetWindowSize(g_window, g_current_window_scale * g_snes_width, g_current_window_scale * g_snes_height);
 }
 
+static void SetModernLayerRendererEnabled(bool enabled) {
+  if (enabled)
+    g_ppu_render_flags |= kPpuRenderFlags_ModernLayerRenderer;
+  else
+    g_ppu_render_flags &= ~kPpuRenderFlags_ModernLayerRenderer;
+  g_modern_layer_renderer = enabled;
+}
+
+static void ToggleNativeLevelRenderMode(void) {
+  if (!g_native_level_render_enabled) {
+    g_native_level_render_saved_modern_layer_renderer = g_modern_layer_renderer;
+    g_native_level_render_enabled = true;
+    SetModernLayerRendererEnabled(true);
+  } else {
+    g_native_level_render_enabled = false;
+    SetModernLayerRendererEnabled(g_native_level_render_saved_modern_layer_renderer);
+  }
+  QueueToggleScreenshot(g_native_level_render_enabled ? "toggle_native_on" : "toggle_native_off");
+  printf("[Native level renderer]=%s\n", g_native_level_render_enabled ? "on" : "off");
+}
+
 static void SdlRenderer_BeginDraw(int width, int height, uint8 **pixels, int *pitch) {
   g_sdl_renderer_rect.w = width;
   g_sdl_renderer_rect.h = height;
@@ -1007,6 +1317,574 @@ static void SdlRenderer_EndDraw(void) {
   SDL_RenderPresent(g_renderer); // vsyncs to 60 FPS?
   if (should_log)
     WidescreenDebugLog("SdlRenderer_EndDraw end");
+}
+
+static bool ReadWavLe16(const uint8 *p, uint16 *value) {
+  *value = (uint16)(p[0] | (p[1] << 8));
+  return true;
+}
+
+static bool ReadWavLe32(const uint8 *p, uint32 *value) {
+  *value = (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16) | ((uint32)p[3] << 24);
+  return true;
+}
+
+static bool LoadTitleVideoAudio(const char *audio_path) {
+  FILE *f = fopen(audio_path, "rb");
+  uint8 header[12];
+  uint8 chunk_header[8];
+  bool saw_fmt = false;
+  uint16 audio_format = 0;
+  uint16 channels = 0;
+  uint32 sample_rate = 0;
+  uint16 bits_per_sample = 0;
+  uint8 *audio = NULL;
+  uint32 audio_size = 0;
+
+  if (!f)
+    return false;
+  if (fread(header, 1, sizeof(header), f) != sizeof(header) ||
+      memcmp(header, "RIFF", 4) != 0 ||
+      memcmp(header + 8, "WAVE", 4) != 0) {
+    fclose(f);
+    return false;
+  }
+
+  while (fread(chunk_header, 1, sizeof(chunk_header), f) == sizeof(chunk_header)) {
+    uint32 chunk_size;
+    ReadWavLe32(chunk_header + 4, &chunk_size);
+    if (memcmp(chunk_header, "fmt ", 4) == 0) {
+      uint8 fmt[32];
+      size_t to_read = IntMin((int)chunk_size, (int)sizeof(fmt));
+      if (fread(fmt, 1, to_read, f) != to_read) {
+        fclose(f);
+        return false;
+      }
+      if (chunk_size > to_read)
+        fseek(f, (long)(chunk_size - to_read), SEEK_CUR);
+      if (to_read >= 16) {
+        ReadWavLe16(fmt + 0, &audio_format);
+        ReadWavLe16(fmt + 2, &channels);
+        ReadWavLe32(fmt + 4, &sample_rate);
+        ReadWavLe16(fmt + 14, &bits_per_sample);
+        saw_fmt = true;
+      }
+    } else if (memcmp(chunk_header, "data", 4) == 0) {
+      audio = (uint8 *)malloc(chunk_size);
+      if (!audio) {
+        fclose(f);
+        return false;
+      }
+      if (fread(audio, 1, chunk_size, f) != chunk_size) {
+        free(audio);
+        fclose(f);
+        return false;
+      }
+      audio_size = chunk_size;
+      break;
+    } else {
+      fseek(f, (long)chunk_size, SEEK_CUR);
+    }
+    if (chunk_size & 1)
+      fseek(f, 1, SEEK_CUR);
+  }
+  fclose(f);
+
+  if (!saw_fmt || !audio ||
+      audio_format != 1 ||
+      channels != 2 ||
+      sample_rate != 44100 ||
+      bits_per_sample != 16) {
+    free(audio);
+    return false;
+  }
+
+  free(g_title_video.audio);
+  g_title_video.audio = audio;
+  g_title_video.audio_size = audio_size;
+  g_title_video.audio_offset = 0;
+  return true;
+}
+
+static bool LoadTitleVideoOverlayImage(const char *path, TitleVideoOverlayImage *image) {
+  SDL_Surface *loaded = SDL_LoadBMP(path);
+  if (!loaded)
+    return false;
+  SDL_Surface *surface = SDL_ConvertSurfaceFormat(loaded, SDL_PIXELFORMAT_ARGB8888, 0);
+  SDL_FreeSurface(loaded);
+  if (!surface)
+    return false;
+
+  image->pixels = (uint32 *)malloc((size_t)surface->w * surface->h * sizeof(uint32));
+  image->width = surface->w;
+  image->height = surface->h;
+  if (!image->pixels) {
+    SDL_FreeSurface(surface);
+    memset(image, 0, sizeof(*image));
+    return false;
+  }
+
+  for (int y = 0; y < surface->h; y++) {
+    const uint32 *src = (const uint32 *)((const uint8 *)surface->pixels + (size_t)y * surface->pitch);
+    for (int x = 0; x < surface->w; x++) {
+      Uint8 r, g, b, a;
+      SDL_GetRGBA(src[x], surface->format, &r, &g, &b, &a);
+      if (a == 0 || (r == 0 && g == 0 && b == 0))
+        image->pixels[y * surface->w + x] = 0;
+      else
+        image->pixels[y * surface->w + x] = ((uint32)a << 24) | ((uint32)r << 16) | ((uint32)g << 8) | b;
+    }
+  }
+
+  SDL_FreeSurface(surface);
+  return true;
+}
+
+static void FreeTitleVideoOverlayImage(TitleVideoOverlayImage *image) {
+  free(image->pixels);
+  memset(image, 0, sizeof(*image));
+}
+
+static int SplitTsvPreserveEmptyFields(char *line, char **columns, int max_columns) {
+  int count = 0;
+  char *cursor = line;
+
+  while (count < max_columns) {
+    columns[count++] = cursor;
+    char *tab = strchr(cursor, '\t');
+    if (!tab)
+      break;
+    *tab = 0;
+    cursor = tab + 1;
+  }
+
+  for (int i = 0; i < count; i++) {
+    char *end = columns[i] + strlen(columns[i]);
+    while (end > columns[i] && (end[-1] == '\r' || end[-1] == '\n')) {
+      end--;
+      *end = 0;
+    }
+  }
+
+  return count;
+}
+
+static bool ParseTitleVideoSubtitleCue(char *line, TitleVideoSubtitleCue *cue) {
+  char *columns[10] = { 0 };
+  int column_count = SplitTsvPreserveEmptyFields(line, columns, 10);
+  if (column_count < 5)
+    return false;
+
+  cue->start_frame = atoi(columns[0]);
+  cue->end_frame = atoi(columns[1]);
+  cue->kind = kTitleVideoSubtitleKind_RedText;
+  cue->text[0] = 0;
+
+  const char *kind = NULL;
+  const char *text = NULL;
+  if (column_count >= 7) {
+    kind = columns[4];
+    text = columns[5];
+  } else {
+    text = columns[4];
+  }
+
+  if (kind) {
+    if (strcmp(kind, "nintendo-logo") == 0)
+      cue->kind = kTitleVideoSubtitleKind_NintendoLogo;
+    else if (strcmp(kind, "red-text") == 0)
+      cue->kind = kTitleVideoSubtitleKind_RedText;
+    else
+      cue->kind = kTitleVideoSubtitleKind_Text;
+  }
+
+  if (text)
+    snprintf(cue->text, sizeof(cue->text), "%s", text);
+  return cue->end_frame > cue->start_frame;
+}
+
+static bool LoadTitleVideoSubtitleCues(const char *path) {
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return false;
+
+  int capacity = 32;
+  TitleVideoSubtitleCue *cues = (TitleVideoSubtitleCue *)calloc((size_t)capacity, sizeof(*cues));
+  if (!cues) {
+    fclose(f);
+    return false;
+  }
+
+  char line[512];
+  int count = 0;
+  while (fgets(line, sizeof(line), f)) {
+    if (line[0] == '#' || line[0] == 0)
+      continue;
+    if (count == capacity) {
+      capacity *= 2;
+      TitleVideoSubtitleCue *new_cues = (TitleVideoSubtitleCue *)realloc(cues, (size_t)capacity * sizeof(*cues));
+      if (!new_cues)
+        break;
+      cues = new_cues;
+    }
+    char parse_line[512];
+    snprintf(parse_line, sizeof(parse_line), "%s", line);
+    if (ParseTitleVideoSubtitleCue(parse_line, &cues[count]))
+      count++;
+  }
+
+  fclose(f);
+  free(g_title_video.subtitle_cues);
+  g_title_video.subtitle_cues = cues;
+  g_title_video.subtitle_cue_count = count;
+  return count > 0;
+}
+
+static bool LoadTitleVideoOverlays(void) {
+  char path[kPathBufferSize];
+  bool loaded_any = false;
+
+  if (ResolveBlocksBoxPath("BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\overlays\\super-metroid-title-logo.bmp",
+                           "..\\..\\BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\overlays\\super-metroid-title-logo.bmp",
+                           path, sizeof(path)) &&
+      FileExists(path)) {
+    loaded_any |= LoadTitleVideoOverlayImage(path, &g_title_video.title_logo);
+  }
+
+  if (ResolveBlocksBoxPath("BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\overlays\\nintendo-logo.bmp",
+                           "..\\..\\BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\overlays\\nintendo-logo.bmp",
+                           path, sizeof(path)) &&
+      FileExists(path)) {
+    loaded_any |= LoadTitleVideoOverlayImage(path, &g_title_video.nintendo_logo);
+  }
+
+  if (ResolveBlocksBoxPath("BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\plan\\title-subtitles.tsv",
+                           "..\\..\\BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\plan\\title-subtitles.tsv",
+                           path, sizeof(path)) &&
+      FileExists(path)) {
+    loaded_any |= LoadTitleVideoSubtitleCues(path);
+  }
+
+  WidescreenDebugLog("title-video: overlays loaded title=%dx%d nintendo=%dx%d cues=%d",
+                     g_title_video.title_logo.width, g_title_video.title_logo.height,
+                     g_title_video.nintendo_logo.width, g_title_video.nintendo_logo.height,
+                     g_title_video.subtitle_cue_count);
+  return loaded_any;
+}
+
+static bool TryStartTitleVideoPlayback(void) {
+  char frames_path[kPathBufferSize];
+  char audio_path[kPathBufferSize];
+  FILE *frames_file;
+  long frame_file_size;
+
+  if (g_title_video.active)
+    return true;
+  if (g_cinematic_capture_path)
+    return false;
+  if (!ResolveBlocksBoxPath("BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\frames.rgb24",
+                            "..\\..\\BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\frames.rgb24",
+                            frames_path, sizeof(frames_path)) ||
+      !ResolveBlocksBoxPath("BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\audio.wav",
+                            "..\\..\\BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\audio.wav",
+                            audio_path, sizeof(audio_path)) ||
+      !FileExists(frames_path) ||
+      !FileExists(audio_path)) {
+    WidescreenDebugLog("title-video: BB export files missing; using runtime title scene");
+    return false;
+  }
+
+  frames_file = fopen(frames_path, "rb");
+  if (!frames_file)
+    return false;
+  fseek(frames_file, 0, SEEK_END);
+  frame_file_size = ftell(frames_file);
+  fseek(frames_file, 0, SEEK_SET);
+
+  memset(&g_title_video, 0, sizeof(g_title_video));
+  g_title_video.width = kTitleVideoWidth;
+  g_title_video.height = kTitleVideoHeight;
+  g_title_video.frame_bytes = (size_t)g_title_video.width * g_title_video.height * 3;
+  if (frame_file_size <= 0 || (size_t)frame_file_size < g_title_video.frame_bytes) {
+    fclose(frames_file);
+    return false;
+  }
+  g_title_video.frame_count = (int)((size_t)frame_file_size / g_title_video.frame_bytes);
+  g_title_video.frames_file = frames_file;
+  g_title_video.rgb_frame = (uint8 *)malloc(g_title_video.frame_bytes);
+  g_title_video.argb_frame = (uint32 *)malloc((size_t)g_title_video.width * g_title_video.height * sizeof(uint32));
+  if (!g_title_video.rgb_frame || !g_title_video.argb_frame || !LoadTitleVideoAudio(audio_path)) {
+    StopTitleVideoPlayback(false);
+    return false;
+  }
+  LoadTitleVideoOverlays();
+
+  if (g_renderer) {
+    g_title_video.texture = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
+                                              g_title_video.width, g_title_video.height);
+    if (g_title_video.texture) {
+      SDL_RenderSetLogicalSize(g_renderer, g_title_video.width, g_title_video.height);
+      g_title_video.changed_logical_size = true;
+    }
+  }
+
+  g_title_video.active = true;
+  g_title_video.show_menu = false;
+  game_state = kGameState_3_Unused;
+  g_native_main_menu_active = true;
+  g_native_main_menu_dismissed = false;
+  g_native_main_menu_return_from_options = false;
+  g_native_main_menu_scene_pending = false;
+  g_native_options_active = false;
+  g_native_file_select_active = false;
+  g_native_level_editor_active = false;
+  g_exit_to_main_menu_prompt_active = false;
+  demo_timer = 900;
+  WidescreenDebugLog("title-video: started frames=%d path=%s", g_title_video.frame_count, frames_path);
+  return true;
+}
+
+static void StopTitleVideoPlayback(bool open_title_scene) {
+  if (g_audio_mutex)
+    SDL_LockMutex(g_audio_mutex);
+  g_title_video.active = false;
+  if (g_audio_mutex)
+    SDL_UnlockMutex(g_audio_mutex);
+
+  if (g_title_video.changed_logical_size && g_renderer) {
+    if (g_config.ignore_aspect_ratio)
+      SDL_RenderSetLogicalSize(g_renderer, 0, 0);
+    else
+      SDL_RenderSetLogicalSize(g_renderer, g_snes_width, g_snes_height);
+  }
+  if (g_title_video.texture)
+    SDL_DestroyTexture(g_title_video.texture);
+  if (g_title_video.frames_file)
+    fclose(g_title_video.frames_file);
+  free(g_title_video.rgb_frame);
+  free(g_title_video.argb_frame);
+  free(g_title_video.audio);
+  free(g_title_video.subtitle_cues);
+  FreeTitleVideoOverlayImage(&g_title_video.title_logo);
+  FreeTitleVideoOverlayImage(&g_title_video.nintendo_logo);
+  memset(&g_title_video, 0, sizeof(g_title_video));
+  if (open_title_scene)
+    OpenNativeMainMenuScene();
+}
+
+static void MixTitleVideoAudio(Uint8 *stream, int len) {
+  size_t remaining = g_title_video.audio_size > g_title_video.audio_offset
+    ? g_title_video.audio_size - g_title_video.audio_offset
+    : 0;
+  int n = (int)IntMin(len, (int)remaining);
+  if (n > 0) {
+    if (g_sdl_audio_mixer_volume == SDL_MIX_MAXVOLUME) {
+      memcpy(stream, g_title_video.audio + g_title_video.audio_offset, n);
+    } else {
+      SDL_memset(stream, 0, n);
+      SDL_MixAudioFormat(stream, g_title_video.audio + g_title_video.audio_offset, AUDIO_S16, n, g_sdl_audio_mixer_volume);
+    }
+    g_title_video.audio_offset += (size_t)n;
+    stream += n;
+    len -= n;
+  }
+  if (len > 0)
+    SDL_memset(stream, 0, len);
+}
+
+static bool UpdateTitleVideoPlayback(uint16 inputs) {
+  if (!g_title_video.active)
+    return false;
+  bool menu_just_shown = false;
+
+  if (!g_title_video.show_menu && inputs != 0) {
+    SeekTitleVideoPlayback(kTitleVideoLoopFrame);
+    g_title_video.show_menu = true;
+    ClearTransientMenuInputs();
+    g_native_main_menu_prev_inputs = inputs;
+    menu_just_shown = true;
+  }
+
+  if (!g_title_video.show_menu && g_title_video.frame_index >= kTitleVideoLoopFrame) {
+    g_title_video.show_menu = true;
+    ClearTransientMenuInputs();
+    g_native_main_menu_prev_inputs = inputs;
+    menu_just_shown = true;
+  }
+
+  if (g_title_video.show_menu && g_native_options_active && !menu_just_shown)
+    UpdateNativeOptionsOverlay(inputs);
+  else if (g_title_video.show_menu && g_native_file_select_active && !menu_just_shown)
+    UpdateNativeFileSelect(inputs);
+  else if (g_title_video.show_menu && g_native_level_editor_active && !menu_just_shown)
+    UpdateNativeLevelEditor(inputs);
+  else if (g_title_video.show_menu && g_native_main_menu_active && !menu_just_shown)
+    UpdateNativeMainMenu(inputs);
+
+  if (!g_native_main_menu_active && !g_native_options_active && !g_native_file_select_active && !g_native_level_editor_active) {
+    StopTitleVideoPlayback(false);
+    return true;
+  }
+
+  if (g_title_video.frame_index >= g_title_video.frame_count) {
+    SeekTitleVideoPlayback(kTitleVideoLoopFrame);
+    g_title_video.show_menu = true;
+  }
+  RenderTitleVideoFrame();
+  g_title_video.frame_index++;
+  return true;
+}
+
+static void SeekTitleVideoPlayback(int frame_index) {
+  if (!g_title_video.active || !g_title_video.frames_file)
+    return;
+
+  frame_index = IntMin(IntMax(frame_index, 0), IntMax(g_title_video.frame_count - 1, 0));
+  if (fseek(g_title_video.frames_file, (long)((size_t)frame_index * g_title_video.frame_bytes), SEEK_SET) != 0)
+    return;
+  g_title_video.frame_index = frame_index;
+
+  if (g_audio_mutex)
+    SDL_LockMutex(g_audio_mutex);
+  if (g_title_video.audio_size != 0 && g_title_video.frame_count > 0) {
+    size_t audio_offset = ((size_t)frame_index * g_title_video.audio_size) / (size_t)g_title_video.frame_count;
+    audio_offset &= ~(size_t)3;
+    g_title_video.audio_offset = audio_offset < g_title_video.audio_size ? audio_offset : g_title_video.audio_size;
+  }
+  if (g_audio_mutex)
+    SDL_UnlockMutex(g_audio_mutex);
+}
+
+static const TitleVideoSubtitleCue *FindTitleVideoSubtitleCue(int frame_index) {
+  for (int i = 0; i < g_title_video.subtitle_cue_count; i++) {
+    const TitleVideoSubtitleCue *cue = &g_title_video.subtitle_cues[i];
+    if (frame_index >= cue->start_frame && frame_index < cue->end_frame)
+      return cue;
+  }
+  return NULL;
+}
+
+static void DrawTitleVideoOverlayImage(const TitleVideoOverlayImage *image, int dst_x, int dst_y) {
+  if (!image || !image->pixels || !g_title_video.argb_frame)
+    return;
+  for (int y = 0; y < image->height; y++) {
+    int py = dst_y + y;
+    if ((unsigned)py >= (unsigned)g_title_video.height)
+      continue;
+    uint32 *dst = g_title_video.argb_frame + (size_t)py * g_title_video.width;
+    const uint32 *src = image->pixels + (size_t)y * image->width;
+    for (int x = 0; x < image->width; x++) {
+      int px = dst_x + x;
+      if ((unsigned)px >= (unsigned)g_title_video.width)
+        continue;
+      uint32 color = src[x];
+      uint32 alpha = color >> 24;
+      if (alpha == 0)
+        continue;
+      if (alpha == 255) {
+        dst[px] = color;
+      } else {
+        uint32 dst_color = dst[px];
+        uint32 inv = 255 - alpha;
+        uint32 r = (((color >> 16) & 0xff) * alpha + ((dst_color >> 16) & 0xff) * inv) / 255;
+        uint32 g = (((color >> 8) & 0xff) * alpha + ((dst_color >> 8) & 0xff) * inv) / 255;
+        uint32 b = ((color & 0xff) * alpha + (dst_color & 0xff) * inv) / 255;
+        dst[px] = 0xff000000u | (r << 16) | (g << 8) | b;
+      }
+    }
+  }
+}
+
+static void DrawTitleVideoSubtitleText(const char *text) {
+  if (!text || !text[0])
+    return;
+  int scale = 1;
+  int text_width = ((int)strlen(text) * 6 - 1) * scale;
+  int x = (g_title_video.width - text_width) / 2;
+  int y = 112 - (7 * scale) / 2;
+  DrawText5x7((uint8 *)g_title_video.argb_frame,
+              (size_t)g_title_video.width * sizeof(uint32),
+              g_title_video.width,
+              g_title_video.height,
+              x,
+              y,
+              text,
+              scale,
+              0xF6241C);
+}
+
+static void RenderTitleVideoOverlays(void) {
+  if (g_title_video.show_menu) {
+    if (g_title_video.title_logo.pixels) {
+      int x = (g_title_video.width - g_title_video.title_logo.width) / 2;
+      DrawTitleVideoOverlayImage(&g_title_video.title_logo, x, 14);
+    }
+    return;
+  }
+
+  const TitleVideoSubtitleCue *cue = FindTitleVideoSubtitleCue(g_title_video.frame_index);
+  if (!cue)
+    return;
+  if (cue->kind == kTitleVideoSubtitleKind_NintendoLogo) {
+    if (g_title_video.nintendo_logo.pixels) {
+      int x = (g_title_video.width - g_title_video.nintendo_logo.width) / 2;
+      int y = (g_title_video.height - g_title_video.nintendo_logo.height) / 2;
+      DrawTitleVideoOverlayImage(&g_title_video.nintendo_logo, x, y);
+    }
+    return;
+  }
+
+  DrawTitleVideoSubtitleText(cue->text);
+}
+
+static void RenderTitleVideoFrame(void) {
+  if (!g_title_video.active || !g_title_video.frames_file)
+    return;
+
+  if (fread(g_title_video.rgb_frame, 1, g_title_video.frame_bytes, g_title_video.frames_file) != g_title_video.frame_bytes) {
+    StopTitleVideoPlayback(true);
+    return;
+  }
+
+  for (int i = 0, n = g_title_video.width * g_title_video.height; i < n; i++) {
+    uint8 r = g_title_video.rgb_frame[i * 3 + 0];
+    uint8 g = g_title_video.rgb_frame[i * 3 + 1];
+    uint8 b = g_title_video.rgb_frame[i * 3 + 2];
+    g_title_video.argb_frame[i] = 0xff000000u | ((uint32)r << 16) | ((uint32)g << 8) | b;
+  }
+
+  RenderTitleVideoOverlays();
+
+  if (g_title_video.show_menu)
+    RenderNativeMainMenu((uint8 *)g_title_video.argb_frame, g_title_video.width * sizeof(uint32),
+                         g_title_video.width, g_title_video.height);
+  if (g_title_video.show_menu)
+    RenderNativeFileSelect((uint8 *)g_title_video.argb_frame, g_title_video.width * sizeof(uint32),
+                           g_title_video.width, g_title_video.height);
+  if (g_title_video.show_menu)
+    RenderNativeLevelEditor((uint8 *)g_title_video.argb_frame, g_title_video.width * sizeof(uint32),
+                            g_title_video.width, g_title_video.height);
+  if (g_title_video.show_menu)
+    RenderNativeOptionsOverlay((uint8 *)g_title_video.argb_frame, g_title_video.width * sizeof(uint32),
+                               g_title_video.width, g_title_video.height);
+
+  if (g_renderer && g_title_video.texture) {
+    SDL_UpdateTexture(g_title_video.texture, NULL, g_title_video.argb_frame, g_title_video.width * (int)sizeof(uint32));
+    SDL_RenderClear(g_renderer);
+    SDL_RenderCopy(g_renderer, g_title_video.texture, NULL, NULL);
+    SDL_RenderPresent(g_renderer);
+    return;
+  }
+
+  uint8 *pixel_buffer = NULL;
+  int pitch = 0;
+  g_renderer_funcs.BeginDraw(g_title_video.width, g_title_video.height, &pixel_buffer, &pitch);
+  for (int y = 0; y < g_title_video.height; y++) {
+    memcpy(pixel_buffer + (size_t)y * pitch,
+           g_title_video.argb_frame + (size_t)y * g_title_video.width,
+           (size_t)g_title_video.width * sizeof(uint32));
+  }
+  g_renderer_funcs.EndDraw();
 }
 
 static const struct RendererFuncs kSdlRendererFuncs = {
@@ -1037,6 +1915,24 @@ int main(int argc, char** argv) {
   if (argc >= 1 && strcmp(argv[0], "--debug") == 0) {
     g_debug_flag = true;
     argc -= 1, argv += 1;
+  }
+  while (argc >= 1) {
+    if (argc >= 2 && strcmp(argv[0], "--capture-cinematic-frames") == 0) {
+      g_cinematic_capture_path = argv[1];
+      g_cinematic_capture_active = true;
+      argc -= 2, argv += 2;
+    } else if (argc >= 2 && strcmp(argv[0], "--capture-cinematic-audio") == 0) {
+      g_cinematic_audio_capture_path = argv[1];
+      argc -= 2, argv += 2;
+    } else if (argc >= 2 && strcmp(argv[0], "--capture-frames") == 0) {
+      g_cinematic_capture_frame_limit = atoi(argv[1]);
+      argc -= 2, argv += 2;
+    } else if (strcmp(argv[0], "--capture-quit") == 0) {
+      g_cinematic_capture_quit_when_done = true;
+      argc -= 1, argv += 1;
+    } else {
+      break;
+    }
   }
   char bootstrap_rom_path[kPathBufferSize];
   char bootstrap_manifest_path[kPathBufferSize];
@@ -1139,7 +2035,7 @@ int main(int argc, char** argv) {
   g_spc_player = SpcPlayer_Create();
   SpcPlayer_Initialize(g_spc_player);
 
-  bool enable_audio = true;
+  bool enable_audio = g_cinematic_audio_capture_path == NULL;
   if (enable_audio) {
     SDL_AudioSpec want = { 0 }, have;
     want.freq = 44100;
@@ -1155,6 +2051,8 @@ int main(int argc, char** argv) {
     g_audio_channels = 2;
     g_frames_per_block = (534 * have.freq) / 32000;
     g_audiobuffer = (uint8 *)malloc(g_frames_per_block * have.channels * sizeof(int16));
+  } else {
+    g_audio_channels = kCinematicCaptureAudioChannels;
   }
 
   PpuBeginDrawing(snes->snes_ppu, g_pixels, kPpuXPixels * 4, 0);
@@ -1181,6 +2079,7 @@ int main(int argc, char** argv) {
   uint32 frameCtr = 0;
   uint8 audiopaused = true;
   int main_loop_log_budget = 32;
+  TryStartTitleVideoPlayback();
 
   while (running) {
     bool log_loop = main_loop_log_budget-- > 0;
@@ -1245,6 +2144,8 @@ int main(int argc, char** argv) {
     static uint32 previous_gamepad_modifiers;
     uint32 gamepad_new_modifiers = g_gamepad_modifiers & ~previous_gamepad_modifiers;
     previous_gamepad_modifiers = g_gamepad_modifiers;
+    if (gamepad_new_modifiers & (1u << kGamepadBtn_L3))
+      ToggleNativeLevelRenderMode();
     g_dedicated_missile_fire_pressed = 0;
     g_dedicated_missile_toggle_pressed = 0;
     g_dedicated_beam_fire_held = 0;
@@ -1264,12 +2165,51 @@ int main(int argc, char** argv) {
       analog_buttons = 0;
     inputs |= analog_buttons;
 
+    if (UpdateTitleVideoPlayback((uint16)(inputs | menu_inputs))) {
+      if (g_native_main_menu_quit_requested) {
+        running = false;
+        continue;
+      }
+      frameCtr++;
+      curTick = SDL_GetTicks();
+      if (!g_config.disable_frame_delay) {
+        static const uint8 title_video_delays[3] = { 17, 17, 16 };
+        lastTick += title_video_delays[frameCtr % 3];
+        if (lastTick > curTick) {
+          uint32 delta = lastTick - curTick;
+          if (delta > 500) {
+            lastTick = curTick - 500;
+            delta = 500;
+          }
+          SDL_Delay(delta);
+        } else if (curTick - lastTick > 500) {
+          lastTick = curTick;
+        }
+      }
+      continue;
+    }
+
     MaybeActivateNativeMainMenu();
-    UpdateOptionsVolumeSlider((uint16)menu_inputs);
     uint8 is_replay = 0;
     if (g_exit_to_main_menu_prompt_active) {
       uint16 game_inputs = MaskExitToMainMenuPromptInputs((uint16)menu_inputs);
       UpdateExitToMainMenuPrompt((uint16)menu_inputs);
+      is_replay = RtlRunFrame(game_inputs);
+      if (g_native_main_menu_scene_pending) {
+        g_native_main_menu_scene_pending = false;
+        OpenNativeMainMenuScene();
+      }
+      g_snes->disableRender = (g_turbo ^ (is_replay & g_replay_turbo)) && (frameCtr & (g_turbo ? 0xf : 0x7f)) != 0;
+    } else if (g_native_options_active) {
+      uint16 game_inputs = MaskNativeMainMenuInputs((uint16)menu_inputs);
+      UpdateNativeOptionsOverlay((uint16)menu_inputs);
+      is_replay = RtlRunFrame(game_inputs);
+      if (game_state == kGameState_1_OpeningCinematic)
+        demo_timer = 900;
+      g_snes->disableRender = (g_turbo ^ (is_replay & g_replay_turbo)) && (frameCtr & (g_turbo ? 0xf : 0x7f)) != 0;
+    } else if (g_native_file_select_active) {
+      uint16 game_inputs = MaskNativeMainMenuInputs((uint16)menu_inputs);
+      UpdateNativeFileSelect((uint16)menu_inputs);
       is_replay = RtlRunFrame(game_inputs);
       g_snes->disableRender = (g_turbo ^ (is_replay & g_replay_turbo)) && (frameCtr & (g_turbo ? 0xf : 0x7f)) != 0;
     } else if (g_native_level_editor_active) {
@@ -1316,9 +2256,13 @@ int main(int argc, char** argv) {
       g_snes->disableRender = (g_turbo ^ (is_replay & g_replay_turbo)) && (frameCtr & (g_turbo ? 0xf : 0x7f)) != 0;
     }
 
+    if (g_cinematic_capture_path && NativeMainMenuCanOpenOnTitleScene())
+      demo_timer = 900;
+
     frameCtr++;
 
     if (!g_snes->disableRender) {
+      CaptureCinematicAudioForFrame();
       if (log_loop)
         WidescreenDebugLog("main-loop DrawPpuFrameWithPerf begin");
       DrawPpuFrameWithPerf();
@@ -1349,14 +2293,26 @@ int main(int argc, char** argv) {
     }
     if (log_loop)
       WidescreenDebugLog("main-loop end");
+    if (g_cinematic_capture_done && g_cinematic_capture_quit_when_done)
+      running = false;
   }
+
+  StopTitleVideoPlayback(false);
+
+  if (g_cinematic_capture_file) {
+    fclose(g_cinematic_capture_file);
+    g_cinematic_capture_file = NULL;
+  }
+  FinalizeCinematicAudioCapture();
 
   if (g_config.autosave)
     HandleCommand(kKeys_Save + 0, true);
 
   // clean sdl
-  SDL_PauseAudioDevice(g_audio_device, 1);
-  SDL_CloseAudioDevice(g_audio_device);
+  if (g_audio_device) {
+    SDL_PauseAudioDevice(g_audio_device, 1);
+    SDL_CloseAudioDevice(g_audio_device);
+  }
   SDL_DestroyMutex(g_audio_mutex);
   free(g_audiobuffer);
 
@@ -1598,6 +2554,10 @@ static void ClearTransientMenuInputs(void) {
 }
 
 static void OpenNativeMainMenuScene(void) {
+  if (g_native_level_render_enabled) {
+    g_native_level_render_enabled = false;
+    SetModernLayerRendererEnabled(g_native_level_render_saved_modern_layer_renderer);
+  }
   reg_BG1HOFS = 0;
   reg_BG1VOFS = 0;
   reg_BG2HOFS = 0;
@@ -1610,15 +2570,21 @@ static void OpenNativeMainMenuScene(void) {
   layer1_y_pos = 0;
   layer2_x_pos = 0;
   layer2_y_pos = 0;
-  game_state = kGameState_1_OpeningCinematic;
-  StartNativeMainMenuTitleScene();
+  game_state = kGameState_3_Unused;
   screen_fade_delay = 0;
   screen_fade_counter = 0;
   demo_timer = 900;
   g_skip_menu = false;
-  g_native_main_menu_active = false;
+  g_native_main_menu_active = true;
   g_native_main_menu_dismissed = false;
   g_native_main_menu_return_from_options = false;
+  g_native_main_menu_scene_pending = false;
+  g_native_options_active = false;
+  g_native_file_select_active = false;
+  g_native_file_select_selection = 0;
+  g_native_file_select_prev_inputs = 0;
+  g_native_file_select_status_slot = -1;
+  g_native_file_select_status_timer = 0;
   g_native_level_editor_active = false;
   g_native_level_editor_page = kNativeLevelEditorPage_PackList;
   g_native_level_editor_pack_selection = 0;
@@ -1631,9 +2597,23 @@ static void OpenNativeMainMenuScene(void) {
   g_exit_to_main_menu_prompt_active = false;
   UnloadNativeLevelEditorPreview();
   ClearTransientMenuInputs();
+  ScreenOff();
+  if (TryStartTitleVideoPlayback()) {
+    SeekTitleVideoPlayback(kTitleVideoLoopFrame);
+    g_title_video.show_menu = true;
+  }
 }
 
 static void MaybeActivateNativeMainMenu(void) {
+  if (g_cinematic_capture_path)
+    return;
+  if (g_native_options_active)
+    return;
+  if (game_state == kGameState_1_OpeningCinematic && !g_title_video.active) {
+    OpenNativeMainMenuScene();
+    return;
+  }
+
   if (g_native_main_menu_return_from_options) {
     if (game_state == kGameState_4_FileSelectMenus) {
       OpenNativeMainMenuScene();
@@ -1646,7 +2626,7 @@ static void MaybeActivateNativeMainMenu(void) {
     }
   }
 
-  if (!g_native_main_menu_dismissed && !g_native_main_menu_active && !g_native_level_editor_active &&
+  if (!g_native_main_menu_dismissed && !g_native_main_menu_active && !g_native_file_select_active && !g_native_level_editor_active &&
       NativeMainMenuCanOpenOnTitleScene()) {
     g_native_main_menu_active = true;
     g_native_main_menu_return_from_options = false;
@@ -1659,6 +2639,90 @@ static void MaybeActivateNativeMainMenu(void) {
 
 void RequestNativeMainMenuFromFileSelect(void) {
   OpenNativeMainMenuScene();
+}
+
+void StartNativePlayFromMainMenu(void) {
+  OpenNativeFileSelect(0);
+  WidescreenDebugLog("native-menu: play -> native file select");
+}
+
+static void OpenNativeOptionsFromMainMenu(uint16 held_inputs) {
+  g_native_main_menu_active = false;
+  g_native_options_active = true;
+  g_native_main_menu_return_from_options = false;
+  g_native_main_menu_prev_inputs = 0;
+  g_native_options_selection = kNativeOptionsRow_Master;
+  ClearTransientMenuInputs();
+  (void)held_inputs;
+}
+
+static void OpenNativeFileSelect(uint16 held_inputs) {
+  g_native_main_menu_active = false;
+  g_native_options_active = false;
+  g_native_file_select_active = true;
+  g_native_level_editor_active = false;
+  g_native_main_menu_dismissed = false;
+  g_native_main_menu_return_from_options = false;
+  g_native_main_menu_prev_inputs = 0;
+  g_native_file_select_prev_inputs = held_inputs;
+  g_native_file_select_selection = 0;
+  g_native_file_select_status_slot = -1;
+  g_native_file_select_status_timer = 0;
+  game_state = kGameState_3_Unused;
+  screen_fade_delay = 0;
+  screen_fade_counter = 0;
+  demo_timer = 900;
+  if (g_title_video.active) {
+    g_title_video.show_menu = true;
+    if (g_title_video.frame_index < kTitleVideoLoopFrame)
+      SeekTitleVideoPlayback(kTitleVideoLoopFrame);
+  } else if (TryStartTitleVideoPlayback()) {
+    SeekTitleVideoPlayback(kTitleVideoLoopFrame);
+    g_title_video.show_menu = true;
+  }
+  ClearTransientMenuInputs();
+}
+
+static void CloseNativeFileSelect(void) {
+  g_native_file_select_active = false;
+  g_native_main_menu_active = true;
+  g_native_main_menu_prev_inputs = 0;
+  g_native_file_select_prev_inputs = 0;
+  g_native_file_select_status_slot = -1;
+  g_native_file_select_status_timer = 0;
+  ClearTransientMenuInputs();
+}
+
+static void UpdateNativeFileSelect(uint16 inputs) {
+  enum { kNativeFileSelectItemCount = 4 };
+  uint16 new_inputs = inputs & ~g_native_file_select_prev_inputs;
+  g_native_file_select_prev_inputs = inputs;
+
+  if (g_native_file_select_status_timer > 0)
+    g_native_file_select_status_timer--;
+
+  if (MenuHasCancelInput(new_inputs) || (new_inputs & kInputBit_Select)) {
+    CloseNativeFileSelect();
+    return;
+  }
+  if (new_inputs & kInputBit_Up) {
+    g_native_file_select_selection = (g_native_file_select_selection + kNativeFileSelectItemCount - 1) % kNativeFileSelectItemCount;
+    return;
+  }
+  if (new_inputs & kInputBit_Down) {
+    g_native_file_select_selection = (g_native_file_select_selection + 1) % kNativeFileSelectItemCount;
+    return;
+  }
+  if (!MenuHasConfirmInput(new_inputs))
+    return;
+
+  if (g_native_file_select_selection == 3) {
+    CloseNativeFileSelect();
+    return;
+  }
+
+  g_native_file_select_status_slot = g_native_file_select_selection;
+  g_native_file_select_status_timer = 120;
 }
 
 static void UnloadNativeLevelEditorPreview(void) {
@@ -1784,17 +2848,9 @@ static void UpdateNativeMainMenu(uint16 inputs) {
   g_native_main_menu_prev_inputs = 0;
   g_skip_menu = false;
   if (g_native_main_menu_selection == 0) {
-    g_native_main_menu_dismissed = true;
-    cinematic_function = FUNC16(CinematicFunc_Func10);
-    screen_fade_delay = 2;
-    screen_fade_counter = 2;
+    StartNativePlayFromMainMenu();
   } else if (g_native_main_menu_selection == 1) {
-    g_native_main_menu_return_from_options = true;
-    game_state = kGameState_2_GameOptionsMenu;
-    game_options_screen_index = 0;
-    menu_index = 0;
-    screen_fade_delay = 0;
-    screen_fade_counter = 0;
+    OpenNativeOptionsFromMainMenu(inputs);
   } else if (g_native_main_menu_selection == 2) {
     OpenNativeLevelEditor(inputs);
   } else {
@@ -1941,7 +2997,7 @@ static void UpdateExitToMainMenuPrompt(uint16 inputs) {
 
   if (MenuHasConfirmInput(new_inputs)) {
     if (g_exit_to_main_menu_prompt_selection_yes)
-      OpenNativeMainMenuScene();
+      g_native_main_menu_scene_pending = true;
     else {
       g_exit_to_main_menu_prompt_active = false;
       g_exit_to_main_menu_prompt_prev_inputs = 0;
@@ -2023,15 +3079,9 @@ static void RenderNativeMainMenu(uint8 *pixel_buffer, size_t pitch, int width, i
   uint8 border_flicker = (uint8)(190 + ((nmi_frame_counter_word * 17 + (nmi_frame_counter_word >> 2) * 53) & 63));
   uint32 border_color = BlendColorOverBgr(0x1C3A2B, 0x8FEA7D, border_flicker);
 
-  if (g_modern_layer_renderer)
-    FillRect(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, 0x9c101722);
-  else
-    FillRectAlpha(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, 0x101722, 156);
+  FillRectAlpha(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, 0x101722, 156);
   for (int y = panel_y + 4 * scale + (nmi_frame_counter_word & 3) * scale; y < panel_y + panel_h - 4 * scale; y += 4 * scale) {
-    if (g_modern_layer_renderer)
-      FillRect(pixel_buffer, pitch, width, height, panel_x + 3 * scale, y, panel_w - 6 * scale, IntMax(1, scale), 0x352D6F58);
-    else
-      FillRectAlpha(pixel_buffer, pitch, width, height, panel_x + 3 * scale, y, panel_w - 6 * scale, IntMax(1, scale), 0x2D6F58, 53);
+    FillRectAlpha(pixel_buffer, pitch, width, height, panel_x + 3 * scale, y, panel_w - 6 * scale, IntMax(1, scale), 0x2D6F58, 53);
   }
   DrawRectOutline(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, IntMax(1, scale), border_color);
   DrawText5x7(pixel_buffer, pitch, width, height, title_x, title_y, "MAIN MENU", scale, 0xFFFFFF);
@@ -2041,14 +3091,53 @@ static void RenderNativeMainMenu(uint8 *pixel_buffer, size_t pitch, int width, i
     uint32 text_color = i == g_native_main_menu_selection ? 0x8FEA7D : 0xC5D0D8;
     if (i == g_native_main_menu_selection) {
       DrawText5x7(pixel_buffer, pitch, width, height, item_x - 16 * scale, y, ">", scale, 0x8FEA7D);
-      if (g_modern_layer_renderer)
-        FillRect(pixel_buffer, pitch, width, height, item_x - 5 * scale, y + 9 * scale, 84 * scale, IntMax(1, scale), 0x8c2E6F58);
-      else
-        FillRectAlpha(pixel_buffer, pitch, width, height, item_x - 5 * scale, y + 9 * scale, 84 * scale, IntMax(1, scale), 0x2E6F58, 140);
+      FillRectAlpha(pixel_buffer, pitch, width, height, item_x - 5 * scale, y + 9 * scale, 84 * scale, IntMax(1, scale), 0x2E6F58, 140);
     }
     DrawText5x7(pixel_buffer, pitch, width, height, item_x, y, kMenuItems[i], scale, text_color);
   }
 
+}
+
+static void RenderNativeFileSelect(uint8 *pixel_buffer, size_t pitch, int width, int height) {
+  static const char *const kFileItems[4] = { "FILE A", "FILE B", "FILE C", "BACK" };
+  char label[64];
+  if (!g_native_file_select_active)
+    return;
+
+  const int scale = IntMax(1, height / 240);
+  const int panel_w = 154 * scale;
+  const int panel_h = 104 * scale;
+  const int panel_x = (width - panel_w) / 2;
+  const int panel_y = (height - panel_h) / 2 + 30 * scale;
+  const int title_x = panel_x + 17 * scale;
+  const int title_y = panel_y + 10 * scale;
+  const int item_x = panel_x + 35 * scale;
+  const int first_item_y = panel_y + 33 * scale;
+  const int item_gap = 15 * scale;
+  uint8 border_flicker = (uint8)(190 + ((nmi_frame_counter_word * 19 + (nmi_frame_counter_word >> 1) * 41) & 63));
+  uint32 border_color = BlendColorOverBgr(0x1C3A2B, 0x8FEA7D, border_flicker);
+
+  FillRectAlpha(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, 0x101722, 168);
+  for (int y = panel_y + 4 * scale + (nmi_frame_counter_word & 3) * scale; y < panel_y + panel_h - 4 * scale; y += 4 * scale)
+    FillRectAlpha(pixel_buffer, pitch, width, height, panel_x + 3 * scale, y, panel_w - 6 * scale, IntMax(1, scale), 0x2D6F58, 46);
+  DrawRectOutline(pixel_buffer, pitch, width, height, panel_x, panel_y, panel_w, panel_h, IntMax(1, scale), border_color);
+  DrawText5x7(pixel_buffer, pitch, width, height, title_x, title_y, "FILE SELECT", scale, 0xFFFFFF);
+
+  for (int i = 0; i < 4; i++) {
+    int y = first_item_y + i * item_gap;
+    uint32 text_color = i == g_native_file_select_selection ? 0x8FEA7D : 0xC5D0D8;
+    if (i == g_native_file_select_selection) {
+      DrawText5x7(pixel_buffer, pitch, width, height, item_x - 16 * scale, y, ">", scale, 0x8FEA7D);
+      FillRectAlpha(pixel_buffer, pitch, width, height, item_x - 5 * scale, y + 9 * scale, 88 * scale, IntMax(1, scale), 0x2E6F58, 130);
+    }
+    DrawText5x7(pixel_buffer, pitch, width, height, item_x, y, kFileItems[i], scale, text_color);
+  }
+
+  if (g_native_file_select_status_timer > 0 && g_native_file_select_status_slot >= 0) {
+    snprintf(label, sizeof(label), "FILE %c NOT WIRED", 'A' + g_native_file_select_status_slot);
+    DrawText5x7(pixel_buffer, pitch, width, height, panel_x + 19 * scale, panel_y + panel_h - 13 * scale,
+                label, scale, 0xFFFFFF);
+  }
 }
 
 static void RenderNativeLevelEditor(uint8 *pixel_buffer, size_t pitch, int width, int height) {
@@ -2373,6 +3462,8 @@ static void RenderBuildTimestampOverlay(uint8 *pixel_buffer, size_t pitch, int w
 }
 
 static bool IsGunshipEnemyData(const EnemyData *E) {
+  if (!E->enemy_ptr)
+    return false;
   EnemyDef *ED = get_EnemyDef_A2(E->enemy_ptr);
   return ED->ai_init == fnGunshipTop_Init || ED->ai_init == fnGunshipBottom_Init;
 }
@@ -2506,6 +3597,8 @@ static void RenderModernGunshipCustomLayerLine(int custom_slot, int y, uint32 *p
     return;
   if (!g_modern_layer_renderer)
     return;
+  if (custom_slot != 3 && custom_slot != 7 && custom_slot != 11 && custom_slot != 15)
+    return;
 
   Ppu *ppu = g_snes->ppu;
   for (int i = 0; i < num_enemies_in_room; i++) {
@@ -2581,7 +3674,19 @@ static void RenderAnalogDebugOverlay(uint8 *pixel_buffer, size_t pitch, int widt
   int arrow_box = 18 * scale;
   int arrow_cx = width - 14 * scale;
   int arrow_cy = height - 14 * scale;
+  const char *mode_text = g_native_level_render_enabled ? "NATIVE" : "SNES";
+  int mode_w = 44 * scale;
+  int mode_h = 12 * scale;
+  int mode_x = arrow_cx - arrow_box / 2 - mode_w - 4 * scale;
+  int mode_y = arrow_cy - mode_h / 2;
+  uint32 mode_color = g_native_level_render_enabled ? 0x8FEA7D : 0xC5D0D8;
   float aim_x, aim_y;
+
+  FillRectAlpha(pixel_buffer, pitch, width, height, mode_x, mode_y, mode_w, mode_h, 0x101722, 176);
+  DrawRectOutline(pixel_buffer, pitch, width, height,
+      mode_x, mode_y, mode_w, mode_h, IntMax(1, scale), mode_color);
+  DrawText5x7(pixel_buffer, pitch, width, height,
+      mode_x + 4 * scale, mode_y + 3 * scale, mode_text, scale, mode_color);
 
   Samus_GetNormalizedAimDirection(&aim_x, &aim_y);
   DrawRectOutline(pixel_buffer, pitch, width, height,
@@ -2616,6 +3721,7 @@ static void RenderModernFrontCustomLayer(uint32 *pixels, int width, int height) 
   RenderOpeningIntroSkipPrompt((uint8 *)pixels, width * sizeof(uint32), width, height);
   RenderAnalogDebugOverlay((uint8 *)pixels, width * sizeof(uint32), width, height);
   RenderNativeMainMenu((uint8 *)pixels, width * sizeof(uint32), width, height);
+  RenderNativeFileSelect((uint8 *)pixels, width * sizeof(uint32), width, height);
   RenderNativeLevelEditor((uint8 *)pixels, width * sizeof(uint32), width, height);
   RenderNativeOptionsOverlay((uint8 *)pixels, width * sizeof(uint32), width, height);
   RenderExitToMainMenuPrompt((uint8 *)pixels, width * sizeof(uint32), width, height);
@@ -2791,12 +3897,17 @@ static void HandleCommand(uint32 j, bool pressed) {
       g_new_ppu = (g_ppu_render_flags & kPpuRenderFlags_NewRenderer) != 0;
       break;
     case kKeys_ToggleModernLayerRenderer:
-      g_ppu_render_flags ^= kPpuRenderFlags_ModernLayerRenderer;
-      g_modern_layer_renderer = (g_ppu_render_flags & kPpuRenderFlags_ModernLayerRenderer) != 0;
+      SetModernLayerRendererEnabled(!g_modern_layer_renderer);
+      if (g_native_level_render_enabled && !g_modern_layer_renderer)
+        g_native_level_render_enabled = false;
+      QueueToggleScreenshot(g_modern_layer_renderer ? "toggle_modern_layers_on" : "toggle_modern_layers_off");
       printf("[Modern layer renderer]=%s\n", g_modern_layer_renderer ? "on" : "off");
       break;
     case kKeys_ToggleModernLayerDebug:
       g_modern_layer_debug = !g_modern_layer_debug;
+      if (g_modern_layer_debug && !g_modern_layer_renderer)
+        SetModernLayerRendererEnabled(true);
+      QueueToggleScreenshot(g_modern_layer_debug ? "toggle_false_color_on" : "toggle_false_color_off");
       printf("[Modern layer debug]=%s\n", g_modern_layer_debug ? "on" : "off");
       break;
     case kKeys_Screenshot:
@@ -2811,9 +3922,38 @@ static void HandleCommand(uint32 j, bool pressed) {
 }
 
 static void HandleInput(int keyCode, int keyMod, bool pressed) {
+  if (pressed && g_title_video.active && !g_title_video.show_menu) {
+    SeekTitleVideoPlayback(kTitleVideoLoopFrame);
+    g_title_video.show_menu = true;
+    g_native_main_menu_active = true;
+    g_native_main_menu_dismissed = false;
+    g_native_main_menu_prev_inputs = 0;
+    ClearTransientMenuInputs();
+    return;
+  }
   if (pressed && keyCode == SDLK_ESCAPE) {
+    if (g_native_options_active) {
+      SaveNativeOptionsConfig();
+      g_native_options_active = false;
+      g_native_main_menu_active = true;
+      g_native_options_prev_inputs = 0;
+      ClearTransientMenuInputs();
+      return;
+    }
+    if (g_native_file_select_active) {
+      CloseNativeFileSelect();
+      return;
+    }
+    if (g_native_level_editor_active) {
+      CloseNativeLevelEditor();
+      return;
+    }
     if (g_native_main_menu_active) {
       g_native_main_menu_quit_requested = true;
+      return;
+    }
+    if (game_state == kGameState_4_FileSelectMenus || game_state == kGameState_5_FileSelectMap) {
+      OpenNativeMainMenuScene();
       return;
     }
     if (g_exit_to_main_menu_prompt_active) {

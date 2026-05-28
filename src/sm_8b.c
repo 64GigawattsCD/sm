@@ -4,6 +4,26 @@
 #include "funcs.h"
 #include "variables.h"
 
+#include <stdarg.h>
+#include <stdio.h>
+
+static void CinematicAssetTraceReset(void) {
+  FILE *f = fopen("cinematic_assets.log", "wb");
+  if (f)
+    fclose(f);
+}
+
+static void CinematicAssetTraceLog(const char *fmt, ...) {
+  FILE *f = fopen("cinematic_assets.log", "ab");
+  if (!f)
+    return;
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(f, fmt, ap);
+  va_end(ap);
+  fputc('\n', f);
+  fclose(f);
+}
 
 #define kPalettes_Intro ((uint16*)RomFixedPtr(0x8ce3e9))
 #define kPalettes_Intro2 ((uint16*)RomFixedPtr(0x8ce5e9))
@@ -1098,6 +1118,11 @@ uint8 SpawnCimenaticSpriteObjectInner(uint16 k, uint16 j) {  // 0x8B93AC
   cinematicspr_goto_timer[v3] = 0;
   cinematicspr_arr6[v3] = 0;
   cinematicspr_arr7[v3] = 0;
+  if (game_state == kGameState_1_OpeningCinematic) {
+    CinematicAssetTraceLog("[spr-spawn] slot=%02x def=8B:%04x init=8B:%04x pre=8B:%04x instr=8B:%04x param=%04x",
+                           j, k, GET_WORD(v2), cinematicspr_preinstr_func[v3],
+                           cinematicspr_instr_ptr[v3], cinematic_spawn_param);
+  }
   CallCinematicSpriteObjectSetup(GET_WORD(v2) | 0x8B0000, j);
   return 0;
 }
@@ -1139,6 +1164,11 @@ void ProcessCinematicSpriteInstructionList(uint16 k) {  // 0x8B9409
     cinematicspr_instr_timer[v7] = v6;
     cinematicspr_whattodraw[v7] = *((uint16 *)RomPtr_8B(v4) + 1);
     cinematicspr_instr_ptr[v7] = v4 + 4;
+    if (game_state == kGameState_1_OpeningCinematic) {
+      CinematicAssetTraceLog("[spr-frame] slot=%02x instr=8B:%04x timer=%04x spritemap=8C:%04x chr=%04x x=%04x y=%04x",
+                             v1, v4, v6, cinematicspr_whattodraw[v7], cinematicbg_arr9[v7],
+                             cinematicbg_arr7[v7], cinematicbg_arr8[v7]);
+    }
   }
 }
 
@@ -1214,6 +1244,11 @@ uint8 SpawnMode7Object(uint16 j, uint16 a) {  // 0x8B94E4
   mode7_obj_instr_ptr[v6] = Mode7ObjectDef->field_4;
   mode7_obj_instr_timer[v6] = 1;
   mode7_obj_goto_timer[v6] = 0;
+  if (game_state == kGameState_1_OpeningCinematic) {
+    CinematicAssetTraceLog("[m7-spawn] slot=%02x def=8B:%04x init=8B:%04x pre=8B:%04x instr=8B:%04x param=%04x",
+                           v3, j, Mode7ObjectDef->field_0, Mode7ObjectDef->field_2,
+                           Mode7ObjectDef->field_4, mode7_spawn_param);
+  }
   CallCinematicSpriteInit(Mode7ObjectDef->field_0 | 0x8B0000, v6);
   return 0;
 }
@@ -1245,6 +1280,10 @@ void ProcessMode7ObjectInstructions(uint16 k) {  // 0x8B9537
     }
     mode7_obj_instr_timer[v1 >> 1] = v6;
     const uint8 *v7 = RomPtr_8B(v4);
+    if (game_state == kGameState_1_OpeningCinematic) {
+      CinematicAssetTraceLog("[m7-frame] slot=%02x instr=8B:%04x timer=%04x transfer=8B:%04x",
+                             v1, v4, v6, GET_WORD(v7 + 2));
+    }
     QueueMode7Transfers(0x8b, GET_WORD(v7 + 2));
     mode7_obj_instr_ptr[v1 >> 1] = v4 + 4;
   }
@@ -1690,6 +1729,8 @@ void HandleCinematicsTransitions(void) {
 }
 
 void CinematicFunctionOpening(void) {  // 0x8B9B68
+  CinematicAssetTraceReset();
+  CinematicAssetTraceLog("[opening] begin");
   LoadTitleSequenceGraphics();
   QueueMusic_Delayed8(0xFF03);
   cinematic_function = FUNC16(CinematicFunctionNone);
@@ -1700,6 +1741,7 @@ void CinematicFunctionOpening(void) {  // 0x8B9B68
 void LoadTitleSequenceGraphics(void) {  // 0x8B9B87
   int16 v1;
 
+  CinematicAssetTraceLog("[title-load] setup ppu/palette palette=8C:E1E9 bytes=0200");
   SetupPpuForTitleSequence();
   cur_irq_handler = 0;
   irqhandler_next_handler = 0;
@@ -1712,6 +1754,7 @@ void LoadTitleSequenceGraphics(void) {  // 0x8B9B87
   DecompressToMem(0x96FC04, g_ram + 0x14000);
   DecompressToMem(0x9580D8, g_ram + 0x15000);
   DecompressToMem(0x95A5E1, g_ram + 0x19000);
+  CinematicAssetTraceLog("[title-load] dma initial mode7 tilemap/tiles");
   WriteReg(VMADDL, 0);
   WriteReg(VMADDH, 0);
   WriteReg(VMAIN, 0x80);
@@ -1899,7 +1942,11 @@ void CinematicFunc_Func7(void) {  // 0x8B9E8B
     } else {
       cinematic_var6 = 256;
       cinematic_function = FUNC16(nullsub_117);
-      SpawnCinematicSpriteObject(addr_kCinematicSpriteObjectDef_8BA107, FUNC16(nullsub_117));
+      if (g_cinematic_capture_active) {
+        ClearCinematicSprites();
+      } else {
+        SpawnCinematicSpriteObject(addr_kCinematicSpriteObjectDef_8BA107, FUNC16(nullsub_117));
+      }
     }
   }
 }
@@ -1982,8 +2029,7 @@ void CinematicFunc_Func10(void) {  // 0x8B9F52
       *(uint16 *)((uint8 *)&cinematic_var5 + (uint16)i) = 0;
     for (j = 510; (j & 0x8000) == 0; j -= 2)
       hdma_table_1[j >> 1] = 0;
-    game_state = 4;
-    game_options_screen_index = 0;
+    StartNativePlayFromMainMenu();
   }
 }
 

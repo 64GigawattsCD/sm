@@ -510,17 +510,10 @@ CoroutineRet GameState_43_TransitionFromDemo(void) {  // 0x828593
 }
 
 CoroutineRet GameState_44_TransitionFromDemo(void) {  // 0x8285FB
-  game_state = kGameState_1_OpeningCinematic;
   if ((substate & 0x8000) != 0) {
     game_state = kGameState_40_TransitionToDemo;
-  } else if (substate) {
-    LoadTitleSequenceGraphics();
-    eproj_x_pos[4] = 2;
-    cinematic_function = FUNC16(CinematicFunctionNone);
   } else {
-    QueueMusic_Delayed8(0);
-    debug_disable_sounds = 0;
-    cinematic_function = FUNC16(CinematicFunctionOpening);
+    RequestNativeMainMenuFromFileSelect();
   }
   return kCoroutineNone;
 }
@@ -721,7 +714,7 @@ CoroutineRet GameState_26_GameOverMenu(void) {  // 0x8289E0
 }
 
 CoroutineRet GameState_4_FileSelectMenus(void) {  // 0x8289E5
-  FileSelectMenu();
+  StartNativePlayFromMainMenu();
   return kCoroutineNone;
 }
 
@@ -4621,7 +4614,7 @@ void GameOptionsMenu_B_TransitionBackToFileSelect(void) {  // 0x82EE6A
     EnableNMI();
     screen_fade_delay = 0;
     screen_fade_counter = 0;
-    game_state = kGameState_4_FileSelectMenus;
+    RequestNativeMainMenuFromFileSelect();
     menu_index = 0;
     game_options_screen_index = 0;
   }
