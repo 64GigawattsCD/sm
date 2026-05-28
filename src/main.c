@@ -104,6 +104,12 @@ static bool NativeMainMenuCanOpenOnTitleScene(void);
 static void RenderModernFrontCustomLayer(uint32 *pixels, int width, int height);
 static void RenderModernGunshipCustomLayerLine(int custom_slot, int y, uint32 *pixels, int width, int height);
 static void CompositeModernFrontCustomLayer(uint8 *pixel_buffer, size_t pitch, int width, int height);
+static bool TryStartTitleVideoPlayback(void);
+static void StopTitleVideoPlayback(bool open_title_scene);
+static bool UpdateTitleVideoPlayback(uint16 inputs);
+static void RenderTitleVideoFrame(void);
+static bool LoadTitleVideoAudio(const char *audio_path);
+static void MixTitleVideoAudio(Uint8 *stream, int len);
 static void SaveDebugScreenshot(uint8 *pixel_buffer, size_t pitch, int width, int height, const char *prefix, int *counter);
 static void CaptureCinematicFrame(uint8 *pixel_buffer, size_t pitch, int width, int height, int render_scale);
 static void CaptureCinematicAudioForFrame(void);
@@ -123,6 +129,23 @@ typedef struct {
   int graphics_number;
   char *preview_file_path;
 } NativeLevelEditorTilesetEntry;
+
+typedef struct TitleVideoPlayback {
+  bool active;
+  FILE *frames_file;
+  uint8 *rgb_frame;
+  uint32 *argb_frame;
+  uint8 *audio;
+  size_t audio_size;
+  size_t audio_offset;
+  int width;
+  int height;
+  int frame_count;
+  int frame_index;
+  size_t frame_bytes;
+  SDL_Texture *texture;
+  bool changed_logical_size;
+} TitleVideoPlayback;
 
 typedef enum NativeLevelEditorPage {
   kNativeLevelEditorPage_PackList,
@@ -197,6 +220,7 @@ static int g_native_level_editor_tilesets_count;
 static bool g_exit_to_main_menu_prompt_active;
 static bool g_exit_to_main_menu_prompt_selection_yes;
 static uint16 g_exit_to_main_menu_prompt_prev_inputs;
+static TitleVideoPlayback g_title_video;
 
 int g_got_mismatch_count;
 
@@ -211,6 +235,8 @@ enum {
   kCinematicCaptureAudioChannels = 2,
   kSnesNativeWidth = 256,
   kSnesNativeHeight = 240,
+  kTitleVideoWidth = 398,
+  kTitleVideoHeight = 224,
   kPathBufferSize = 1024,
 };
 
@@ -1077,6 +1103,11 @@ void RtlApuUnlock(void) {
 
 static void SDLCALL AudioCallback(void *userdata, Uint8 *stream, int len) {
   if (SDL_LockMutex(g_audio_mutex)) Die("Mutex lock failed!");
+  if (g_title_video.active && g_title_video.audio != NULL) {
+    MixTitleVideoAudio(stream, len);
+    SDL_UnlockMutex(g_audio_mutex);
+    return;
+  }
   while (len != 0) {
     if (g_audiobuffer_end - g_audiobuffer_cur == 0) {
       RtlRenderAudio((int16 *)g_audiobuffer, g_frames_per_block, g_audio_channels);
@@ -1232,6 +1263,248 @@ static void SdlRenderer_EndDraw(void) {
   SDL_RenderPresent(g_renderer); // vsyncs to 60 FPS?
   if (should_log)
     WidescreenDebugLog("SdlRenderer_EndDraw end");
+}
+
+static bool ReadWavLe16(const uint8 *p, uint16 *value) {
+  *value = (uint16)(p[0] | (p[1] << 8));
+  return true;
+}
+
+static bool ReadWavLe32(const uint8 *p, uint32 *value) {
+  *value = (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16) | ((uint32)p[3] << 24);
+  return true;
+}
+
+static bool LoadTitleVideoAudio(const char *audio_path) {
+  FILE *f = fopen(audio_path, "rb");
+  uint8 header[12];
+  uint8 chunk_header[8];
+  bool saw_fmt = false;
+  uint16 audio_format = 0;
+  uint16 channels = 0;
+  uint32 sample_rate = 0;
+  uint16 bits_per_sample = 0;
+  uint8 *audio = NULL;
+  uint32 audio_size = 0;
+
+  if (!f)
+    return false;
+  if (fread(header, 1, sizeof(header), f) != sizeof(header) ||
+      memcmp(header, "RIFF", 4) != 0 ||
+      memcmp(header + 8, "WAVE", 4) != 0) {
+    fclose(f);
+    return false;
+  }
+
+  while (fread(chunk_header, 1, sizeof(chunk_header), f) == sizeof(chunk_header)) {
+    uint32 chunk_size;
+    ReadWavLe32(chunk_header + 4, &chunk_size);
+    if (memcmp(chunk_header, "fmt ", 4) == 0) {
+      uint8 fmt[32];
+      size_t to_read = IntMin((int)chunk_size, (int)sizeof(fmt));
+      if (fread(fmt, 1, to_read, f) != to_read) {
+        fclose(f);
+        return false;
+      }
+      if (chunk_size > to_read)
+        fseek(f, (long)(chunk_size - to_read), SEEK_CUR);
+      if (to_read >= 16) {
+        ReadWavLe16(fmt + 0, &audio_format);
+        ReadWavLe16(fmt + 2, &channels);
+        ReadWavLe32(fmt + 4, &sample_rate);
+        ReadWavLe16(fmt + 14, &bits_per_sample);
+        saw_fmt = true;
+      }
+    } else if (memcmp(chunk_header, "data", 4) == 0) {
+      audio = (uint8 *)malloc(chunk_size);
+      if (!audio) {
+        fclose(f);
+        return false;
+      }
+      if (fread(audio, 1, chunk_size, f) != chunk_size) {
+        free(audio);
+        fclose(f);
+        return false;
+      }
+      audio_size = chunk_size;
+      break;
+    } else {
+      fseek(f, (long)chunk_size, SEEK_CUR);
+    }
+    if (chunk_size & 1)
+      fseek(f, 1, SEEK_CUR);
+  }
+  fclose(f);
+
+  if (!saw_fmt || !audio ||
+      audio_format != 1 ||
+      channels != 2 ||
+      sample_rate != 44100 ||
+      bits_per_sample != 16) {
+    free(audio);
+    return false;
+  }
+
+  free(g_title_video.audio);
+  g_title_video.audio = audio;
+  g_title_video.audio_size = audio_size;
+  g_title_video.audio_offset = 0;
+  return true;
+}
+
+static bool TryStartTitleVideoPlayback(void) {
+  char frames_path[kPathBufferSize];
+  char audio_path[kPathBufferSize];
+  FILE *frames_file;
+  long frame_file_size;
+
+  if (g_cinematic_capture_path)
+    return false;
+  if (!ResolveBlocksBoxPath("BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\frames.rgb24",
+                            "..\\..\\BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\frames.rgb24",
+                            frames_path, sizeof(frames_path)) ||
+      !ResolveBlocksBoxPath("BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\audio.wav",
+                            "..\\..\\BlockBox\\out\\cinematic-bb-title-16x9-full\\super-metroid\\audio.wav",
+                            audio_path, sizeof(audio_path)) ||
+      !FileExists(frames_path) ||
+      !FileExists(audio_path)) {
+    WidescreenDebugLog("title-video: BB export files missing; using runtime title scene");
+    return false;
+  }
+
+  frames_file = fopen(frames_path, "rb");
+  if (!frames_file)
+    return false;
+  fseek(frames_file, 0, SEEK_END);
+  frame_file_size = ftell(frames_file);
+  fseek(frames_file, 0, SEEK_SET);
+
+  memset(&g_title_video, 0, sizeof(g_title_video));
+  g_title_video.width = kTitleVideoWidth;
+  g_title_video.height = kTitleVideoHeight;
+  g_title_video.frame_bytes = (size_t)g_title_video.width * g_title_video.height * 3;
+  if (frame_file_size <= 0 || (size_t)frame_file_size < g_title_video.frame_bytes) {
+    fclose(frames_file);
+    return false;
+  }
+  g_title_video.frame_count = (int)((size_t)frame_file_size / g_title_video.frame_bytes);
+  g_title_video.frames_file = frames_file;
+  g_title_video.rgb_frame = (uint8 *)malloc(g_title_video.frame_bytes);
+  g_title_video.argb_frame = (uint32 *)malloc((size_t)g_title_video.width * g_title_video.height * sizeof(uint32));
+  if (!g_title_video.rgb_frame || !g_title_video.argb_frame || !LoadTitleVideoAudio(audio_path)) {
+    StopTitleVideoPlayback(false);
+    return false;
+  }
+
+  if (g_renderer) {
+    g_title_video.texture = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
+                                              g_title_video.width, g_title_video.height);
+    if (g_title_video.texture) {
+      SDL_RenderSetLogicalSize(g_renderer, g_title_video.width, g_title_video.height);
+      g_title_video.changed_logical_size = true;
+    }
+  }
+
+  g_title_video.active = true;
+  g_native_main_menu_dismissed = true;
+  WidescreenDebugLog("title-video: started frames=%d path=%s", g_title_video.frame_count, frames_path);
+  return true;
+}
+
+static void StopTitleVideoPlayback(bool open_title_scene) {
+  if (g_audio_mutex)
+    SDL_LockMutex(g_audio_mutex);
+  g_title_video.active = false;
+  if (g_audio_mutex)
+    SDL_UnlockMutex(g_audio_mutex);
+
+  if (g_title_video.changed_logical_size && g_renderer) {
+    if (g_config.ignore_aspect_ratio)
+      SDL_RenderSetLogicalSize(g_renderer, 0, 0);
+    else
+      SDL_RenderSetLogicalSize(g_renderer, g_snes_width, g_snes_height);
+  }
+  if (g_title_video.texture)
+    SDL_DestroyTexture(g_title_video.texture);
+  if (g_title_video.frames_file)
+    fclose(g_title_video.frames_file);
+  free(g_title_video.rgb_frame);
+  free(g_title_video.argb_frame);
+  free(g_title_video.audio);
+  memset(&g_title_video, 0, sizeof(g_title_video));
+  if (open_title_scene)
+    OpenNativeMainMenuScene();
+}
+
+static void MixTitleVideoAudio(Uint8 *stream, int len) {
+  size_t remaining = g_title_video.audio_size > g_title_video.audio_offset
+    ? g_title_video.audio_size - g_title_video.audio_offset
+    : 0;
+  int n = (int)IntMin(len, (int)remaining);
+  if (n > 0) {
+    if (g_sdl_audio_mixer_volume == SDL_MIX_MAXVOLUME) {
+      memcpy(stream, g_title_video.audio + g_title_video.audio_offset, n);
+    } else {
+      SDL_memset(stream, 0, n);
+      SDL_MixAudioFormat(stream, g_title_video.audio + g_title_video.audio_offset, AUDIO_S16, n, g_sdl_audio_mixer_volume);
+    }
+    g_title_video.audio_offset += (size_t)n;
+    stream += n;
+    len -= n;
+  }
+  if (len > 0)
+    SDL_memset(stream, 0, len);
+}
+
+static bool UpdateTitleVideoPlayback(uint16 inputs) {
+  if (!g_title_video.active)
+    return false;
+  if (inputs & (kInputBit_Start | kInputBit_A | kInputBit_B)) {
+    StopTitleVideoPlayback(true);
+    return true;
+  }
+  if (g_title_video.frame_index >= g_title_video.frame_count) {
+    StopTitleVideoPlayback(true);
+    return true;
+  }
+  RenderTitleVideoFrame();
+  g_title_video.frame_index++;
+  return true;
+}
+
+static void RenderTitleVideoFrame(void) {
+  if (!g_title_video.active || !g_title_video.frames_file)
+    return;
+
+  if (fread(g_title_video.rgb_frame, 1, g_title_video.frame_bytes, g_title_video.frames_file) != g_title_video.frame_bytes) {
+    StopTitleVideoPlayback(true);
+    return;
+  }
+
+  for (int i = 0, n = g_title_video.width * g_title_video.height; i < n; i++) {
+    uint8 r = g_title_video.rgb_frame[i * 3 + 0];
+    uint8 g = g_title_video.rgb_frame[i * 3 + 1];
+    uint8 b = g_title_video.rgb_frame[i * 3 + 2];
+    g_title_video.argb_frame[i] = 0xff000000u | ((uint32)r << 16) | ((uint32)g << 8) | b;
+  }
+
+  if (g_renderer && g_title_video.texture) {
+    SDL_UpdateTexture(g_title_video.texture, NULL, g_title_video.argb_frame, g_title_video.width * (int)sizeof(uint32));
+    SDL_RenderClear(g_renderer);
+    SDL_RenderCopy(g_renderer, g_title_video.texture, NULL, NULL);
+    SDL_RenderPresent(g_renderer);
+    return;
+  }
+
+  uint8 *pixel_buffer = NULL;
+  int pitch = 0;
+  g_renderer_funcs.BeginDraw(g_title_video.width, g_title_video.height, &pixel_buffer, &pitch);
+  for (int y = 0; y < g_title_video.height; y++) {
+    memcpy(pixel_buffer + (size_t)y * pitch,
+           g_title_video.argb_frame + (size_t)y * g_title_video.width,
+           (size_t)g_title_video.width * sizeof(uint32));
+  }
+  g_renderer_funcs.EndDraw();
 }
 
 static const struct RendererFuncs kSdlRendererFuncs = {
@@ -1426,6 +1699,7 @@ int main(int argc, char** argv) {
   uint32 frameCtr = 0;
   uint8 audiopaused = true;
   int main_loop_log_budget = 32;
+  TryStartTitleVideoPlayback();
 
   while (running) {
     bool log_loop = main_loop_log_budget-- > 0;
@@ -1510,6 +1784,26 @@ int main(int argc, char** argv) {
     if (g_input1_state & 0xf0)
       analog_buttons = 0;
     inputs |= analog_buttons;
+
+    if (UpdateTitleVideoPlayback((uint16)(inputs | menu_inputs))) {
+      frameCtr++;
+      curTick = SDL_GetTicks();
+      if (!g_config.disable_frame_delay) {
+        static const uint8 title_video_delays[3] = { 17, 17, 16 };
+        lastTick += title_video_delays[frameCtr % 3];
+        if (lastTick > curTick) {
+          uint32 delta = lastTick - curTick;
+          if (delta > 500) {
+            lastTick = curTick - 500;
+            delta = 500;
+          }
+          SDL_Delay(delta);
+        } else if (curTick - lastTick > 500) {
+          lastTick = curTick;
+        }
+      }
+      continue;
+    }
 
     MaybeActivateNativeMainMenu();
     UpdateOptionsVolumeSlider((uint16)menu_inputs);
@@ -1607,6 +1901,8 @@ int main(int argc, char** argv) {
     if (g_cinematic_capture_done && g_cinematic_capture_quit_when_done)
       running = false;
   }
+
+  StopTitleVideoPlayback(false);
 
   if (g_cinematic_capture_file) {
     fclose(g_cinematic_capture_file);
